@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -13,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
+from typing import cast
 
 import app.institutions.sources.kindergarten as kindergarten_module
 import app.institutions.sources.neis as neis_module
@@ -55,6 +57,7 @@ from app.institutions.store import InstitutionStore
 from app.institutions.sync import (
     SnapshotBuildResult,
     SnapshotQualityError,
+    build_candidate_review_packet,
     build_candidate_snapshot,
     build_sync_preflight_audit,
     emit_sync_preflight_audit,
@@ -2339,6 +2342,223 @@ def test_promotion_rechecks_hash_before_pointer_change(tmp_path: Path) -> None:
     with pytest.raises(SnapshotQualityError, match="hash mismatch"):
         promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
+
+
+def test_review_packet_is_deterministic_and_contains_audit_categories(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="review-packet",
+        coverage=TEST_COVERAGE,
+    )
+
+    first = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    second = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert first == second
+    assert set(first) == {
+        "status",
+        "snapshotId",
+        "createdAt",
+        "snapshotAsOf",
+        "previousSnapshotId",
+        "sourceCounts",
+        "institutionTypeCounts",
+        "foundationCounts",
+        "districtCounts",
+        "statusCounts",
+        "coordinateQualityCounts",
+        "quarantinedInstitutionIds",
+        "quarantinedSiteIds",
+        "diff",
+        "siteOnlyDiff",
+        "institutionsSha256",
+        "sitesSha256",
+        "candidateManifestSha256",
+        "sourceProvenanceSha256",
+        "enrichmentProvenanceSha256",
+        "reviewDigest",
+    }
+    assert first["status"] == "CANDIDATE_REVIEW_REQUIRED"
+    assert first["snapshotId"] == candidate.snapshot_id
+    assert re.fullmatch(r"[0-9a-f]{64}", cast(str, first["reviewDigest"]))
+    without_digest = {
+        key: value for key, value in first.items() if key != "reviewDigest"
+    }
+    assert (
+        first["reviewDigest"]
+        == hashlib.sha256(
+            json.dumps(
+                without_digest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_review_packet_excludes_sensitive_source_values(tmp_path: Path) -> None:
+    sensitive = replace(
+        source_record(road_address="서울특별시 중구 비공개로 987"),
+        official_name="비공개검토학교",
+    )
+    candidate = build_test_candidate(
+        records=(sensitive,),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="private-review",
+        coverage=TEST_COVERAGE,
+    )
+
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    serialized = json.dumps(packet, ensure_ascii=False, sort_keys=True)
+
+    for forbidden in (
+        sensitive.official_name,
+        sensitive.road_address,
+        str(sensitive.latitude),
+        str(sensitive.longitude),
+        "Authorization",
+        "rawResponse",
+        "KAKAO_REST_API_KEY",
+    ):
+        assert forbidden not in serialized
+
+
+def test_review_packet_reports_disjoint_site_only_changes(tmp_path: Path) -> None:
+    changed = SourceInstitutionSiteRecord(
+        site_code="changed",
+        site_name="Changed branch",
+        road_address="서울특별시 강서구 양천로 61",
+        district="강서구",
+        latitude=37.5701,
+        longitude=126.8412,
+        coordinate_quality="MANUALLY_VERIFIED",
+    )
+    removed = replace(
+        changed,
+        site_code="removed",
+        site_name="Removed branch",
+    )
+    initial = build_test_candidate(
+        records=(replace(source_record(), additional_sites=(changed, removed)),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="site-only-before",
+        coverage=TEST_COVERAGE,
+    )
+    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
+    added = replace(changed, site_code="added", site_name="Added branch")
+    candidate = build_test_candidate(
+        records=(
+            replace(
+                source_record(),
+                additional_sites=(
+                    replace(changed, road_address="서울특별시 강서구 양천로 62"),
+                    added,
+                ),
+            ),
+        ),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="site-only-after",
+        coverage=TEST_COVERAGE,
+    )
+
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert packet["siteOnlyDiff"] == {
+        "addedSiteIds": ["neis:B10:7010001:added"],
+        "changedSiteIds": ["neis:B10:7010001:changed"],
+        "missingSiteIds": ["neis:B10:7010001:removed"],
+    }
+
+
+def test_review_rejects_tampered_candidate_before_emitting_packet(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="tampered-review",
+        coverage=TEST_COVERAGE,
+    )
+    (candidate.candidate_path / "sites.jsonl").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError, match="hash|candidate"):
+        build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_review_rejects_unsafe_id_symlink_and_quality_issues(tmp_path: Path) -> None:
+    with pytest.raises(SnapshotQualityError, match="snapshot ID"):
+        build_candidate_review_packet(
+            snapshot_id="../unsafe",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    external = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path / "external",
+        snapshot_id="symlink-review",
+        coverage=TEST_COVERAGE,
+    )
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / ".symlink-review.candidate").symlink_to(
+        external.candidate_path,
+        target_is_directory=True,
+    )
+    with pytest.raises(SnapshotQualityError, match="symlink"):
+        build_candidate_review_packet(
+            snapshot_id="symlink-review",
+            snapshot_root=target,
+            coverage=TEST_COVERAGE,
+        )
+
+    invalid = replace(source_record(), latitude=35.1796, longitude=129.0756)
+    rejected = build_test_candidate(
+        records=(invalid,),
+        previous=None,
+        output_root=tmp_path / "quality",
+        snapshot_id="quality-review",
+        coverage=TEST_COVERAGE,
+    )
+    assert rejected.issues
+    with pytest.raises(SnapshotQualityError, match="coordinate|quality"):
+        build_candidate_review_packet(
+            snapshot_id=rejected.snapshot_id,
+            snapshot_root=tmp_path / "quality",
+            coverage=TEST_COVERAGE,
+        )
 
 
 def test_promotion_replays_coverage_for_persisted_active_site(

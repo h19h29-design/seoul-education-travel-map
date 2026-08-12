@@ -230,6 +230,17 @@ class SnapshotBuildResult:
     issues: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _ReviewableCandidate:
+    result: SnapshotBuildResult
+    root: Path
+    selected_path: Path
+    manifest: dict[str, object]
+    institutions: tuple[Institution, ...]
+    sites: tuple[InstitutionSite, ...]
+    transaction: dict[str, object]
+
+
 def reconcile_selectable_school_counts(
     records: tuple[SourceInstitutionRecord, ...],
     *,
@@ -685,37 +696,35 @@ def promote_snapshot(
             os.close(descriptor)
 
 
-def _promote_snapshot_locked(
-    candidate: SnapshotBuildResult,
-    output_root: Path,
+def build_candidate_review_packet(
     *,
+    snapshot_id: str,
+    snapshot_root: Path,
     coverage: CoverageService,
-) -> None:
-    if _SAFE_SNAPSHOT_ID.fullmatch(candidate.snapshot_id) is None:
+) -> dict[str, object]:
+    reviewable = _load_reviewable_candidate(
+        snapshot_id=snapshot_id,
+        snapshot_root=snapshot_root,
+        coverage=coverage,
+        allow_recovery_final=False,
+    )
+    return _build_review_packet(reviewable)
+
+
+def _load_reviewable_candidate(
+    *,
+    snapshot_id: str,
+    snapshot_root: Path,
+    coverage: CoverageService,
+    allow_recovery_final: bool,
+) -> _ReviewableCandidate:
+    if _SAFE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
         raise SnapshotQualityError("snapshot ID is unsafe")
-    root = _validated_snapshot_root(Path(output_root))
-    candidate_path = Path(candidate.candidate_path)
-    expected_candidate_name = f".{candidate.snapshot_id}.candidate"
-    try:
-        candidate_parent = candidate_path.parent.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise SnapshotQualityError("candidate path parent is invalid") from exc
-    if (
-        candidate_path.name != expected_candidate_name
-        or candidate_parent != root
-    ):
-        raise SnapshotQualityError("candidate path is outside the snapshot root")
+    root = _validated_snapshot_root(Path(snapshot_root))
+    candidate_path = root / f".{snapshot_id}.candidate"
+    final_path = root / snapshot_id
     if candidate_path.is_symlink():
         raise SnapshotQualityError("candidate path must not be a symlink")
-    transaction = _load_build_transaction(root, candidate.snapshot_id)
-    transaction_issues = transaction.get("issues")
-    if type(transaction_issues) is not list:
-        raise SnapshotQualityError("build transaction issues are invalid")
-    if transaction_issues:
-        raise SnapshotQualityError("; ".join(cast(list[str], transaction_issues)))
-    phase = cast(str, transaction["phase"])
-    candidate_path = root / expected_candidate_name
-    final_path = root / candidate.snapshot_id
     if final_path.is_symlink():
         raise SnapshotQualityError("final snapshot path must not be a symlink")
     current_path = root / "current.json"
@@ -723,9 +732,19 @@ def _promote_snapshot_locked(
         raise SnapshotQualityError("current pointer must not be a symlink")
     if candidate_path.exists() and final_path.exists():
         raise SnapshotQualityError("candidate and final snapshot both exist")
+    if not allow_recovery_final and not candidate_path.is_dir():
+        raise SnapshotQualityError("candidate snapshot is missing")
     selected_path = candidate_path if candidate_path.exists() else final_path
     if not selected_path.is_dir():
         raise SnapshotQualityError("candidate snapshot is missing")
+
+    transaction = _load_build_transaction(root, snapshot_id)
+    transaction_issues = transaction.get("issues")
+    if type(transaction_issues) is not list:
+        raise SnapshotQualityError("build transaction issues are invalid")
+    if transaction_issues:
+        raise SnapshotQualityError("; ".join(cast(list[str], transaction_issues)))
+    phase = cast(str, transaction["phase"])
     manifest_path = _validated_snapshot_file(
         selected_path / "manifest.json",
         selected_path,
@@ -736,10 +755,14 @@ def _promote_snapshot_locked(
         _verify_manifest_fields(manifest)
     except SnapshotIntegrityError as exc:
         raise SnapshotQualityError("candidate manifest fields are invalid") from exc
-    if selected_path == candidate_path and manifest.get("approved") is not False:
-        raise SnapshotQualityError("candidate manifest must remain approved=false")
-    if selected_path == candidate_path and phase != "BUILT":
-        raise SnapshotQualityError("build transaction phase is invalid")
+
+    if selected_path == candidate_path:
+        if manifest.get("approved") is not False:
+            raise SnapshotQualityError("candidate manifest must remain approved=false")
+        if phase != "BUILT":
+            raise SnapshotQualityError("build transaction phase is invalid")
+    elif not allow_recovery_final:
+        raise SnapshotQualityError("candidate snapshot is missing")
     if transaction.get("sourcesSha256") != _manifest_section_sha256(
         manifest.get("sources")
     ):
@@ -771,15 +794,64 @@ def _promote_snapshot_locked(
         _validate_approved_manifest_schema(manifest)
     else:
         raise SnapshotQualityError("recoverable final manifest approval is invalid")
+
     institutions, sites = _recheck_candidate(
         selected_path,
         manifest,
-        candidate.snapshot_id,
+        snapshot_id,
     )
     _recheck_promotion_quality(root, manifest, institutions, sites, coverage)
     _recheck_source_provenance(manifest, institutions, sites)
     _recheck_enrichment_provenance(manifest, institutions, sites)
     _transaction_attests_manifest(transaction, manifest)
+    result = SnapshotBuildResult(
+        snapshot_id=snapshot_id,
+        candidate_path=candidate_path,
+        approved=False,
+        issues=tuple(cast(list[str], transaction_issues)),
+    )
+    return _ReviewableCandidate(
+        result=result,
+        root=root,
+        selected_path=selected_path,
+        manifest=manifest,
+        institutions=tuple(institutions),
+        sites=tuple(sites),
+        transaction=transaction,
+    )
+
+
+def _promote_snapshot_locked(
+    candidate: SnapshotBuildResult,
+    output_root: Path,
+    *,
+    coverage: CoverageService,
+) -> None:
+    if _SAFE_SNAPSHOT_ID.fullmatch(candidate.snapshot_id) is None:
+        raise SnapshotQualityError("snapshot ID is unsafe")
+    root = _validated_snapshot_root(Path(output_root))
+    candidate_path = Path(candidate.candidate_path)
+    expected_candidate_name = f".{candidate.snapshot_id}.candidate"
+    try:
+        candidate_parent = candidate_path.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SnapshotQualityError("candidate path parent is invalid") from exc
+    if candidate_path.name != expected_candidate_name or candidate_parent != root:
+        raise SnapshotQualityError("candidate path is outside the snapshot root")
+    reviewable = _load_reviewable_candidate(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=root,
+        coverage=coverage,
+        allow_recovery_final=True,
+    )
+    transaction = reviewable.transaction
+    phase = cast(str, transaction["phase"])
+    candidate_path = root / expected_candidate_name
+    final_path = root / candidate.snapshot_id
+    current_path = root / "current.json"
+    selected_path = reviewable.selected_path
+    manifest = reviewable.manifest
+    manifest_path = selected_path / "manifest.json"
     for file_name in ("manifest.json", "institutions.jsonl", "sites.jsonl"):
         _fsync_file(selected_path / file_name)
     _fsync_directory(selected_path)
@@ -1709,7 +1781,7 @@ def _strict_json_loads(data: str | bytes) -> object:
     )
 
 
-def _manifest_section_sha256(value: object) -> str:
+def _canonical_sha256(value: object) -> str:
     return hashlib.sha256(
         json.dumps(
             value,
@@ -1718,6 +1790,142 @@ def _manifest_section_sha256(value: object) -> str:
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _unapproved_manifest(
+    manifest: Mapping[str, object],
+) -> dict[str, object]:
+    value = dict(manifest)
+    value["approved"] = False
+    value["approvedAt"] = None
+    value["approvedByRole"] = None
+    return value
+
+
+def _manifest_section_sha256(value: object) -> str:
+    return _canonical_sha256(value)
+
+
+def _build_review_packet(reviewable: _ReviewableCandidate) -> dict[str, object]:
+    manifest = reviewable.manifest
+    institutions = reviewable.institutions
+    sites = reviewable.sites
+    source_entries = cast(list[dict[str, object]], manifest["sources"])
+    source_counts = {
+        cast(str, entry["source"]): {
+            "fetched": cast(int, entry["fetchedRowCount"]),
+            "normalized": cast(int, entry["normalizedRowCount"]),
+            "preserved": cast(int, entry["preservedRowCount"]),
+            "output": cast(int, entry["rowCount"]),
+        }
+        for entry in sorted(source_entries, key=lambda item: cast(str, item["source"]))
+    }
+    district_counts = dict(
+        sorted(Counter(site.district for site in sites if site.is_default).items())
+    )
+    diff = cast(dict[str, object], manifest["diff"])
+    packet_without_digest: dict[str, object] = {
+        "status": "CANDIDATE_REVIEW_REQUIRED",
+        "snapshotId": reviewable.result.snapshot_id,
+        "createdAt": cast(str, manifest["createdAt"]),
+        "snapshotAsOf": cast(str, manifest["snapshotAsOf"]),
+        "previousSnapshotId": diff.get("previousSnapshotId"),
+        "sourceCounts": source_counts,
+        "institutionTypeCounts": dict(
+            sorted(Counter(item.institution_type for item in institutions).items())
+        ),
+        "foundationCounts": dict(
+            sorted(Counter(item.foundation_type for item in institutions).items())
+        ),
+        "districtCounts": district_counts,
+        "statusCounts": dict(
+            sorted(Counter(item.status.value for item in institutions).items())
+        ),
+        "coordinateQualityCounts": dict(
+            sorted(Counter(item.coordinate_quality for item in sites).items())
+        ),
+        "quarantinedInstitutionIds": sorted(
+            item.institution_id
+            for item in institutions
+            if item.status is InstitutionStatus.REVIEW_REQUIRED
+        ),
+        "quarantinedSiteIds": sorted(
+            item.site_id
+            for item in sites
+            if item.status is InstitutionStatus.REVIEW_REQUIRED
+        ),
+        "diff": dict(diff),
+        "siteOnlyDiff": _build_site_only_diff(reviewable, diff),
+        "institutionsSha256": cast(str, manifest["institutionsSha256"]),
+        "sitesSha256": cast(str, manifest["sitesSha256"]),
+        "candidateManifestSha256": _canonical_sha256(_unapproved_manifest(manifest)),
+        "sourceProvenanceSha256": _canonical_sha256(manifest["sources"]),
+        "enrichmentProvenanceSha256": _canonical_sha256(manifest["enrichments"]),
+    }
+    packet = dict(packet_without_digest)
+    packet["reviewDigest"] = _canonical_sha256(packet_without_digest)
+    return packet
+
+
+def _build_site_only_diff(
+    reviewable: _ReviewableCandidate,
+    diff: Mapping[str, object],
+) -> dict[str, object]:
+    previous_snapshot_id = diff.get("previousSnapshotId")
+    if previous_snapshot_id is None:
+        return {
+            "addedSiteIds": [],
+            "changedSiteIds": [],
+            "missingSiteIds": [],
+        }
+    if type(previous_snapshot_id) is not str:
+        raise SnapshotQualityError("candidate previous snapshot ID is invalid")
+    try:
+        previous = verify_snapshot_directory(
+            reviewable.root,
+            previous_snapshot_id,
+        )
+    except (OSError, ValueError) as exc:
+        raise SnapshotQualityError(
+            "candidate previous snapshot cannot be verified"
+        ) from exc
+
+    current_by_id = {
+        institution.institution_id: institution
+        for institution in reviewable.institutions
+    }
+    previous_by_id = {
+        institution.institution_id: institution for institution in previous.institutions
+    }
+    unchanged_institution_ids = {
+        institution_id
+        for institution_id in current_by_id.keys() & previous_by_id.keys()
+        if _institution_change_key(current_by_id[institution_id])
+        == _institution_change_key(previous_by_id[institution_id])
+    }
+    current_sites = {
+        site.site_id: site
+        for site in reviewable.sites
+        if site.institution_id in unchanged_institution_ids
+        and site.status is not InstitutionStatus.MISSING_FROM_SOURCE
+    }
+    previous_sites = {
+        site.site_id: site
+        for site in previous.sites
+        if site.institution_id in unchanged_institution_ids
+        and site.status is not InstitutionStatus.MISSING_FROM_SOURCE
+    }
+    shared_site_ids = current_sites.keys() & previous_sites.keys()
+    return {
+        "addedSiteIds": sorted(current_sites.keys() - previous_sites.keys()),
+        "changedSiteIds": sorted(
+            site_id
+            for site_id in shared_site_ids
+            if _site_change_key([current_sites[site_id]])
+            != _site_change_key([previous_sites[site_id]])
+        ),
+        "missingSiteIds": sorted(previous_sites.keys() - current_sites.keys()),
+    }
 
 
 def _create_build_transaction(
