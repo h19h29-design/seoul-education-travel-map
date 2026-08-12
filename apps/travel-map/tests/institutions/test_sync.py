@@ -64,7 +64,6 @@ from app.institutions.sync import (
     emit_sync_preflight_audit,
     enrichment_records_sha256,
     geocode_missing_records,
-    promote_snapshot,
     reconcile_selectable_school_counts,
 )
 from app.policy.coverage import CoverageService
@@ -580,7 +579,7 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
     )
 
     assert candidate.issues == ()
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
     store = InstitutionStore.load(tmp_path)
 
     matches = store.search("강서도서관")
@@ -1021,6 +1020,13 @@ async def test_sync_cli_stops_at_candidate_review_without_promotion(
     assert set(keys.values()) == {""}
     assert not hasattr(module, "promote_snapshot")
     assert not (tmp_path / "current.json").exists()
+
+
+def test_no_production_script_has_automatic_snapshot_promotion() -> None:
+    assert not hasattr(sync_module, "promote_snapshot")
+    for path in Path("apps/travel-map/scripts").glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        assert "promote_snapshot" not in source
 
 
 def test_sync_cli_main_prints_compact_candidate_review_status(
@@ -1882,7 +1888,7 @@ def test_source_record_persists_official_branch_as_second_site(
         snapshot_id="official-branch",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
     assert len(verified.institutions) == 1
@@ -1915,7 +1921,7 @@ def test_missing_coordinate_branch_is_persisted_for_review(
         snapshot_id="missing-branch",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
     branch_site = next(
@@ -1947,7 +1953,7 @@ def test_manifest_persists_cross_source_possible_match_pairs(
         snapshot_id="possible-pair",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
     assert {item.institution_id for item in verified.institutions} == {
@@ -2010,7 +2016,7 @@ def test_failed_candidate_does_not_replace_current_snapshot(tmp_path: Path) -> N
         snapshot_id="initial",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(initial, root, coverage=TEST_COVERAGE)
+    approve_test_candidate(initial, root, coverage=TEST_COVERAGE)
     before = (root / "current.json").read_bytes()
     result = build_test_candidate(
         records=records[:6],
@@ -2023,7 +2029,7 @@ def test_failed_candidate_does_not_replace_current_snapshot(tmp_path: Path) -> N
     assert result.approved is False
     forged_result = replace(result, issues=())
     with pytest.raises(SnapshotQualityError, match="record count drop"):
-        promote_snapshot(forged_result, root, coverage=TEST_COVERAGE)
+        approve_test_candidate(forged_result, root, coverage=TEST_COVERAGE)
     assert (root / "current.json").read_bytes() == before
 
 
@@ -2052,7 +2058,7 @@ def test_existing_current_cannot_be_replaced_when_previous_is_omitted(
         snapshot_id="existing-current",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
     before = (tmp_path / "current.json").read_bytes()
     omitted = build_test_candidate(
         records=records[:1],
@@ -2063,7 +2069,7 @@ def test_existing_current_cannot_be_replaced_when_previous_is_omitted(
     )
 
     with pytest.raises(SnapshotQualityError, match="previous snapshot"):
-        promote_snapshot(omitted, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(omitted, tmp_path, coverage=TEST_COVERAGE)
     assert (tmp_path / "current.json").read_bytes() == before
 
 
@@ -2093,7 +2099,7 @@ def test_coordinate_gate_uses_only_current_rows_and_stale_sites_are_inactive(
         snapshot_id="full",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(initial, root, coverage=TEST_COVERAGE)
+    approve_test_candidate(initial, root, coverage=TEST_COVERAGE)
     current = list(records[:90])
     for index in (88, 89):
         current[index] = SourceInstitutionRecord(
@@ -2146,7 +2152,7 @@ def test_preserved_enriched_site_does_not_require_current_enrichment_match(
             standard_enrichment_provenance(matched_row_count=1),
         ),
     )
-    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
     replacement = source_record(institution_id="neis:B10:7010002")
     candidate = build_test_candidate(
         records=(replacement,),
@@ -2156,7 +2162,7 @@ def test_preserved_enriched_site_does_not_require_current_enrichment_match(
         coverage=TEST_COVERAGE,
     )
 
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
     old = next(
@@ -2189,7 +2195,7 @@ def test_missing_official_branch_is_preserved_when_parent_remains(
         snapshot_id="branch-before-missing",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
     candidate = build_test_candidate(
         records=(source_record(),),
         previous=verify_snapshot(tmp_path),
@@ -2198,7 +2204,7 @@ def test_missing_official_branch_is_preserved_when_parent_remains(
         coverage=TEST_COVERAGE,
     )
 
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
     old_branch = next(
@@ -2218,7 +2224,7 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
         snapshot_id="concurrent-base",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
     previous = verify_snapshot(tmp_path)
     first = build_test_candidate(
         records=(source_record(),),
@@ -2234,6 +2240,8 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
         snapshot_id="concurrent-second",
         coverage=TEST_COVERAGE,
     )
+    first_digest = review_test_candidate(first, tmp_path)
+    second_digest = review_test_candidate(second, tmp_path)
     real_quality = sync_module._recheck_promotion_quality
     first_entered = threading.Event()
     release_first = threading.Event()
@@ -2260,17 +2268,19 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
     )
     with ThreadPoolExecutor(max_workers=2) as executor:
         first_future = executor.submit(
-            promote_snapshot,
+            approve_test_candidate,
             first,
             tmp_path,
             coverage=TEST_COVERAGE,
+            review_digest=first_digest,
         )
         assert first_entered.wait(timeout=2)
         second_future = executor.submit(
-            promote_snapshot,
+            approve_test_candidate,
             second,
             tmp_path,
             coverage=TEST_COVERAGE,
+            review_digest=second_digest,
         )
         assert not second_entered.wait(timeout=0.2)
         release_first.set()
@@ -2293,7 +2303,7 @@ def test_manifest_counts_changed_institution_records(tmp_path: Path) -> None:
         snapshot_id="before-change",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
     original = source_record()
     changed = SourceInstitutionRecord(
         **{**original.__dict__, "official_name": "Changed Official Name"}
@@ -2363,7 +2373,7 @@ def test_coordinate_outside_seoul_is_quarantined(tmp_path: Path) -> None:
     assert any("coordinate validation" in issue for issue in candidate.issues)
     forged_candidate = replace(candidate, issues=())
     with pytest.raises(SnapshotQualityError, match="coordinate validation"):
-        promote_snapshot(forged_candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(forged_candidate, tmp_path, coverage=TEST_COVERAGE)
 
 
 def test_namesake_across_sources_is_not_merged(tmp_path: Path) -> None:
@@ -2405,12 +2415,18 @@ def test_promotion_rechecks_hash_before_pointer_change(tmp_path: Path) -> None:
         snapshot_id="tampered",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     (candidate.candidate_path / "institutions.jsonl").write_text(
         "tampered\n", encoding="utf-8"
     )
 
     with pytest.raises(SnapshotQualityError, match="hash mismatch"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -2698,7 +2714,7 @@ def test_review_packet_reports_disjoint_site_only_changes(tmp_path: Path) -> Non
         snapshot_id="site-only-before",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
     added = replace(changed, site_code="added", site_name="Added branch")
     candidate = build_test_candidate(
         records=(
@@ -2805,6 +2821,7 @@ def test_promotion_replays_coverage_for_persisted_active_site(
         snapshot_id="tampered-coverage",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     sites_path = candidate.candidate_path / "sites.jsonl"
     site = json.loads(sites_path.read_text(encoding="utf-8"))
     site.update(
@@ -2823,7 +2840,12 @@ def test_promotion_replays_coverage_for_persisted_active_site(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="Seoul coverage"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -2835,6 +2857,7 @@ def test_candidate_cannot_self_approve_before_promotion(tmp_path: Path) -> None:
         snapshot_id="self-approved",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["approved"] = True
@@ -2843,7 +2866,12 @@ def test_candidate_cannot_self_approve_before_promotion(tmp_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="approved=false"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -2860,9 +2888,15 @@ def test_promotion_rejects_candidate_from_another_snapshot_root(
         snapshot_id="external-candidate",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, external_root)
 
     with pytest.raises(SnapshotQualityError, match="candidate path"):
-        promote_snapshot(candidate, target_root, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            target_root,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert candidate.candidate_path.is_dir()
     assert not (target_root / "current.json").exists()
 
@@ -2875,6 +2909,7 @@ def test_promotion_rejects_candidate_symlink(tmp_path: Path) -> None:
         snapshot_id="symlinked",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(external, tmp_path / "external")
     target_root = tmp_path / "target"
     target_root.mkdir()
     candidate_path = target_root / ".symlinked.candidate"
@@ -2887,7 +2922,12 @@ def test_promotion_rejects_candidate_symlink(tmp_path: Path) -> None:
     )
 
     with pytest.raises(SnapshotQualityError, match="symlink"):
-        promote_snapshot(forged, target_root, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            forged,
+            target_root,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (target_root / "current.json").exists()
 
 
@@ -2906,13 +2946,19 @@ def test_promotion_rejects_symlinked_candidate_file(
         snapshot_id=f"symlink-{file_name.split('.')[0]}",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     candidate_file = candidate.candidate_path / file_name
     external_file = tmp_path / f"external-{file_name}"
     candidate_file.rename(external_file)
     candidate_file.symlink_to(external_file)
 
     with pytest.raises(SnapshotQualityError, match="symlink"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -2924,6 +2970,7 @@ def test_promotion_revalidates_safe_snapshot_slug(tmp_path: Path) -> None:
         snapshot_id="safe-slug",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     forged = replace(
         candidate,
         snapshot_id="../escaped-final",
@@ -2931,7 +2978,12 @@ def test_promotion_revalidates_safe_snapshot_slug(tmp_path: Path) -> None:
     )
 
     with pytest.raises(SnapshotQualityError, match="unsafe"):
-        promote_snapshot(forged, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            forged,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path.parent / "escaped-final").exists()
 
 
@@ -2945,13 +2997,19 @@ def test_promotion_recounts_candidate_manifest_before_pointer_change(
         snapshot_id="bad-count",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["institutionCount"] = 99
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="institutionCount"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -2965,6 +3023,7 @@ def test_promotion_binds_source_digest_to_persisted_site_content(
         snapshot_id="site-provenance-binding",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     sites_path = candidate.candidate_path / "sites.jsonl"
     site = json.loads(sites_path.read_text(encoding="utf-8"))
     site.update(
@@ -2985,7 +3044,12 @@ def test_promotion_binds_source_digest_to_persisted_site_content(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="source provenance"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -2999,6 +3063,7 @@ def test_promotion_rejects_replacement_acquisition_provenance(
         snapshot_id="replacement-acquisition",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sources"][0].update(
@@ -3011,7 +3076,12 @@ def test_promotion_rejects_replacement_acquisition_provenance(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="source provenance"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3025,6 +3095,7 @@ def test_public_result_cannot_authorize_replaced_raw_provenance(
         snapshot_id="forged-public-attestations",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sources"][0]["rawSha256"] = "f" * 64
@@ -3032,7 +3103,12 @@ def test_public_result_cannot_authorize_replaced_raw_provenance(
     forged = replace(candidate, issues=())
 
     with pytest.raises(SnapshotQualityError, match="transaction attestation"):
-        promote_snapshot(forged, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            forged,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3118,6 +3194,7 @@ def test_promotion_rejects_missing_or_tampered_build_transaction(
         snapshot_id=f"{mutation}-transaction",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     receipt_path = (
         tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
     )
@@ -3129,7 +3206,12 @@ def test_promotion_rejects_missing_or_tampered_build_transaction(
         receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="transaction"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3152,6 +3234,7 @@ def test_build_transaction_cannot_be_copied_between_output_roots(
         snapshot_id="copied-transaction",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(second, second_root)
     first_receipt = (
         first_root / ".sync-transactions" / "copied-transaction.json"
     )
@@ -3161,7 +3244,12 @@ def test_build_transaction_cannot_be_copied_between_output_roots(
     second_receipt.write_bytes(first_receipt.read_bytes())
 
     with pytest.raises(SnapshotQualityError, match="transaction attestation"):
-        promote_snapshot(second, second_root, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            second,
+            second_root,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (second_root / "current.json").exists()
     assert first.candidate_path.is_dir()
 
@@ -3185,6 +3273,7 @@ def test_standard_enrichment_binds_selected_site_mapping(
             standard_enrichment_provenance(matched_row_count=1),
         ),
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     sites_path = candidate.candidate_path / "sites.jsonl"
     site = json.loads(sites_path.read_text(encoding="utf-8"))
     site.update(
@@ -3207,7 +3296,12 @@ def test_standard_enrichment_binds_selected_site_mapping(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="provenance"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3221,6 +3315,7 @@ def test_promotion_runs_task3_strict_checks_before_pointer(
         snapshot_id="strict-before-pointer",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     institutions_path = candidate.candidate_path / "institutions.jsonl"
     institution = json.loads(institutions_path.read_text(encoding="utf-8"))
     institution["lastSeenSnapshot"] = "other-snapshot"
@@ -3234,7 +3329,12 @@ def test_promotion_runs_task3_strict_checks_before_pointer(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="transaction attestation"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3260,13 +3360,19 @@ def test_promotion_replays_source_provenance_from_persisted_rows(
         snapshot_id=f"promotion-source-{field_name}",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sources"][0][field_name] = value
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="source provenance"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3289,13 +3395,19 @@ def test_promotion_replays_enrichment_provenance_from_persisted_rows(
             standard_enrichment_provenance(matched_row_count=1),
         ),
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["enrichments"][0]["normalizedSha256"] = "f" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="enrichment provenance"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3477,6 +3589,7 @@ def test_pointer_replace_failure_is_recoverable(
         snapshot_id="recoverable",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer_once(source: str | Path, destination: str | Path) -> None:
@@ -3486,12 +3599,22 @@ def test_pointer_replace_failure_is_recoverable(
 
     monkeypatch.setattr(os, "replace", fail_pointer_once)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
     assert (tmp_path / "recoverable").is_dir()
 
     monkeypatch.setattr(os, "replace", real_replace)
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(
+        candidate,
+        tmp_path,
+        coverage=TEST_COVERAGE,
+        review_digest=review_digest,
+    )
     assert verify_snapshot(tmp_path).manifest.snapshot_id == "recoverable"
 
 
@@ -3506,6 +3629,7 @@ def test_pointer_failure_restart_uses_durable_transaction_not_result_fields(
         snapshot_id="restart-from-transaction",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer(source: str | Path, destination: str | Path) -> None:
@@ -3515,7 +3639,12 @@ def test_pointer_failure_restart_uses_durable_transaction_not_result_fields(
 
     monkeypatch.setattr(os, "replace", fail_pointer)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     monkeypatch.setattr(os, "replace", real_replace)
     snapshot_id = candidate.snapshot_id
     candidate_path = candidate.candidate_path
@@ -3527,7 +3656,12 @@ def test_pointer_failure_restart_uses_durable_transaction_not_result_fields(
         issues=(),
     )
 
-    promote_snapshot(restarted, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(
+        restarted,
+        tmp_path,
+        coverage=TEST_COVERAGE,
+        review_digest=review_digest,
+    )
     assert verify_snapshot(tmp_path).manifest.snapshot_id == snapshot_id
 
 
@@ -3542,6 +3676,7 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
         snapshot_id="pointer-written-before-phase",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     real_advance = sync_module._advance_build_transaction
 
     def fail_published_phase(
@@ -3566,7 +3701,12 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
         fail_published_phase,
     )
     with pytest.raises(OSError, match="before published receipt"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     pointer_before = (tmp_path / "current.json").read_bytes()
     receipt_path = (
         tmp_path
@@ -3588,7 +3728,12 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
         issues=(),
     )
 
-    promote_snapshot(restarted, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(
+        restarted,
+        tmp_path,
+        coverage=TEST_COVERAGE,
+        review_digest=review_digest,
+    )
 
     assert (tmp_path / "current.json").read_bytes() == pointer_before
     assert json.loads(receipt_path.read_text(encoding="utf-8"))["phase"] == (
@@ -3607,14 +3752,25 @@ def test_published_transaction_cannot_authorize_a_different_current_pointer(
         snapshot_id="published-pointer-binding",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    review_digest = review_test_candidate(candidate, tmp_path)
+    approve_test_candidate(
+        candidate,
+        tmp_path,
+        coverage=TEST_COVERAGE,
+        review_digest=review_digest,
+    )
     (tmp_path / "current.json").write_text(
         json.dumps({"snapshotId": "different-snapshot"}),
         encoding="utf-8",
     )
 
     with pytest.raises(SnapshotQualityError, match="pointer|current snapshot"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
 
     assert json.loads((tmp_path / "current.json").read_text(encoding="utf-8")) == {
         "snapshotId": "different-snapshot"
@@ -3632,6 +3788,7 @@ def test_pointer_failure_rejects_changed_attested_approval_timestamp(
         snapshot_id="changed-approved-at",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer(source: str | Path, destination: str | Path) -> None:
@@ -3641,7 +3798,12 @@ def test_pointer_failure_rejects_changed_attested_approval_timestamp(
 
     monkeypatch.setattr(os, "replace", fail_pointer)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     monkeypatch.setattr(os, "replace", real_replace)
     manifest_path = tmp_path / candidate.snapshot_id / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -3649,7 +3811,12 @@ def test_pointer_failure_rejects_changed_attested_approval_timestamp(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="approval phase"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3663,6 +3830,7 @@ def test_forged_approved_final_without_attested_phase_is_rejected(
         snapshot_id="forged-approved-final",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     final_path = tmp_path / candidate.snapshot_id
     os.replace(candidate.candidate_path, final_path)
     manifest_path = final_path / "manifest.json"
@@ -3677,7 +3845,12 @@ def test_forged_approved_final_without_attested_phase_is_rejected(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="approval phase"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3692,6 +3865,7 @@ def test_manifest_replace_failure_is_recoverable(
         snapshot_id="manifest-recovery",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_manifest_once(source: str | Path, destination: str | Path) -> None:
@@ -3701,12 +3875,22 @@ def test_manifest_replace_failure_is_recoverable(
 
     monkeypatch.setattr(os, "replace", fail_manifest_once)
     with pytest.raises(OSError, match="manifest replacement failure"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
     assert (tmp_path / "manifest-recovery").is_dir()
 
     monkeypatch.setattr(os, "replace", real_replace)
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(
+        candidate,
+        tmp_path,
+        coverage=TEST_COVERAGE,
+        review_digest=review_digest,
+    )
     assert verify_snapshot(tmp_path).manifest.snapshot_id == "manifest-recovery"
 
 
@@ -3727,6 +3911,7 @@ def test_pointer_retry_validates_real_approved_manifest(
         snapshot_id=f"retry-{field_name}",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer(source: str | Path, destination: str | Path) -> None:
@@ -3736,7 +3921,12 @@ def test_pointer_retry_validates_real_approved_manifest(
 
     monkeypatch.setattr(os, "replace", fail_pointer)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     monkeypatch.setattr(os, "replace", real_replace)
     manifest_path = tmp_path / candidate.snapshot_id / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -3744,7 +3934,12 @@ def test_pointer_retry_validates_real_approved_manifest(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="approved manifest"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3759,6 +3954,7 @@ def test_pointer_retry_rejects_duplicate_approval_key(
         snapshot_id="retry-duplicate-key",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer(source: str | Path, destination: str | Path) -> None:
@@ -3768,7 +3964,12 @@ def test_pointer_retry_rejects_duplicate_approval_key(
 
     monkeypatch.setattr(os, "replace", fail_pointer)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     monkeypatch.setattr(os, "replace", real_replace)
     manifest_path = tmp_path / candidate.snapshot_id / "manifest.json"
     manifest_text = manifest_path.read_text(encoding="utf-8")
@@ -3782,7 +3983,12 @@ def test_pointer_retry_rejects_duplicate_approval_key(
     )
 
     with pytest.raises(SnapshotQualityError, match="duplicate JSON key"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3794,10 +4000,21 @@ def test_successful_promotion_retry_is_idempotent(tmp_path: Path) -> None:
         snapshot_id="already-current-retry",
         coverage=TEST_COVERAGE,
     )
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    review_digest = review_test_candidate(candidate, tmp_path)
+    approve_test_candidate(
+        candidate,
+        tmp_path,
+        coverage=TEST_COVERAGE,
+        review_digest=review_digest,
+    )
     first_pointer = (tmp_path / "current.json").read_bytes()
 
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(
+        candidate,
+        tmp_path,
+        coverage=TEST_COVERAGE,
+        review_digest=review_digest,
+    )
 
     assert (tmp_path / "current.json").read_bytes() == first_pointer
     assert verify_snapshot(tmp_path).manifest.snapshot_id == candidate.snapshot_id
@@ -3813,6 +4030,7 @@ def test_promotion_rejects_duplicate_jsonl_key_before_pointer(
         snapshot_id="duplicate-jsonl-key",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     institutions_path = candidate.candidate_path / "institutions.jsonl"
     line = institutions_path.read_text(encoding="utf-8")
     tampered = line.replace(
@@ -3827,7 +4045,12 @@ def test_promotion_rejects_duplicate_jsonl_key_before_pointer(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="duplicate JSON key"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3842,6 +4065,7 @@ def test_candidate_directory_replace_failure_is_recoverable(
         snapshot_id="rename-recovery",
         coverage=TEST_COVERAGE,
     )
+    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_directory_once(source: str | Path, destination: str | Path) -> None:
@@ -3851,7 +4075,12 @@ def test_candidate_directory_replace_failure_is_recoverable(
 
     monkeypatch.setattr(os, "replace", fail_directory_once)
     with pytest.raises(OSError, match="directory replacement failure"):
-        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+        approve_test_candidate(
+            candidate,
+            tmp_path,
+            coverage=TEST_COVERAGE,
+            review_digest=review_digest,
+        )
     manifest = json.loads(
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
@@ -3859,8 +4088,136 @@ def test_candidate_directory_replace_failure_is_recoverable(
     assert not (tmp_path / "current.json").exists()
 
     monkeypatch.setattr(os, "replace", real_replace)
-    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    approve_test_candidate(
+        candidate,
+        tmp_path,
+        coverage=TEST_COVERAGE,
+        review_digest=review_digest,
+    )
     assert verify_snapshot(tmp_path).manifest.snapshot_id == "rename-recovery"
+
+
+def test_review_cli_is_offline_and_emits_only_review_packet(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="review-cli",
+        coverage=TEST_COVERAGE,
+    )
+    command = [
+        sys.executable,
+        "apps/travel-map/scripts/review-institution-snapshot.py",
+        "--snapshot-id",
+        candidate.snapshot_id,
+        "--snapshot-root",
+        str(tmp_path),
+        "--geodata-root",
+        "apps/travel-map/resources/geodata",
+    ]
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": "apps/travel-map",
+    }
+
+    completed = subprocess.run(
+        command,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    packet = json.loads(completed.stdout)
+
+    assert completed.returncode == 0
+    assert packet["status"] == "CANDIDATE_REVIEW_REQUIRED"
+    assert completed.stderr == ""
+
+    rejected = subprocess.run(
+        [*command, "--env-file", "ignored"],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode == 2
+    assert "unrecognized arguments: --env-file ignored" in rejected.stderr
+
+
+def test_approval_cli_is_offline_and_emits_exact_success_object(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="approval-cli",
+        coverage=TEST_COVERAGE,
+    )
+    review_digest = review_test_candidate(candidate, tmp_path)
+    command = [
+        sys.executable,
+        "apps/travel-map/scripts/approve-institution-snapshot.py",
+        "--snapshot-id",
+        candidate.snapshot_id,
+        "--review-digest",
+        review_digest,
+        "--reviewer-role",
+        "data-steward",
+        "--snapshot-root",
+        str(tmp_path),
+        "--geodata-root",
+        "apps/travel-map/resources/geodata",
+    ]
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": "apps/travel-map",
+    }
+
+    completed = subprocess.run(
+        command,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    expected = {
+        "reviewDigest": review_digest,
+        "snapshotId": candidate.snapshot_id,
+        "status": "SNAPSHOT_APPROVED",
+    }
+
+    assert completed.returncode == 0
+    assert completed.stdout == (
+        json.dumps(
+            expected,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    assert completed.stderr == ""
+    assert verify_snapshot(tmp_path).manifest.snapshot_id == candidate.snapshot_id
+    for credential_name in (
+        "NEIS_API_KEY",
+        "KINDERGARTEN_API_KEY",
+        "KAKAO_REST_API_KEY",
+        "Authorization",
+    ):
+        assert credential_name not in completed.stdout + completed.stderr
+
+    rejected = subprocess.run(
+        [*command, "--env-file", "ignored"],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode == 2
+    assert "unrecognized arguments: --env-file ignored" in rejected.stderr
 
 
 def test_sync_cli_fails_closed_without_credentials(tmp_path: Path) -> None:
@@ -3980,19 +4337,34 @@ def approve_test_candidate(
     output_root: Path,
     *,
     coverage: CoverageService = TEST_COVERAGE,
+    review_digest: str | None = None,
+) -> str:
+    digest = review_digest or review_test_candidate(
+        candidate,
+        output_root,
+        coverage=coverage,
+    )
+    return approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=digest,
+        reviewer_role="data-steward",
+        snapshot_root=output_root,
+        coverage=coverage,
+    )
+
+
+def review_test_candidate(
+    candidate: SnapshotBuildResult,
+    output_root: Path,
+    *,
+    coverage: CoverageService = TEST_COVERAGE,
 ) -> str:
     packet = build_candidate_review_packet(
         snapshot_id=candidate.snapshot_id,
         snapshot_root=output_root,
         coverage=coverage,
     )
-    return approve_candidate_snapshot(
-        snapshot_id=candidate.snapshot_id,
-        review_digest=cast(str, packet["reviewDigest"]),
-        reviewer_role="data-steward",
-        snapshot_root=output_root,
-        coverage=coverage,
-    )
+    return cast(str, packet["reviewDigest"])
 
 
 def source_provenance_for(

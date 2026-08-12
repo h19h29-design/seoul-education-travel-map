@@ -664,38 +664,6 @@ def build_candidate_snapshot(
     )
 
 
-def promote_snapshot(
-    candidate: SnapshotBuildResult,
-    output_root: Path,
-    *,
-    coverage: CoverageService,
-) -> None:
-    if _SAFE_SNAPSHOT_ID.fullmatch(candidate.snapshot_id) is None:
-        raise SnapshotQualityError("snapshot ID is unsafe")
-    root = _validated_snapshot_root(Path(output_root))
-    lock_path = root / ".promotion.lock"
-    flags = os.O_CREAT | os.O_RDWR
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(lock_path, flags, 0o600)
-    except OSError as exc:
-        raise SnapshotQualityError("promotion lock is invalid") from exc
-    try:
-        if (
-            not stat.S_ISREG(os.fstat(descriptor).st_mode)
-            or lock_path.resolve(strict=True).parent != root
-        ):
-            raise SnapshotQualityError("promotion lock must be a regular root file")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        _promote_snapshot_locked(candidate, root, coverage=coverage)
-    finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
-
-
 def approve_candidate_snapshot(
     *,
     snapshot_id: str,
@@ -736,7 +704,7 @@ def approve_candidate_snapshot(
             packet = _build_review_packet(reviewable)
         except SnapshotQualityError as exc:
             raise SnapshotQualityError(
-                "candidate manifest or attestation is invalid"
+                f"candidate manifest or attestation is invalid: {exc}"
             ) from exc
         actual_digest = cast(str, packet["reviewDigest"])
         if not hmac.compare_digest(review_digest, actual_digest):
@@ -790,10 +758,10 @@ def _load_reviewable_candidate(
     if candidate_path.exists() and final_path.exists():
         raise SnapshotQualityError("candidate and final snapshot both exist")
     if not allow_recovery_final and not candidate_path.is_dir():
-        raise SnapshotQualityError("candidate snapshot is missing")
+        raise SnapshotQualityError("candidate path or snapshot is missing")
     selected_path = candidate_path if candidate_path.exists() else final_path
     if not selected_path.is_dir():
-        raise SnapshotQualityError("candidate snapshot is missing")
+        raise SnapshotQualityError("candidate path or snapshot is missing")
 
     transaction = _load_build_transaction(root, snapshot_id)
     transaction_issues = transaction.get("issues")

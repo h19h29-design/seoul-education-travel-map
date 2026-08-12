@@ -47,7 +47,7 @@ _SEN_COUNTS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build and atomically promote a Seoul education institution snapshot."
+        description="Build a Seoul education institution snapshot candidate for review."
     )
     parser.add_argument(
         "--sen-csv",
