@@ -159,6 +159,23 @@ def test_release_context_contains_only_the_current_verified_snapshot(
     assert not (context_root / "e2e").exists()
 
 
+def test_release_staging_rejects_candidate_without_current_pointer(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "travel-map"
+    shutil.copytree(ROOT, source_root)
+    snapshots = source_root / "resources/institution-snapshots"
+    snapshots.mkdir()
+    shutil.copytree(
+        FIXTURE_SNAPSHOT / "fixture-001",
+        snapshots / ".candidate-review.candidate",
+    )
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="candidate_release_test")
+
+    with pytest.raises((OSError, ValueError), match="current|snapshot"):
+        module["stage_release_context"](source_root, tmp_path / "context")
+
+
 def test_release_context_omits_unlisted_files_from_selected_snapshot_and_rules(
     tmp_path: Path,
 ) -> None:

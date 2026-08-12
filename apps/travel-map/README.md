@@ -59,12 +59,41 @@ Production accepts only the normalized snapshot selected by `resources/instituti
 With NEIS, kindergarten, and Kakao REST synchronization keys configured:
 
 ```sh
-uv run --project apps/travel-map python apps/travel-map/scripts/sync-institutions.py \
-  --env-file apps/travel-map/.env
-uv run --project apps/travel-map python -c 'from app.institutions.snapshot import verify_snapshot; print(verify_snapshot("apps/travel-map/resources/institution-snapshots").manifest.snapshot_id)'
+review_dir=$(mktemp -d "${TMPDIR:-/tmp}/institution-review.XXXXXX")
+chmod 700 "$review_dir"
+trap 'rm -rf -- "$review_dir"' EXIT HUP INT TERM
+
+uv run --project apps/travel-map python \
+  apps/travel-map/scripts/sync-institutions.py \
+  --env-file apps/travel-map/.env | tee "$review_dir/institution-sync.jsonl"
+
+snapshot_id=$(tail -n 1 "$review_dir/institution-sync.jsonl" | \
+  uv run --project apps/travel-map python -c \
+  'import json,sys; print(json.load(sys.stdin)["snapshotId"])')
+uv run --project apps/travel-map python \
+  apps/travel-map/scripts/review-institution-snapshot.py \
+  --snapshot-id "$snapshot_id" | tee "$review_dir/institution-review.json"
+
+less "$review_dir/institution-review.json"
+review_digest=$(uv run --project apps/travel-map python -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["reviewDigest"])' \
+  "$review_dir/institution-review.json")
+uv run --project apps/travel-map python \
+  apps/travel-map/scripts/approve-institution-snapshot.py \
+  --snapshot-id "$snapshot_id" \
+  --review-digest "$review_digest" \
+  --reviewer-role data-steward
 ```
 
-Use the synchronizer as the only promotion path. An authorized data reviewer must check source scope, counts, quarantined records, coordinate quality, and the diff before approving the manifest. A missing or invalid approved snapshot is a release blocker, never permission to substitute a sample catalog.
+`snapshot_id` comes from the final JSON line emitted by the sync command. Before
+continuing past `less`, an authorized data reviewer must inspect the source,
+institution-type, foundation-type, district, status, and coordinate counts;
+quarantine IDs; and institution and site diffs. The temporary review directory
+is owner-only and the trap deletes it on shell exit or interruption. Only the
+sync command reads provider credentials; review and approval are offline and
+credential-free. Candidate creation alone does not update `current.json` or
+unblock release. A missing or invalid approved snapshot is a release blocker,
+never permission to substitute a sample catalog.
 
 ## Live smoke and manual approval
 
