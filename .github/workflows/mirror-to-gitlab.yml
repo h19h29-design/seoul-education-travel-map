@@ -1,0 +1,36 @@
+name: Mirror to GitLab
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitlab-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'h19h29-design/seoul-education-travel-map'
+    runs-on: ubuntu-latest
+    env:
+      GITLAB_MIRROR_TOKEN: ${{ secrets.GITLAB_MIRROR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify mirror credential
+        run: test -n "$GITLAB_MIRROR_TOKEN"
+
+      - name: Push main and release tags
+        run: |
+          git remote add gitlab "https://oauth2:${GITLAB_MIRROR_TOKEN}@gitlab.aigov.go.kr/h19h19/seoul-education-travel-map.git"
+          git push gitlab HEAD:refs/heads/main
+          git push gitlab --tags
