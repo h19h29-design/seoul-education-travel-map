@@ -508,6 +508,7 @@ def build_candidate_snapshot(
             provenance,
             current_by_source[source_name],
         )
+    _validate_source_districts(records, source_provenance)
     _validate_enrichment_provenance(records, enrichment_provenance)
 
     institutions, sites = _build_current_records(records, snapshot_id, coverage)
@@ -1170,6 +1171,58 @@ def _validate_source_record(record: SourceInstitutionRecord) -> None:
             )
         if site.coordinate_quality not in _ALLOWED_COORDINATE_QUALITIES:
             raise SnapshotQualityError("unsupported coordinate quality")
+
+
+def _validate_source_districts(
+    records: tuple[SourceInstitutionRecord, ...],
+    source_provenance: Mapping[str, SourceProvenance],
+) -> None:
+    for record in records:
+        source_sites = (
+            SourceInstitutionSiteRecord(
+                site_code="main",
+                site_name=record.site_name,
+                road_address=record.road_address,
+                district=record.district,
+                latitude=record.latitude,
+                longitude=record.longitude,
+                coordinate_quality=record.coordinate_quality,
+            ),
+            *record.additional_sites,
+        )
+        for site in source_sites:
+            if site.district in _SEOUL_DISTRICTS:
+                continue
+            provenance = source_provenance.get(record.source)
+            if (
+                provenance is None
+                or not _is_pinned_sen_source_attestation(provenance, records)
+                or _is_seoul_address(site.road_address)
+            ):
+                raise SnapshotQualityError("source site district is invalid")
+
+
+def _is_pinned_sen_source_attestation(
+    provenance: SourceProvenance,
+    records: tuple[SourceInstitutionRecord, ...],
+) -> bool:
+    sen_records = [record for record in records if record.source == "SEN_REVIEWED_CSV"]
+    return (
+        provenance.source == "SEN_REVIEWED_CSV"
+        and provenance.endpoint == _SOURCE_ENDPOINTS["SEN_REVIEWED_CSV"]
+        and provenance.license_name == _SOURCE_LICENSES["SEN_REVIEWED_CSV"]
+        and provenance.attribution == _SOURCE_ATTRIBUTIONS["SEN_REVIEWED_CSV"]
+        and provenance.request_region_code
+        == _EXPECTED_REGION_CODES["SEN_REVIEWED_CSV"]
+        and provenance.raw_sha256
+        == _PINNED_SOURCE_RAW_SHA256["SEN_REVIEWED_CSV"]
+        and provenance.normalized_sha256
+        == _PINNED_SOURCE_NORMALIZED_SHA256["SEN_REVIEWED_CSV"]
+        and normalized_records_sha256(
+            [_record_before_enrichment(record) for record in sen_records]
+        )
+        == _PINNED_SOURCE_NORMALIZED_SHA256["SEN_REVIEWED_CSV"]
+    )
 
 
 def _validate_source_provenance(
@@ -1845,10 +1898,13 @@ def _build_review_packet(reviewable: _ReviewableCandidate) -> dict[str, object]:
         }
         for entry in sorted(source_entries, key=lambda item: cast(str, item["source"]))
     }
-    district_counts = dict(
-        sorted(Counter(site.district for site in sites if site.is_default).items())
-    )
-    diff = cast(dict[str, object], manifest["diff"])
+    district_counts = {district: 0 for district in _SEOUL_DISTRICTS}
+    for site in sites:
+        if site.is_default and site.district in district_counts:
+            district_counts[site.district] += 1
+    manifest_diff = cast(dict[str, object], manifest["diff"])
+    previous = _load_review_previous_snapshot(reviewable, manifest_diff)
+    diff = _build_review_institution_diff(reviewable, manifest_diff, previous)
     packet_without_digest: dict[str, object] = {
         "status": "CANDIDATE_REVIEW_REQUIRED",
         "snapshotId": reviewable.result.snapshot_id,
@@ -1880,7 +1936,7 @@ def _build_review_packet(reviewable: _ReviewableCandidate) -> dict[str, object]:
             if item.status is InstitutionStatus.REVIEW_REQUIRED
         ),
         "diff": dict(diff),
-        "siteOnlyDiff": _build_site_only_diff(reviewable, diff),
+        "siteOnlyDiff": _build_site_only_diff(reviewable, previous),
         "institutionsSha256": cast(str, manifest["institutionsSha256"]),
         "sitesSha256": cast(str, manifest["sitesSha256"]),
         "candidateManifestSha256": _canonical_sha256(_unapproved_manifest(manifest)),
@@ -1892,21 +1948,17 @@ def _build_review_packet(reviewable: _ReviewableCandidate) -> dict[str, object]:
     return packet
 
 
-def _build_site_only_diff(
+def _load_review_previous_snapshot(
     reviewable: _ReviewableCandidate,
     diff: Mapping[str, object],
-) -> dict[str, object]:
+) -> VerifiedSnapshot | None:
     previous_snapshot_id = diff.get("previousSnapshotId")
     if previous_snapshot_id is None:
-        return {
-            "addedSiteIds": [],
-            "changedSiteIds": [],
-            "missingSiteIds": [],
-        }
+        return None
     if type(previous_snapshot_id) is not str:
         raise SnapshotQualityError("candidate previous snapshot ID is invalid")
     try:
-        previous = verify_snapshot_directory(
+        return verify_snapshot_directory(
             reviewable.root,
             previous_snapshot_id,
         )
@@ -1915,6 +1967,42 @@ def _build_site_only_diff(
             "candidate previous snapshot cannot be verified"
         ) from exc
 
+
+def _build_review_institution_diff(
+    reviewable: _ReviewableCandidate,
+    diff: Mapping[str, object],
+    previous: VerifiedSnapshot | None,
+) -> dict[str, object]:
+    value = dict(diff)
+    if previous is None:
+        value["changedCount"] = 0
+        return value
+    current_by_id = {
+        institution.institution_id: institution
+        for institution in reviewable.institutions
+        if institution.status is not InstitutionStatus.MISSING_FROM_SOURCE
+    }
+    previous_by_id = {
+        institution.institution_id: institution for institution in previous.institutions
+    }
+    value["changedCount"] = sum(
+        _institution_change_key(current_by_id[institution_id])
+        != _institution_change_key(previous_by_id[institution_id])
+        for institution_id in current_by_id.keys() & previous_by_id.keys()
+    )
+    return value
+
+
+def _build_site_only_diff(
+    reviewable: _ReviewableCandidate,
+    previous: VerifiedSnapshot | None,
+) -> dict[str, object]:
+    if previous is None:
+        return {
+            "addedSiteIds": [],
+            "changedSiteIds": [],
+            "missingSiteIds": [],
+        }
     current_by_id = {
         institution.institution_id: institution
         for institution in reviewable.institutions
@@ -2764,6 +2852,7 @@ def _recheck_promotion_quality(
 ) -> None:
     for institution in institutions:
         _validate_persisted_institution(institution)
+    _validate_persisted_site_districts(manifest, institutions, sites)
     if any(
         site.coordinate_quality not in _ALLOWED_COORDINATE_QUALITIES
         for site in sites
@@ -2885,6 +2974,48 @@ def _recheck_promotion_quality(
     )
     if previous_active and len(active) < previous_active * 0.9:
         raise SnapshotQualityError("record count drop exceeds 10 percent")
+
+
+def _validate_persisted_site_districts(
+    manifest: Mapping[str, object],
+    institutions: list[Institution],
+    sites: list[InstitutionSite],
+) -> None:
+    institutions_by_id = {
+        institution.institution_id: institution for institution in institutions
+    }
+    sources = manifest.get("sources")
+    sen_attested = type(sources) is list and any(
+        type(entry) is dict and _is_pinned_sen_manifest_source(entry)
+        for entry in sources
+    )
+    for site in sites:
+        if site.district in _SEOUL_DISTRICTS:
+            continue
+        institution = institutions_by_id[site.institution_id]
+        if (
+            not sen_attested
+            or institution.source != "SEN_REVIEWED_CSV"
+            or _is_seoul_address(site.road_address)
+            or site.status is not InstitutionStatus.REVIEW_REQUIRED
+            or institution.status is not InstitutionStatus.REVIEW_REQUIRED
+        ):
+            raise SnapshotQualityError("persisted site district is invalid")
+
+
+def _is_pinned_sen_manifest_source(entry: Mapping[str, object]) -> bool:
+    return (
+        entry.get("source") == "SEN_REVIEWED_CSV"
+        and entry.get("endpoint") == _SOURCE_ENDPOINTS["SEN_REVIEWED_CSV"]
+        and entry.get("licenseName") == _SOURCE_LICENSES["SEN_REVIEWED_CSV"]
+        and entry.get("attribution") == _SOURCE_ATTRIBUTIONS["SEN_REVIEWED_CSV"]
+        and entry.get("requestRegionCode")
+        == _EXPECTED_REGION_CODES["SEN_REVIEWED_CSV"]
+        and entry.get("rawSha256")
+        == _PINNED_SOURCE_RAW_SHA256["SEN_REVIEWED_CSV"]
+        and entry.get("sourceNormalizedSha256")
+        == _PINNED_SOURCE_NORMALIZED_SHA256["SEN_REVIEWED_CSV"]
+    )
 
 
 def _validate_persisted_institution(institution: Institution) -> None:

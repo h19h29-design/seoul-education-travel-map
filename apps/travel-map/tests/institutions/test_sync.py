@@ -579,7 +579,19 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
     )
 
     assert candidate.issues == ()
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    district_counts = cast(dict[str, int], packet["districtCounts"])
+    assert len(district_counts) == 25
+    assert "가평군" not in district_counts
+    assert "가평군" not in json.dumps(packet, ensure_ascii=False, sort_keys=True)
+    assert "sen:agency-student" in packet["quarantinedInstitutionIds"]
+    assert "sen:agency-student:main" in packet["quarantinedSiteIds"]
     approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
+    verified = verify_snapshot(tmp_path)
     store = InstitutionStore.load(tmp_path)
 
     matches = store.search("강서도서관")
@@ -589,6 +601,21 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
     }
     assert sum(item.site_name == "본관" for item in matches) == 1
     assert store.require_site("sen:gangseo-library:gayang").site_name == "가양관"
+    student = next(
+        institution
+        for institution in verified.institutions
+        if institution.institution_id == "sen:agency-student"
+    )
+    student_site = next(
+        site
+        for site in verified.sites
+        if site.site_id == "sen:agency-student:main"
+    )
+    assert student.status is InstitutionStatus.REVIEW_REQUIRED
+    assert student_site.status is InstitutionStatus.REVIEW_REQUIRED
+    assert store.search("학생교육원") == ()
+    with pytest.raises(LookupError, match="unknown or inactive"):
+        store.require_site(student_site.site_id)
 
 
 def test_reviewed_sen_provenance_is_accepted_by_candidate_builder(
@@ -2642,6 +2669,33 @@ def test_review_packet_is_deterministic_and_contains_audit_categories(
     }
     assert first["status"] == "CANDIDATE_REVIEW_REQUIRED"
     assert first["snapshotId"] == candidate.snapshot_id
+    assert first["districtCounts"] == {
+        "강남구": 0,
+        "강동구": 0,
+        "강북구": 0,
+        "강서구": 0,
+        "관악구": 0,
+        "광진구": 0,
+        "구로구": 0,
+        "금천구": 0,
+        "노원구": 0,
+        "도봉구": 0,
+        "동대문구": 0,
+        "동작구": 0,
+        "마포구": 0,
+        "서대문구": 0,
+        "서초구": 0,
+        "성동구": 0,
+        "성북구": 0,
+        "송파구": 0,
+        "양천구": 0,
+        "영등포구": 0,
+        "용산구": 0,
+        "은평구": 0,
+        "종로구": 0,
+        "중구": 1,
+        "중랑구": 0,
+    }
     assert re.fullmatch(r"[0-9a-f]{64}", cast(str, first["reviewDigest"]))
     without_digest = {
         key: value for key, value in first.items() if key != "reviewDigest"
@@ -2692,6 +2746,101 @@ def test_review_packet_excludes_sensitive_source_values(tmp_path: Path) -> None:
         assert forbidden not in serialized
 
 
+@pytest.mark.parametrize("invalid_site", ["main", "branch"])
+def test_candidate_rejects_non_seoul_district_before_writing_review_data(
+    tmp_path: Path,
+    invalid_site: str,
+) -> None:
+    sensitive_name = "비공개검토학교"
+    record = replace(
+        source_record(
+            road_address=f"서울특별시 {sensitive_name} 검증로 1",
+        ),
+        official_name=sensitive_name,
+        district=sensitive_name if invalid_site == "main" else "중구",
+        additional_sites=(
+            SourceInstitutionSiteRecord(
+                site_code="private-branch",
+                site_name="Private branch",
+                road_address="서울특별시 강서구 양천로 61",
+                district=(
+                    sensitive_name if invalid_site == "branch" else "강서구"
+                ),
+                latitude=37.5701,
+                longitude=126.8412,
+                coordinate_quality="MANUALLY_VERIFIED",
+            ),
+        ),
+    )
+
+    with pytest.raises(SnapshotQualityError, match="district"):
+        build_test_candidate(
+            records=(record,),
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id=f"invalid-{invalid_site}-district",
+            coverage=TEST_COVERAGE,
+        )
+
+    assert not (tmp_path / f".invalid-{invalid_site}-district.candidate").exists()
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_review_rejects_signed_legacy_candidate_with_non_seoul_district(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="legacy-district-current",
+        coverage=TEST_COVERAGE,
+    )
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
+    previous = verify_snapshot(tmp_path)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    sensitive_name = "비공개검토학교"
+    legacy_record = replace(
+        source_record(
+            road_address=f"서울특별시 {sensitive_name} 검증로 1",
+        ),
+        official_name=sensitive_name,
+        district=sensitive_name,
+    )
+    with monkeypatch.context() as legacy_context:
+        legacy_context.setattr(
+            sync_module,
+            "_validate_source_districts",
+            lambda _records, _provenance: None,
+        )
+        candidate = build_test_candidate(
+            records=(legacy_record,),
+            previous=previous,
+            output_root=tmp_path,
+            snapshot_id="legacy-private-district",
+            coverage=TEST_COVERAGE,
+        )
+
+    with pytest.raises(SnapshotQualityError, match="district"):
+        build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    with pytest.raises(SnapshotQualityError, match="district"):
+        approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest="0" * 64,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
 def test_review_packet_reports_disjoint_site_only_changes(tmp_path: Path) -> None:
     changed = SourceInstitutionSiteRecord(
         site_code="changed",
@@ -2738,10 +2887,82 @@ def test_review_packet_reports_disjoint_site_only_changes(tmp_path: Path) -> Non
         coverage=TEST_COVERAGE,
     )
 
+    assert cast(dict[str, object], packet["diff"])["changedCount"] == 0
     assert packet["siteOnlyDiff"] == {
         "addedSiteIds": ["neis:B10:7010001:added"],
         "changedSiteIds": ["neis:B10:7010001:changed"],
         "missingSiteIds": ["neis:B10:7010001:removed"],
+    }
+
+
+def test_review_packet_counts_institution_only_change_once(tmp_path: Path) -> None:
+    initial = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="institution-only-before",
+        coverage=TEST_COVERAGE,
+    )
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
+    candidate = build_test_candidate(
+        records=(replace(source_record(), official_name="Changed Official Name"),),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="institution-only-after",
+        coverage=TEST_COVERAGE,
+    )
+
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert cast(dict[str, object], packet["diff"])["changedCount"] == 1
+    assert packet["siteOnlyDiff"] == {
+        "addedSiteIds": [],
+        "changedSiteIds": [],
+        "missingSiteIds": [],
+    }
+
+
+def test_review_packet_does_not_report_site_change_for_changed_institution(
+    tmp_path: Path,
+) -> None:
+    initial = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="institution-and-site-before",
+        coverage=TEST_COVERAGE,
+    )
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
+    candidate = build_test_candidate(
+        records=(
+            replace(
+                source_record(
+                    road_address="서울특별시 중구 검증로 2",
+                ),
+                official_name="Changed Official Name",
+            ),
+        ),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="institution-and-site-after",
+        coverage=TEST_COVERAGE,
+    )
+
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert cast(dict[str, object], packet["diff"])["changedCount"] == 1
+    assert packet["siteOnlyDiff"] == {
+        "addedSiteIds": [],
+        "changedSiteIds": [],
+        "missingSiteIds": [],
     }
 
 
