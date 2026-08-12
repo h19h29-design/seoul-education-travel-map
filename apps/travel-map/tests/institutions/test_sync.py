@@ -57,6 +57,7 @@ from app.institutions.store import InstitutionStore
 from app.institutions.sync import (
     SnapshotBuildResult,
     SnapshotQualityError,
+    approve_candidate_snapshot,
     build_candidate_review_packet,
     build_candidate_snapshot,
     build_sync_preflight_audit,
@@ -986,6 +987,75 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
     assert audit["reconciliation"]["passed"] is False
     assert audit["passed"] is False
     assert not snapshot_root.exists()
+
+
+@pytest.mark.asyncio
+async def test_sync_cli_stops_at_candidate_review_without_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script_path = Path("apps/travel-map/scripts/sync-institutions.py")
+    spec = importlib.util.spec_from_file_location(
+        "candidate_only_sync_cli", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    async def fake_run_with_keys(
+        _args: argparse.Namespace,
+        _keys: dict[str, str],
+        _holders: list[object],
+    ) -> str:
+        return "cli-candidate"
+
+    monkeypatch.setattr(module, "_run_with_keys", fake_run_with_keys)
+    keys = {
+        "NEIS_API_KEY": "neis-test",
+        "KINDERGARTEN_API_KEY": "kindergarten-test",
+        "KAKAO_REST_API_KEY": "kakao-test",
+    }
+    result = await module.run(argparse.Namespace(), keys)
+
+    assert result == "cli-candidate"
+    assert set(keys.values()) == {""}
+    assert not hasattr(module, "promote_snapshot")
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_sync_cli_main_prints_compact_candidate_review_status(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script_path = Path("apps/travel-map/scripts/sync-institutions.py")
+    spec = importlib.util.spec_from_file_location(
+        "candidate_status_sync_cli", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    async def fake_run(
+        _args: argparse.Namespace,
+        _keys: dict[str, str],
+    ) -> str:
+        return "cli-candidate"
+
+    monkeypatch.setattr(
+        module,
+        "parse_args",
+        lambda: argparse.Namespace(env_file=None),
+    )
+    monkeypatch.setattr(module, "load_environment_file", lambda _path: None)
+    monkeypatch.setattr(module, "run", fake_run)
+    for name in module._REQUIRED_KEYS:
+        monkeypatch.setenv(name, f"{name}-test")
+
+    assert module.main() == 0
+    assert capsys.readouterr().out == (
+        '{"snapshotId":"cli-candidate",'
+        '"status":"CANDIDATE_REVIEW_REQUIRED"}\n'
+    )
 
 
 @pytest.mark.parametrize(
@@ -2342,6 +2412,170 @@ def test_promotion_rechecks_hash_before_pointer_change(tmp_path: Path) -> None:
     with pytest.raises(SnapshotQualityError, match="hash mismatch"):
         promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
+
+
+@pytest.mark.parametrize(
+    "review_digest",
+    ["", "A" * 64, "0" * 63, "0" * 65, True, 1],
+)
+def test_approval_requires_exact_lowercase_review_digest(
+    tmp_path: Path,
+    review_digest: object,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="digest-contract",
+        coverage=TEST_COVERAGE,
+    )
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=cast(str, review_digest),
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_approval_requires_data_steward_role(tmp_path: Path) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="role-contract",
+        coverage=TEST_COVERAGE,
+    )
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    with pytest.raises(SnapshotQualityError, match="reviewer role"):
+        approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=cast(str, packet["reviewDigest"]),
+            reviewer_role="developer",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+
+def test_approval_rechecks_review_digest_before_pointer_mutation(
+    tmp_path: Path,
+) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="digest-recheck",
+        coverage=TEST_COVERAGE,
+    )
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["countsByType"] = {"ELEMENTARY_SCHOOL": 2}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError, match="attestation|manifest|digest"):
+        approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=cast(str, packet["reviewDigest"]),
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_reviewed_approval_writes_verified_current_snapshot(tmp_path: Path) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="reviewed-approval",
+        coverage=TEST_COVERAGE,
+    )
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    digest = approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=cast(str, packet["reviewDigest"]),
+        reviewer_role="data-steward",
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    verified = verify_snapshot(tmp_path)
+    assert digest == packet["reviewDigest"]
+    assert verified.manifest.snapshot_id == candidate.snapshot_id
+    assert verified.manifest.approved is True
+    assert verified.manifest.approved_by_role == "data-steward"
+
+
+def test_candidate_review_leaves_existing_current_pointer_unchanged(
+    tmp_path: Path,
+) -> None:
+    initial = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="initial-current",
+        coverage=TEST_COVERAGE,
+    )
+    approve_test_candidate(initial, tmp_path)
+    before = (tmp_path / "current.json").read_bytes()
+    second = build_test_candidate(
+        records=(source_record(),),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="next-candidate",
+        coverage=TEST_COVERAGE,
+    )
+
+    packet = build_candidate_review_packet(
+        snapshot_id=second.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert packet["previousSnapshotId"] == "initial-current"
+    assert (tmp_path / "current.json").read_bytes() == before
+
+
+def test_reviewed_approval_retry_is_idempotent(tmp_path: Path) -> None:
+    candidate = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="reviewed-retry",
+        coverage=TEST_COVERAGE,
+    )
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    kwargs = {
+        "snapshot_id": candidate.snapshot_id,
+        "review_digest": packet["reviewDigest"],
+        "reviewer_role": "data-steward",
+        "snapshot_root": tmp_path,
+        "coverage": TEST_COVERAGE,
+    }
+    approve_candidate_snapshot(**kwargs)
+    first_pointer = (tmp_path / "current.json").read_bytes()
+    approve_candidate_snapshot(**kwargs)
+    assert (tmp_path / "current.json").read_bytes() == first_pointer
 
 
 def test_review_packet_is_deterministic_and_contains_audit_categories(
@@ -3738,6 +3972,26 @@ def build_test_candidate(
         coverage=coverage,
         source_provenance=selected_provenance,
         enrichment_provenance=enrichment_provenance,
+    )
+
+
+def approve_test_candidate(
+    candidate: SnapshotBuildResult,
+    output_root: Path,
+    *,
+    coverage: CoverageService = TEST_COVERAGE,
+) -> str:
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=output_root,
+        coverage=coverage,
+    )
+    return approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=cast(str, packet["reviewDigest"]),
+        reviewer_role="data-steward",
+        snapshot_root=output_root,
+        coverage=coverage,
     )
 
 

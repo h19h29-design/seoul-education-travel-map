@@ -3,14 +3,12 @@ import asyncio
 import json
 import os
 import sys
-from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 from app.environment import EnvironmentFileError, load_environment_file
-from app.institutions.models import InstitutionStatus
 from app.institutions.snapshot import verify_snapshot
 from app.institutions.sources.common import EnrichmentProvenance, SourceDataError
 from app.institutions.sources.kindergarten import KindergartenSource
@@ -28,7 +26,6 @@ from app.institutions.sync import (
     emit_sync_preflight_audit,
     enrichment_records_sha256,
     geocode_missing_records,
-    promote_snapshot,
     reconcile_selectable_school_counts,
 )
 from app.policy.coverage import CoverageService
@@ -89,12 +86,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def run(args: argparse.Namespace, keys: dict[str, str]) -> None:
+async def run(args: argparse.Namespace, keys: dict[str, str]) -> str:
     credential_holders: list[
         NeisSource | KindergartenSource | KakaoLocalClient
     ] = []
     try:
-        await _run_with_keys(args, keys, credential_holders)
+        return await _run_with_keys(args, keys, credential_holders)
     finally:
         for holder in credential_holders:
             holder.clear_credentials()
@@ -108,7 +105,7 @@ async def _run_with_keys(
     credential_holders: list[
         NeisSource | KindergartenSource | KakaoLocalClient
     ],
-) -> None:
+) -> str:
     timeout = httpx.Timeout(5.0, connect=2.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
         neis_source = NeisSource(api_key=keys["NEIS_API_KEY"], client=http)
@@ -209,50 +206,7 @@ async def _run_with_keys(
     )
     if candidate.issues:
         raise SnapshotQualityError("; ".join(candidate.issues))
-    promote_snapshot(candidate, args.snapshot_root, coverage=coverage)
-    verified = verify_snapshot(args.snapshot_root)
-    manifest = json.loads(
-        (args.snapshot_root / snapshot_id / "manifest.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    default_site_districts = Counter(
-        site.district for site in verified.sites if site.is_default
-    )
-    quarantined_ids = sorted(
-        institution.institution_id
-        for institution in verified.institutions
-        if institution.status is InstitutionStatus.REVIEW_REQUIRED
-    )
-    quarantined_site_ids = sorted(
-        site.site_id
-        for site in verified.sites
-        if site.status is InstitutionStatus.REVIEW_REQUIRED
-    )
-    summary = {
-        "snapshotId": snapshot_id,
-        "institutionCount": manifest["institutionCount"],
-        "siteCount": manifest["siteCount"],
-        "quarantinedCount": manifest["quarantinedCount"],
-        "sourceCounts": {
-            source["source"]: {
-                "fetched": source["fetchedRowCount"],
-                "normalized": source["normalizedRowCount"],
-                "preserved": source["preservedRowCount"],
-                "output": source["rowCount"],
-            }
-            for source in manifest["sources"]
-        },
-        "typeCounts": manifest["countsByType"],
-        "foundationCounts": manifest["countsByFoundation"],
-        "districtCounts": dict(sorted(default_site_districts.items())),
-        "statusCounts": manifest["countsByStatus"],
-        "quarantinedInstitutionIds": quarantined_ids,
-        "quarantinedSiteIds": quarantined_site_ids,
-        "reconciliation": reconciliation,
-        "standardSchoolCoordinateRows": len(standard_result.locations),
-    }
-    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    return candidate.snapshot_id
 
 
 def main() -> int:
@@ -273,7 +227,7 @@ def main() -> int:
         return 2
     keys = {name: os.environ[name] for name in _REQUIRED_KEYS}
     try:
-        asyncio.run(run(args, keys))
+        snapshot_id = asyncio.run(run(args, keys))
     except (SourceDataError, SnapshotQualityError, OSError, ValueError) as exc:
         for name in keys:
             keys[name] = ""
@@ -281,6 +235,17 @@ def main() -> int:
         return 1
     for name in keys:
         keys[name] = ""
+    print(
+        json.dumps(
+            {
+                "snapshotId": snapshot_id,
+                "status": "CANDIDATE_REVIEW_REQUIRED",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
     return 0
 
 

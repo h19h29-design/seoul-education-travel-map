@@ -696,6 +696,63 @@ def promote_snapshot(
             os.close(descriptor)
 
 
+def approve_candidate_snapshot(
+    *,
+    snapshot_id: str,
+    review_digest: str,
+    reviewer_role: str,
+    snapshot_root: Path,
+    coverage: CoverageService,
+) -> str:
+    if type(snapshot_id) is not str or _SAFE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
+        raise SnapshotQualityError("snapshot ID is unsafe")
+    if type(review_digest) is not str or _SHA256.fullmatch(review_digest) is None:
+        raise SnapshotQualityError("review digest is invalid")
+    if reviewer_role != "data-steward":
+        raise SnapshotQualityError("reviewer role is invalid")
+    root = _validated_snapshot_root(Path(snapshot_root))
+    lock_path = root / ".promotion.lock"
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise SnapshotQualityError("promotion lock is invalid") from exc
+    try:
+        if (
+            not stat.S_ISREG(os.fstat(descriptor).st_mode)
+            or lock_path.resolve(strict=True).parent != root
+        ):
+            raise SnapshotQualityError("promotion lock must be a regular root file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            reviewable = _load_reviewable_candidate(
+                snapshot_id=snapshot_id,
+                snapshot_root=root,
+                coverage=coverage,
+                allow_recovery_final=True,
+            )
+            packet = _build_review_packet(reviewable)
+        except SnapshotQualityError as exc:
+            raise SnapshotQualityError(
+                "candidate manifest or attestation is invalid"
+            ) from exc
+        actual_digest = cast(str, packet["reviewDigest"])
+        if not hmac.compare_digest(review_digest, actual_digest):
+            raise SnapshotQualityError("review digest does not match candidate")
+        _promote_snapshot_locked(reviewable.result, root, coverage=coverage)
+        verified = verify_snapshot(root)
+        if verified.manifest.snapshot_id != snapshot_id:
+            raise SnapshotQualityError("approved snapshot pointer is invalid")
+        return actual_digest
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def build_candidate_review_packet(
     *,
     snapshot_id: str,
