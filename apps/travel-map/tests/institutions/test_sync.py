@@ -182,6 +182,10 @@ def test_source_ids_are_namespaced_and_private_schools_are_kept() -> None:
         ("\uac01\uc885\ud559\uad50(\uc911)", "MISC_SCHOOL"),
         ("\uac01\uc885\ud559\uad50(\uace0)", "MISC_SCHOOL"),
         ("\uace0\ub4f1\uae30\uc220\ud559\uad50", "MISC_SCHOOL"),
+        ("\ud3c9\uc0dd\ud559\uad50(\ucd08)-3\ub1446\ud559\uae30", "LIFELONG_EDUCATION_FACILITY"),
+        ("\ud3c9\uc0dd\ud559\uad50(\uc911)-2\ub1446\ud559\uae30", "LIFELONG_EDUCATION_FACILITY"),
+        ("\ud3c9\uc0dd\ud559\uad50(\uace0)-2\ub1446\ud559\uae30", "LIFELONG_EDUCATION_FACILITY"),
+        ("\ud3c9\uc0dd\ud559\uad50(\uace0)-3\ub1446\ud559\uae30", "LIFELONG_EDUCATION_FACILITY"),
     ],
 )
 def test_neis_maps_every_verified_selectable_school_type(
@@ -851,6 +855,21 @@ def test_school_reconciliation_passes_reviewed_real_count_fixture() -> None:
         category["deltaCount"] == 0
         for category in audit["categories"].values()
     )
+
+
+# Production break caught: folding school-form lifelong-education facilities into
+# the ordinary elementary/middle/high or misc school count gates.
+def test_school_reconciliation_keeps_lifelong_facilities_outside_school_counts() -> None:
+    benchmark = reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 1})
+    records = records_for_type_counts(
+        {"ELEMENTARY_SCHOOL": 1, "LIFELONG_EDUCATION_FACILITY": 18}
+    )
+
+    audit = reconcile_selectable_school_counts(records, benchmark=benchmark)
+
+    assert audit["categories"]["ELEMENTARY_SCHOOL"]["actualCount"] == 1
+    assert audit["reportedTotals"][0]["actualCount"] == 1
+    assert audit["passed"] is True
 
 
 def test_school_reconciliation_rejects_actual_source_contamination() -> None:

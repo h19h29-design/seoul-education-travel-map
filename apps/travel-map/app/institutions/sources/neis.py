@@ -39,6 +39,10 @@ _INSTITUTION_TYPES = {
     "\uac01\uc885\ud559\uad50(\uc911)": "MISC_SCHOOL",
     "\uac01\uc885\ud559\uad50(\uace0)": "MISC_SCHOOL",
     "\uace0\ub4f1\uae30\uc220\ud559\uad50": "MISC_SCHOOL",
+    "\ud3c9\uc0dd\ud559\uad50(\ucd08)-3\ub1446\ud559\uae30": "LIFELONG_EDUCATION_FACILITY",
+    "\ud3c9\uc0dd\ud559\uad50(\uc911)-2\ub1446\ud559\uae30": "LIFELONG_EDUCATION_FACILITY",
+    "\ud3c9\uc0dd\ud559\uad50(\uace0)-2\ub1446\ud559\uae30": "LIFELONG_EDUCATION_FACILITY",
+    "\ud3c9\uc0dd\ud559\uad50(\uace0)-3\ub1446\ud559\uae30": "LIFELONG_EDUCATION_FACILITY",
 }
 _NONSELECTABLE_TYPES = {"\uacf5\ub3d9\uc2e4\uc2b5\uc18c"}
 

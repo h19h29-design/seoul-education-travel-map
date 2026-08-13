@@ -44,6 +44,9 @@ const institutionTypeName = {
   ELEMENTARY_SCHOOL: "초등학교",
   MIDDLE_SCHOOL: "중학교",
   HIGH_SCHOOL: "고등학교",
+  SPECIAL_SCHOOL: "특수학교",
+  MISC_SCHOOL: "각종학교·고등기술학교",
+  LIFELONG_EDUCATION_FACILITY: "학력인정 평생교육시설",
 };
 const foundationTypeName = {
   NATIONAL: "국립",
