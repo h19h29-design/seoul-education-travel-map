@@ -1139,7 +1139,9 @@ def _build_current_records(
 
 def _is_seoul_address(address: str) -> bool:
     normalized = " ".join(address.split())
-    return normalized.startswith(("\uc11c\uc6b8\ud2b9\ubcc4\uc2dc ", "\uc11c\uc6b8\uc2dc "))
+    return normalized.startswith(
+        ("\uc11c\uc6b8\ud2b9\ubcc4\uc2dc ", "\uc11c\uc6b8\uc2dc ", "\uc11c\uc6b8 ")
+    )
 
 
 def _validate_source_record(record: SourceInstitutionRecord) -> None:

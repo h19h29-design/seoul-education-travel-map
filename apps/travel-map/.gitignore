@@ -6,3 +6,7 @@ __pycache__/
 .ruff_cache/
 test-results/
 playwright-report/
+resources/institution-snapshots/.*.candidate/
+resources/institution-snapshots/.sync-attestation.key
+resources/institution-snapshots/.sync-transactions/
+resources/institution-snapshots/.promotion.lock

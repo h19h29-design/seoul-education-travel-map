@@ -125,7 +125,7 @@ def test_release_context_contains_only_the_current_verified_snapshot(
     source_root = tmp_path / "travel-map"
     shutil.copytree(ROOT, source_root)
     snapshots = source_root / "resources/institution-snapshots"
-    snapshots.mkdir()
+    snapshots.mkdir(exist_ok=True)
     shutil.copytree(
         FIXTURE_SNAPSHOT / "fixture-001",
         snapshots / "fixture-001",
@@ -165,7 +165,7 @@ def test_release_staging_rejects_candidate_without_current_pointer(
     source_root = tmp_path / "travel-map"
     shutil.copytree(ROOT, source_root)
     snapshots = source_root / "resources/institution-snapshots"
-    snapshots.mkdir()
+    snapshots.mkdir(exist_ok=True)
     shutil.copytree(
         FIXTURE_SNAPSHOT / "fixture-001",
         snapshots / ".candidate-review.candidate",
@@ -472,7 +472,7 @@ def _release_source_with_current_snapshot(tmp_path: Path) -> Path:
     source_root = tmp_path / "travel-map"
     shutil.copytree(ROOT, source_root)
     snapshots = source_root / "resources/institution-snapshots"
-    snapshots.mkdir()
+    snapshots.mkdir(exist_ok=True)
     shutil.copytree(
         FIXTURE_SNAPSHOT / "fixture-001",
         snapshots / "fixture-001",

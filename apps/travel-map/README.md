@@ -96,6 +96,34 @@ credential-free. Candidate creation alone does not update `current.json` or
 unblock release. A missing or invalid approved snapshot is a release blocker,
 never permission to substitute a sample catalog.
 
+### Administrator data review notes
+
+These notes are for synchronization and release administrators; they are not
+shown in the public user interface.
+
+- The 2026-03-10 Seoul education preliminary table reports 724 kindergartens
+  and 2,092 institutions in its preliminary school-count population. It remains
+  an informational audit total and is not rewritten.
+- The source-specific completeness gate for the public kindergarten catalog is
+  the official Kindergarten Info April 2026 disclosure: Seoul code `11`, all 25
+  districts, 706 disclosed kindergartens (295 public and 411 private). The same
+  706 records must be returned by the approved `basicInfo2` OpenAPI timing
+  `20261`; the preliminary 724 count must not be used to weaken this exact API
+  population check.
+- NEIS categories that are separate selectable systems—foreign schools,
+  broadcast schools, school-form lifelong-education facilities, and reviewed
+  alternative/miscellaneous programs—remain searchable but are not folded into
+  the ordinary elementary, middle, high, special, or miscellaneous-school count
+  gates.
+- Review packets may retain non-active rows for completeness and audit. Only an
+  institution with an `ACTIVE` default site is exposed as a route origin. The
+  reviewer must examine aggregate quarantine counts and must never manually turn
+  missing or out-of-Seoul coordinates into active sites.
+
+Candidate directories, signed sync transactions, and the local attestation key
+are operator state. They are ignored by Git. Only the approved snapshot selected
+by `current.json` is eligible for version control and release staging.
+
 ## Live smoke and manual approval
 
 The live smoke runs exactly three bounded cases only after opt-in, a valid approved snapshot, and all runtime provider credentials:

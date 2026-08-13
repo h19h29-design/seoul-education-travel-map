@@ -14,6 +14,14 @@ _PRELIMINARY_AS_OF = "2026-03-10"
 _PRELIMINARY_SHA256 = (
     "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70"
 )
+_KINDERGARTEN_DISCLOSURE_URL = "https://e-childschoolinfo.moe.go.kr/?mi=2782"
+_KINDERGARTEN_DISCLOSURE_AS_OF = "2026-04-01"
+_KINDERGARTEN_DISCLOSURE_SHA256 = (
+    "a64b2af7fcbe91892b438b80cfbca16567cbfd898d3f23d26ad24d66cd9ec0bd"
+)
+_KINDERGARTEN_DISCLOSURE_NORMALIZED_SHA256 = (
+    "a88594b566286fa898796ceed8f26719cc88d5b0d546970abac2ffb2e6adcdc1"
+)
 _DETAILED_CORROBORATING_URL = (
     "https://www.sen.go.kr/www/information/statistics/"
     "statistics_2/statistics_2025.jsp"
@@ -22,10 +30,13 @@ _DETAILED_CORROBORATING_SHA256 = (
     "8d3791e2ebf84799c7af53be0d662a4eaeb922bab3e85f0c82fe08793b1bd26b"
 )
 _NORMALIZED_SHA256 = (
-    "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332"
+    "532225bc7f1d2dd63e976880e53a4217b548e83e7dbc278363808aba41132907"
 )
-_LICENSE_NAME = "KOGL_TYPE_1_ATTRIBUTION"
-_ATTRIBUTION = "Source: Seoul Metropolitan Office of Education school statistics"
+_LICENSE_NAME = "KOGL_TYPE_1_AND_PUBLIC_DATA_PORTAL_TERMS"
+_ATTRIBUTION = (
+    "Sources: Seoul Metropolitan Office of Education and "
+    "Ministry of Education Kindergarten Info"
+)
 _REPORTED_POPULATION = (
     "KINDERGARTEN+ELEMENTARY_SCHOOL+MIDDLE_SCHOOL+HIGH_SCHOOL+"
     "SPECIAL_SCHOOL+MISC_SCHOOL"
@@ -40,11 +51,11 @@ _CATEGORY_COMPOSITION = {
 }
 _EXPECTED_ROWS = {
     "KINDERGARTEN": (
-        724,
-        _PRELIMINARY_URL,
-        _PRELIMINARY_AS_OF,
-        _PRELIMINARY_SHA256,
-        "PRELIMINARY_2026",
+        706,
+        _KINDERGARTEN_DISCLOSURE_URL,
+        _KINDERGARTEN_DISCLOSURE_AS_OF,
+        _KINDERGARTEN_DISCLOSURE_SHA256,
+        "OFFICIAL_DISCLOSURE_2026_04",
     ),
     "ELEMENTARY_SCHOOL": (
         609,
@@ -136,6 +147,14 @@ def load_reviewed_school_counts(path: Path) -> ReviewedSchoolCounts:
         "detailed_corroborating_raw_sha256",
         "preliminary_table_source_url",
         "preliminary_table_source_raw_sha256",
+        "kindergarten_disclosure_source_url",
+        "kindergarten_disclosure_source_raw_sha256",
+        "kindergarten_disclosure_normalized_sha256",
+        "kindergarten_disclosure_sido_code",
+        "kindergarten_disclosure_district_count",
+        "kindergarten_disclosure_total",
+        "kindergarten_disclosure_public",
+        "kindergarten_disclosure_private",
         "misc_school_composition",
         "reported_total_count",
         "reported_total_population",
@@ -162,6 +181,17 @@ def load_reviewed_school_counts(path: Path) -> ReviewedSchoolCounts:
         or metadata["preliminary_table_source_url"] != _PRELIMINARY_URL
         or metadata["preliminary_table_source_raw_sha256"]
         != _PRELIMINARY_SHA256
+        or metadata["kindergarten_disclosure_source_url"]
+        != _KINDERGARTEN_DISCLOSURE_URL
+        or metadata["kindergarten_disclosure_source_raw_sha256"]
+        != _KINDERGARTEN_DISCLOSURE_SHA256
+        or metadata["kindergarten_disclosure_normalized_sha256"]
+        != _KINDERGARTEN_DISCLOSURE_NORMALIZED_SHA256
+        or metadata["kindergarten_disclosure_sido_code"] != "11"
+        or metadata["kindergarten_disclosure_district_count"] != "25"
+        or metadata["kindergarten_disclosure_total"] != "706"
+        or metadata["kindergarten_disclosure_public"] != "295"
+        or metadata["kindergarten_disclosure_private"] != "411"
         or metadata["misc_school_composition"]
         != _CATEGORY_COMPOSITION["MISC_SCHOOL"]
         or metadata["reported_total_count"] != "2092"
@@ -178,6 +208,8 @@ def load_reviewed_school_counts(path: Path) -> ReviewedSchoolCounts:
                 "normalized_sha256",
                 "detailed_corroborating_raw_sha256",
                 "preliminary_table_source_raw_sha256",
+                "kindergarten_disclosure_source_raw_sha256",
+                "kindergarten_disclosure_normalized_sha256",
                 "reported_total_evidence_raw_sha256",
             )
         )
@@ -222,8 +254,6 @@ def load_reviewed_school_counts(path: Path) -> ReviewedSchoolCounts:
         category_evidence[institution_type] = evidence
     if set(counts) != set(_EXPECTED_ROWS):
         raise SourceDataError("SEN school count categories are incomplete")
-    if sum(counts.values()) != 2_092:
-        raise SourceDataError("SEN school count total does not reconcile")
     preliminary_evidence = SchoolCountEvidence(
         source_url=_PRELIMINARY_URL,
         source_as_of=_PRELIMINARY_AS_OF,

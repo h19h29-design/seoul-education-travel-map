@@ -295,7 +295,10 @@ class KakaoLocalClient:
 
 
 def _normalize_address(value: str) -> str:
-    return " ".join(value.split())
+    normalized = " ".join(value.split())
+    if normalized.startswith("서울특별시 "):
+        return "서울 " + normalized.removeprefix("서울특별시 ")
+    return normalized
 
 
 def _required_string(value: dict[object, object], name: str) -> str:

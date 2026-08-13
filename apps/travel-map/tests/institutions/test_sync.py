@@ -233,6 +233,20 @@ def test_neis_explicitly_excludes_nonselectable_joint_training_center() -> None:
     assert parse_neis_rows(payload) == ()
 
 
+# Production break caught: a special-school campus annotation appears before the
+# canonical Seoul address, so positional token parsing returned "서울특별시" as a
+# district and blocked the entire live candidate.
+def test_neis_extracts_district_from_annotated_multicampus_address() -> None:
+    payload = neis_payload(source_type="특수학교")
+    row = payload["schoolInfo"][1]["row"][0]  # type: ignore[index]
+    row["ORG_RDNMA"] = (
+        "(본교) 서울특별시 도봉구 평화로15번길 9-26, "
+        "(초등) 도봉산길 27"
+    )
+
+    assert parse_neis_rows(payload)[0].district == "도봉구"
+
+
 # Production break caught: assigning every parsed NEIS row the newest page vintage
 # instead of the record's own raw LOAD_DTM value.
 def test_neis_parse_preserves_mixed_raw_load_dates_within_one_page() -> None:
@@ -713,7 +727,7 @@ def test_reviewed_school_count_resource_is_official_and_pinned() -> None:
         SOURCE_RESOURCES / "sen-annual-school-counts.csv"
     )
     assert benchmark.counts == {
-        "KINDERGARTEN": 724,
+        "KINDERGARTEN": 706,
         "ELEMENTARY_SCHOOL": 609,
         "MIDDLE_SCHOOL": 390,
         "HIGH_SCHOOL": 319,
@@ -721,11 +735,17 @@ def test_reviewed_school_count_resource_is_official_and_pinned() -> None:
         "MISC_SCHOOL": 18,
     }
     assert benchmark.category_evidence["KINDERGARTEN"].source_as_of == (
-        "2026-03-10"
+        "2026-04-01"
     )
     assert (
         benchmark.category_evidence["KINDERGARTEN"].status
-        == "PRELIMINARY_2026"
+        == "OFFICIAL_DISCLOSURE_2026_04"
+    )
+    assert benchmark.category_evidence["KINDERGARTEN"].source_url == (
+        "https://e-childschoolinfo.moe.go.kr/?mi=2782"
+    )
+    assert benchmark.category_evidence["KINDERGARTEN"].source_sha256 == (
+        "a64b2af7fcbe91892b438b80cfbca16567cbfd898d3f23d26ad24d66cd9ec0bd"
     )
     assert benchmark.category_evidence["ELEMENTARY_SCHOOL"].source_as_of == (
         "2026-03-10"
@@ -764,15 +784,23 @@ def test_reviewed_school_count_resource_is_official_and_pinned() -> None:
 @pytest.mark.parametrize(
     ("old", "new"),
     [
-        ("KINDERGARTEN,724,", "KINDERGARTEN,725,"),
+        ("KINDERGARTEN,706,", "KINDERGARTEN,707,"),
         (
             "https://enews.sen.go.kr/uploads/img_smart//",
             "https://attacker.invalid/",
         ),
         ("PRELIMINARY_2026", "FINAL_2026"),
         (
-            "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332",
+            "532225bc7f1d2dd63e976880e53a4217b548e83e7dbc278363808aba41132907",
             "f" * 64,
+        ),
+        (
+            "kindergarten_disclosure_total=706",
+            "kindergarten_disclosure_total=707",
+        ),
+        (
+            "kindergarten_disclosure_district_count=25",
+            "kindergarten_disclosure_district_count=24",
         ),
     ],
 )
@@ -850,7 +878,7 @@ def test_school_reconciliation_passes_reviewed_real_count_fixture() -> None:
     assert audit["reportedTotals"] == [
         {
             "expectedCount": 2_092,
-            "actualCount": 2_092,
+            "actualCount": 2_074,
             "population": (
                 "KINDERGARTEN+ELEMENTARY_SCHOOL+MIDDLE_SCHOOL+"
                 "HIGH_SCHOOL+SPECIAL_SCHOOL+MISC_SCHOOL"
@@ -871,7 +899,11 @@ def test_school_reconciliation_passes_reviewed_real_count_fixture() -> None:
     ]
     assert (
         audit["categories"]["KINDERGARTEN"]["sourceAsOf"]
-        == "2026-03-10"
+        == "2026-04-01"
+    )
+    assert (
+        audit["categories"]["KINDERGARTEN"]["evidenceStatus"]
+        == "OFFICIAL_DISCLOSURE_2026_04"
     )
     assert (
         audit["categories"]["ELEMENTARY_SCHOOL"]["sourceAsOf"]
@@ -2026,6 +2058,59 @@ async def test_kakao_geocode_accepts_one_exact_road_address_and_redacts_key() ->
 
     with pytest.raises(SourceDataError, match="KAKAO_REST_API_KEY"):
         KakaoLocalClient(api_key="", client=httpx.AsyncClient())
+
+
+# Production break caught: Kakao canonicalizes the official Seoul prefix from
+# "서울특별시" to "서울" for otherwise identical road addresses. Treating this
+# public administrative alias as a mismatch left almost every missing coordinate
+# unresolved and kept the production snapshot below its 98 percent quality gate.
+@pytest.mark.asyncio
+async def test_kakao_geocode_accepts_canonical_seoul_region_alias() -> None:
+    requested = "서울특별시 중구 검증로 1"
+    returned = "서울 중구 검증로 1"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "documents": [
+                    {
+                        "x": "126.97",
+                        "y": "37.56",
+                        "road_address": {"address_name": returned},
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        kakao = KakaoLocalClient(api_key="test-key", client=client)
+        result = await kakao.geocode(requested)
+
+    assert result is not None
+    assert result.road_address == requested
+    assert result.confidence == "EXACT_ROAD_ADDRESS"
+
+
+def test_candidate_accepts_kakao_canonical_seoul_region_alias(
+    tmp_path: Path,
+) -> None:
+    record = source_record(road_address="서울 중구 검증로 1")
+
+    candidate = build_test_candidate(
+        records=(record,),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="seoul-region-alias",
+    )
+    site = json.loads(
+        (candidate.candidate_path / "sites.jsonl").read_text(encoding="utf-8")
+    )
+
+    assert site["status"] == "ACTIVE"
+    assert candidate.issues == ()
 
 
 @pytest.mark.asyncio

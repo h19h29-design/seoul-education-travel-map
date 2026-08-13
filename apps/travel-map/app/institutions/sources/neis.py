@@ -51,6 +51,15 @@ _INSTITUTION_TYPE_OVERRIDES = {
     "\uc9c0\uad6c\ucd0c\ud559\uad50 \uc911\ud559\uad50": "MISC_SCHOOL_PROGRAM",
     "\uc9c0\uad6c\ucd0c\ud559\uad50 \uace0\ub4f1\ud559\uad50": "MISC_SCHOOL_PROGRAM",
 }
+_SEOUL_DISTRICTS = frozenset(
+    {
+        "강남구", "강동구", "강북구", "강서구", "관악구", "광진구",
+        "구로구", "금천구", "노원구", "도봉구", "동대문구", "동작구",
+        "마포구", "서대문구", "서초구", "성동구", "성북구", "송파구",
+        "양천구", "영등포구", "용산구", "은평구", "종로구", "중구",
+        "중랑구",
+    }
+)
 
 
 class NeisSource:
@@ -306,10 +315,10 @@ def _required_string_from_object(row: object, name: str) -> str:
 
 
 def _district_from_address(address: str) -> str:
-    parts = address.split()
-    if len(parts) < 2:
-        raise SourceDataError("NEIS road address has no district")
-    return parts[1]
+    for part in address.replace(",", " ").split():
+        if part in _SEOUL_DISTRICTS:
+            return part
+    raise SourceDataError("NEIS road address has no Seoul district")
 
 
 def _yyyymmdd_as_iso(value: str) -> str:
