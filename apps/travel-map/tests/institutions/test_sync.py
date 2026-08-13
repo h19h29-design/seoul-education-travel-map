@@ -2893,6 +2893,7 @@ def test_review_packet_is_deterministic_and_contains_audit_categories(
         "snapshotAsOf",
         "previousSnapshotId",
         "sourceCounts",
+        "sourceObservationDateRanges",
         "institutionTypeCounts",
         "foundationCounts",
         "districtCounts",
@@ -2954,6 +2955,137 @@ def test_review_packet_is_deterministic_and_contains_audit_categories(
         ).hexdigest()
     )
     assert not (tmp_path / "current.json").exists()
+
+
+# Production break caught: omitting or misrepresenting the bounded raw-source
+# observation dates that a data steward must review before approving a snapshot.
+def test_review_packet_binds_sorted_source_observation_date_ranges(
+    tmp_path: Path,
+) -> None:
+    records = (
+        replace(
+            source_record(),
+            official_name="비공개검토학교",
+            source_as_of="2026-04-23",
+        ),
+        replace(
+            source_record(institution_id="neis:B10:7010002"),
+            source_as_of="2026-06-07",
+        ),
+    )
+    provenance = replace(
+        source_provenance_for(records)["NEIS"],
+        fetched_row_count=3,
+        source_as_of="2026-06-07",
+        source_observation_date_counts=(
+            ("2026-04-23", 1),
+            ("2026-06-07", 2),
+        ),
+    )
+    candidate = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="review-date-ranges",
+        coverage=TEST_COVERAGE,
+        source_provenance={"NEIS": provenance},
+    )
+
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert packet["sourceObservationDateRanges"]["NEIS"] == {
+        "earliest": "2026-04-23",
+        "latest": "2026-06-07",
+        "spanDays": 45,
+        "rawRowCounts": {"2026-04-23": 1, "2026-06-07": 2},
+    }
+    assert "비공개검토학교" not in json.dumps(packet, ensure_ascii=False)
+
+
+# Production break caught: approving a candidate with a digest reviewed against
+# a different but otherwise valid raw-source observation-date histogram.
+def test_approval_rejects_digest_for_changed_source_observation_histogram(
+    tmp_path: Path,
+) -> None:
+    records = (
+        replace(source_record(), source_as_of="2026-04-23"),
+        replace(
+            source_record(institution_id="neis:B10:7010002"),
+            source_as_of="2026-06-07",
+        ),
+    )
+    original_provenance = replace(
+        source_provenance_for(records)["NEIS"],
+        fetched_row_count=3,
+        source_as_of="2026-06-07",
+        source_observation_date_counts=(
+            ("2026-04-23", 1),
+            ("2026-06-07", 2),
+        ),
+    )
+    changed_provenance = replace(
+        original_provenance,
+        source_observation_date_counts=(
+            ("2026-04-23", 2),
+            ("2026-06-07", 1),
+        ),
+    )
+    original_root = tmp_path / "original"
+    changed_root = tmp_path / "changed"
+    original = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=original_root,
+        snapshot_id="date-histogram-digest",
+        coverage=TEST_COVERAGE,
+        source_provenance={"NEIS": original_provenance},
+    )
+    changed = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=changed_root,
+        snapshot_id="date-histogram-digest",
+        coverage=TEST_COVERAGE,
+        source_provenance={"NEIS": changed_provenance},
+    )
+    original_packet = build_candidate_review_packet(
+        snapshot_id=original.snapshot_id,
+        snapshot_root=original_root,
+        coverage=TEST_COVERAGE,
+    )
+    changed_packet = build_candidate_review_packet(
+        snapshot_id=changed.snapshot_id,
+        snapshot_root=changed_root,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert changed_packet["sourceObservationDateRanges"]["NEIS"]["rawRowCounts"] == {
+        "2026-04-23": 2,
+        "2026-06-07": 1,
+    }
+    assert original_packet["reviewDigest"] != changed_packet["reviewDigest"]
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        approve_candidate_snapshot(
+            snapshot_id=changed.snapshot_id,
+            review_digest=cast(str, original_packet["reviewDigest"]),
+            reviewer_role="data-steward",
+            snapshot_root=changed_root,
+            coverage=TEST_COVERAGE,
+        )
+    assert not (changed_root / "current.json").exists()
+
+
+def test_administrator_snapshot_guidance_names_source_date_range_review() -> None:
+    guide = Path("apps/travel-map/README.md").read_text(encoding="utf-8")
+
+    assert (
+        "each source's earliest/latest date, span, and raw-row counts"
+        in " ".join(guide.split())
+    )
 
 
 def test_review_packet_excludes_sensitive_source_values(tmp_path: Path) -> None:

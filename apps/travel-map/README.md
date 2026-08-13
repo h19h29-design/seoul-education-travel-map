@@ -88,9 +88,10 @@ uv run --project apps/travel-map python \
 `snapshot_id` comes from the final JSON line emitted by the sync command. Before
 continuing past `less`, an authorized data reviewer must inspect the source,
 institution-type, foundation-type, district, status, and coordinate counts;
-quarantine IDs; and institution and site diffs. The temporary review directory
-is owner-only and the trap deletes it on shell exit or interruption. Only the
-sync command reads provider credentials; review and approval are offline and
+quarantine IDs; institution and site diffs; and each source's earliest/latest
+date, span, and raw-row counts. The temporary review directory is owner-only
+and the trap deletes it on shell exit or interruption. Only the sync command
+reads provider credentials; review and approval are offline and
 credential-free. Candidate creation alone does not update `current.json` or
 unblock release. A missing or invalid approved snapshot is a release blocker,
 never permission to substitute a sample catalog.

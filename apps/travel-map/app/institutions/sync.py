@@ -9,7 +9,7 @@ import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -1958,6 +1958,9 @@ def _build_review_packet(reviewable: _ReviewableCandidate) -> dict[str, object]:
         }
         for entry in sorted(source_entries, key=lambda item: cast(str, item["source"]))
     }
+    source_observation_date_ranges = _review_source_observation_date_ranges(
+        source_entries
+    )
     district_counts = {district: 0 for district in _SEOUL_DISTRICTS}
     for site in sites:
         if site.is_default and site.district in district_counts:
@@ -1972,6 +1975,7 @@ def _build_review_packet(reviewable: _ReviewableCandidate) -> dict[str, object]:
         "snapshotAsOf": cast(str, manifest["snapshotAsOf"]),
         "previousSnapshotId": diff.get("previousSnapshotId"),
         "sourceCounts": source_counts,
+        "sourceObservationDateRanges": source_observation_date_ranges,
         "institutionTypeCounts": dict(
             sorted(Counter(item.institution_type for item in institutions).items())
         ),
@@ -2006,6 +2010,25 @@ def _build_review_packet(reviewable: _ReviewableCandidate) -> dict[str, object]:
     packet = dict(packet_without_digest)
     packet["reviewDigest"] = _canonical_sha256(packet_without_digest)
     return packet
+
+
+def _review_source_observation_date_ranges(
+    entries: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    ranges: dict[str, dict[str, object]] = {}
+    for entry in sorted(entries, key=lambda item: cast(str, item["source"])):
+        source = cast(str, entry["source"])
+        counts = cast(dict[str, int], entry["sourceObservationDateCounts"])
+        dates = sorted(counts)
+        ranges[source] = {
+            "earliest": dates[0],
+            "latest": dates[-1],
+            "spanDays": (
+                date.fromisoformat(dates[-1]) - date.fromisoformat(dates[0])
+            ).days,
+            "rawRowCounts": {day: counts[day] for day in dates},
+        }
+    return ranges
 
 
 def _load_review_previous_snapshot(
