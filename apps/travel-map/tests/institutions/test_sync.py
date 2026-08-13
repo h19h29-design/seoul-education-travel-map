@@ -3850,6 +3850,60 @@ def test_review_and_approval_reject_signed_unobserved_institution_date(
     assert not (tmp_path / "current.json").exists()
 
 
+# Production break caught: accepting descending serialized observation-date keys
+# after the canonical transaction and review digests conceal their ordering change.
+def test_review_and_approval_reject_signed_unsorted_observation_histogram(
+    tmp_path: Path,
+) -> None:
+    initial = build_test_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="histogram-order-current",
+        coverage=TEST_COVERAGE,
+    )
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    records = (
+        source_record(institution_id="neis:B10:7010001"),
+        replace(
+            source_record(institution_id="neis:B10:7010002"),
+            source_as_of="2026-08-09",
+        ),
+    )
+    candidate = build_test_candidate(
+        records=records,
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="histogram-order-tampered",
+        coverage=TEST_COVERAGE,
+    )
+    review_digest = review_test_candidate(candidate, tmp_path)
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sources"][0]["sourceObservationDateCounts"] = {
+        "2026-08-10": 1,
+        "2026-08-09": 1,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError, match="manifest|provenance"):
+        build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    with pytest.raises(SnapshotQualityError, match="manifest|provenance"):
+        approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=review_digest,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [

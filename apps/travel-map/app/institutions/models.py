@@ -307,7 +307,9 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
 
     @model_validator(mode="after")
     def observation_dates_are_consistent(self) -> Self:
-        pairs = tuple(sorted(self.source_observation_date_counts.items()))
+        pairs = tuple(self.source_observation_date_counts.items())
+        if pairs != tuple(sorted(pairs)):
+            raise ValueError("source observation date keys must be sorted")
         if not pairs or sum(count for _, count in pairs) != self.fetched_row_count:
             raise ValueError(
                 "source observation dates do not match fetchedRowCount"

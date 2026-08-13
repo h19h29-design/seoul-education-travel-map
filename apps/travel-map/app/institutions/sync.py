@@ -1239,7 +1239,7 @@ def _validated_source_observation_date_counts(
         return None
     if type(value) is dict:
         raw_pairs = tuple(value.items())
-        require_sorted = False
+        require_sorted = True
     elif type(value) is tuple:
         raw_pairs = value
         require_sorted = True
