@@ -1,4 +1,5 @@
 import hashlib
+from collections import Counter
 from collections.abc import Mapping
 from datetime import date
 
@@ -75,7 +76,7 @@ class NeisSource:
         pages: list[bytes] = []
         records: list[SourceInstitutionRecord] = []
         seen_page_ids: set[tuple[str, ...]] = set()
-        raw_source_dates: set[str] = set()
+        fetched_raw_rows: list[object] = []
         declared_total: int | None = None
         raw_row_count = 0
         cumulative_raw_bytes = 0
@@ -115,11 +116,6 @@ class NeisSource:
             elif total != declared_total:
                 raise SourceDataError("NEIS list_total_count changed during pagination")
             raw_rows = _neis_rows(payload)
-            raw_source_dates.update(_raw_neis_load_dates(raw_rows))
-            if len(raw_source_dates) > 1:
-                raise SourceDataError(
-                    "NEIS source contains multiple raw LOAD_DTM dates across pages"
-                )
             if len(raw_rows) > self._page_size:
                 raise SourceDataError("NEIS returned more rows than requested page size")
             if raw_row_count + len(raw_rows) > declared_total:
@@ -144,6 +140,7 @@ class NeisSource:
             parsed = parse_neis_rows(payload)
             pages.append(raw)
             raw_row_count += len(raw_rows)
+            fetched_raw_rows.extend(raw_rows)
             records.extend(parsed)
             if not raw_rows and raw_row_count < declared_total:
                 raise SourceDataError("NEIS pagination ended before list_total_count")
@@ -152,9 +149,10 @@ class NeisSource:
             raise SourceDataError("NEIS row count does not match list_total_count")
         if not records:
             raise SourceDataError("NEIS returned no selectable source rows")
-        if len(raw_source_dates) != 1:
-            raise SourceDataError("NEIS raw source date is missing")
-        source_as_of = raw_source_dates.pop()
+        source_observation_date_counts = _sorted_observation_date_counts(
+            fetched_raw_rows
+        )
+        source_as_of = source_observation_date_counts[-1][0]
         return SourceFetchResult(
             records=tuple(records),
             provenance=SourceProvenance(
@@ -171,54 +169,39 @@ class NeisSource:
                 request_region_code="B10",
                 request_timing=None,
                 normalized_sha256=normalized_records_sha256(records),
+                source_observation_date_counts=source_observation_date_counts,
             ),
         )
 
 
 def parse_neis_rows(payload: Mapping[str, object]) -> tuple[SourceInstitutionRecord, ...]:
     rows = _neis_rows(payload)
-    raw_source_dates = _raw_neis_load_dates(rows)
-    if len(raw_source_dates) > 1:
-        raise SourceDataError("NEIS page contains multiple raw LOAD_DTM dates")
-
+    _sorted_observation_date_counts(rows)
     selectable_rows = [
         row
         for row in rows
         if _required_string_from_object(row, "SCHUL_KND_SC_NM")
         not in _NONSELECTABLE_TYPES
     ]
-    parsed_rows = [_parse_row(row) for row in selectable_rows]
-    if not parsed_rows:
-        return ()
-    source_as_of = max(row[1] for row in parsed_rows)
-    return tuple(
-        SourceInstitutionRecord(
-            institution_id=record.institution_id,
-            official_name=record.official_name,
-            institution_type=record.institution_type,
-            foundation_type=record.foundation_type,
-            education_office=record.education_office,
-            road_address=record.road_address,
-            district=record.district,
-            latitude=None,
-            longitude=None,
-            source="NEIS",
-            source_region_code="B10",
-            source_as_of=source_as_of,
-            coordinate_quality="MISSING",
-        )
-        for record, _ in parsed_rows
-    )
+    return tuple(record for record, _loaded in map(_parse_row, selectable_rows))
 
 
-def _raw_neis_load_dates(rows: list[object]) -> set[str]:
+def _sorted_observation_date_counts(
+    raw_rows: list[object],
+) -> tuple[tuple[str, int], ...]:
     try:
-        return {
+        counts = Counter(
             _yyyymmdd_as_iso(_required_string_from_object(row, "LOAD_DTM"))
-            for row in rows
-        }
+            for row in raw_rows
+        )
     except ValueError as exc:
         raise SourceDataError("NEIS row contains an unsupported value") from exc
+    dates = tuple(sorted(counts.items()))
+    if not dates or (
+        date.fromisoformat(dates[-1][0]) - date.fromisoformat(dates[0][0])
+    ).days > 90:
+        raise SourceDataError("NEIS observation date span exceeds 90 days")
+    return dates
 
 
 def _neis_rows(payload: Mapping[str, object]) -> list[object]:

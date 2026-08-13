@@ -199,19 +199,18 @@ def test_neis_explicitly_excludes_nonselectable_joint_training_center() -> None:
     assert parse_neis_rows(payload) == ()
 
 
-# Production break caught: collapsing two raw vintages on one API page to the later
-# date and presenting the page as one coherent source snapshot.
-def test_neis_rejects_multiple_raw_load_dates_within_one_page() -> None:
+# Production break caught: assigning every parsed NEIS row the newest page vintage
+# instead of the record's own raw LOAD_DTM value.
+def test_neis_parse_preserves_mixed_raw_load_dates_within_one_page() -> None:
     payload = load_json("neis-school-info.json")
     rows = payload["schoolInfo"][1]["row"]  # type: ignore[index]
     rows[0]["LOAD_DTM"] = "20260809"
     rows[1]["LOAD_DTM"] = "20260810"
 
-    with pytest.raises(
-        SourceDataError,
-        match="^NEIS page contains multiple raw LOAD_DTM dates$",
-    ):
-        parse_neis_rows(payload)
+    assert {record.source_as_of for record in parse_neis_rows(payload)} == {
+        "2026-08-09",
+        "2026-08-10",
+    }
 
 
 # Production break caught: treating a filtered-out row as if its vintage cannot
@@ -383,6 +382,9 @@ def test_reviewed_sen_resource_matches_official_organization_totals() -> None:
     assert len(result.records) == 41
     assert result.provenance.row_count == 41
     assert result.provenance.fetched_row_count == 42
+    assert result.provenance.source_observation_date_counts == (
+        ("2026-08-10", 42),
+    )
     assert all(record.foundation_type == "PUBLIC" for record in result.records)
     assert all(record.source_region_code == "SEOUL" for record in result.records)
     assert all(not hasattr(record, "telephone") for record in result.records)
@@ -1355,6 +1357,32 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_kindergarten_fetch_reports_all_raw_rows_at_pinned_timing(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = kindergarten_payload()
+        payload["sggList"] = request.url.params["sggCode"]
+        row = payload["kinderInfo"][0]  # type: ignore[index]
+        row["kinderCode"] = f"K{request.url.params['sggCode']}"
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await KindergartenSource(
+            api_key="test-key",
+            client=client,
+            region_codes_path=write_region_fixture(tmp_path),
+            timing="20261",
+        ).fetch()
+
+    assert result.provenance.source_observation_date_counts == (
+        ("2026-04-01", 25),
+    )
+
+
+@pytest.mark.asyncio
 async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
@@ -1384,7 +1412,9 @@ async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
 
 
 @pytest.mark.asyncio
-async def test_neis_source_rejects_mixed_load_dates_across_pages() -> None:
+async def test_neis_fetch_preserves_mixed_raw_load_dates() -> None:
+    dates = ("20260423", "20260607")
+
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["pIndex"])
         payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
@@ -1393,22 +1423,81 @@ async def test_neis_source_rejects_mixed_load_dates_across_pages() -> None:
         sections[0]["head"][0]["list_total_count"] = 2
         row = sections[1]["row"][0]
         row["SD_SCHUL_CODE"] = f"701000{page}"
-        row["LOAD_DTM"] = "20260809" if page == 1 else "20260810"
+        row["LOAD_DTM"] = dates[page - 1]
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler)
     ) as client:
         source = NeisSource(api_key="test-key", client=client, page_size=1)
-        with pytest.raises(
-            SourceDataError,
-            match="^NEIS source contains multiple raw LOAD_DTM dates across pages$",
-        ):
+        result = await source.fetch()
+
+    assert {record.source_as_of for record in result.records} == {
+        "2026-04-23",
+        "2026-06-07",
+    }
+    assert result.provenance.source_as_of == "2026-06-07"
+    assert result.provenance.source_observation_date_counts == (
+        ("2026-04-23", 1),
+        ("2026-06-07", 1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_neis_fetch_accepts_raw_observation_span_of_90_days() -> None:
+    dates = ("20260401", "20260630")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["pIndex"])
+        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
+        sections = payload["schoolInfo"]
+        assert type(sections) is list
+        sections[0]["head"][0]["list_total_count"] = 2
+        row = sections[1]["row"][0]
+        row["SD_SCHUL_CODE"] = f"701000{page}"
+        row["LOAD_DTM"] = dates[page - 1]
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await NeisSource(
+            api_key="test-key",
+            client=client,
+            page_size=1,
+        ).fetch()
+
+    assert result.provenance.source_observation_date_counts == (
+        ("2026-04-01", 1),
+        ("2026-06-30", 1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_neis_fetch_rejects_raw_observation_span_over_90_days() -> None:
+    dates = ("20260401", "20260701")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["pIndex"])
+        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
+        sections = payload["schoolInfo"]
+        assert type(sections) is list
+        sections[0]["head"][0]["list_total_count"] = 2
+        row = sections[1]["row"][0]
+        row["SD_SCHUL_CODE"] = f"701000{page}"
+        row["LOAD_DTM"] = dates[page - 1]
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        source = NeisSource(api_key="test-key", client=client, page_size=1)
+        with pytest.raises(SourceDataError, match="observation date span"):
             await source.fetch()
 
 
 @pytest.mark.asyncio
-async def test_neis_source_rejects_different_date_on_excluded_only_page() -> None:
+async def test_neis_fetch_counts_excluded_rows_in_raw_observation_dates() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["pIndex"])
         payload = neis_payload(
@@ -1425,11 +1514,13 @@ async def test_neis_source_rejects_different_date_on_excluded_only_page() -> Non
         transport=httpx.MockTransport(handler)
     ) as client:
         source = NeisSource(api_key="test-key", client=client, page_size=1)
-        with pytest.raises(
-            SourceDataError,
-            match="^NEIS source contains multiple raw LOAD_DTM dates across pages$",
-        ):
-            await source.fetch()
+        result = await source.fetch()
+
+    assert [record.source_as_of for record in result.records] == ["2026-08-10"]
+    assert result.provenance.source_observation_date_counts == (
+        ("2026-08-09", 1),
+        ("2026-08-10", 1),
+    )
 
 
 @pytest.mark.asyncio

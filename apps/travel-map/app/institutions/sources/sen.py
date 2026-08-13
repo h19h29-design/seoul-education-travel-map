@@ -110,6 +110,9 @@ class SenCsvSource:
                 request_region_code="SEOUL",
                 request_timing=None,
                 normalized_sha256=normalized_records_sha256(records),
+                source_observation_date_counts=(
+                    (metadata["source_as_of"], fetched_row_count),
+                ),
             ),
         )
 

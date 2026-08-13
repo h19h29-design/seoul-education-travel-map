@@ -56,6 +56,7 @@ class SourceProvenance:
     request_region_code: str | None = None
     request_timing: str | None = None
     normalized_sha256: str | None = None
+    source_observation_date_counts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)

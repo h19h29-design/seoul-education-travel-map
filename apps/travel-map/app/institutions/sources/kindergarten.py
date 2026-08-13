@@ -87,6 +87,7 @@ class KindergartenSource:
         pages: list[bytes] = []
         cumulative_bytes = 0
         records: list[SourceInstitutionRecord] = []
+        fetched_raw_row_count = 0
         for sido_code, sgg_code, _district in regions:
             seen_page_ids: set[tuple[str, ...]] = set()
             page = 1
@@ -126,6 +127,7 @@ class KindergartenSource:
                     source_as_of=_timing_as_date(self._timing),
                     expected_timing=self._timing,
                 )
+                fetched_raw_row_count += len(_raw_kindergarten_rows(payload))
                 page_ids = tuple(record.institution_id for record in parsed)
                 if page_ids in seen_page_ids:
                     raise SourceDataError("kindergarten returned a repeated page")
@@ -150,10 +152,13 @@ class KindergartenSource:
                 raw_sha256=hashlib.sha256(b"".join(pages)).hexdigest(),
                 page_count=len(pages),
                 row_count=len(records),
-                fetched_row_count=len(records),
+                fetched_row_count=fetched_raw_row_count,
                 request_region_code="11",
                 request_timing=self._timing,
                 normalized_sha256=normalized_records_sha256(records),
+                source_observation_date_counts=(
+                    (_timing_as_date(self._timing), fetched_raw_row_count),
+                ),
             ),
         )
 
@@ -184,6 +189,13 @@ def parse_kindergarten_rows(
     else:
         raise SourceDataError("kindergarten source timing must be pinned")
     return tuple(_parse_row(row, selected_as_of) for row in rows)
+
+
+def _raw_kindergarten_rows(payload: Mapping[str, object]) -> list[object]:
+    rows = payload.get("kinderInfo")
+    if type(rows) is not list:
+        raise SourceDataError("kindergarten source rows are missing")
+    return rows
 
 
 def parse_kindergarten_region_codes(
