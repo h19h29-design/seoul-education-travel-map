@@ -137,6 +137,8 @@ class KindergartenSource:
                 if len(parsed) < self._page_size:
                     break
                 page += 1
+        if fetched_raw_row_count == 0:
+            raise SourceDataError("kindergarten returned no source rows")
         ids = [record.institution_id for record in records]
         if len(ids) != len(set(ids)):
             raise SourceDataError("kindergarten source returned duplicate identifiers")

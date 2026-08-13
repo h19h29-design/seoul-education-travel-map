@@ -1382,6 +1382,30 @@ async def test_kindergarten_fetch_reports_all_raw_rows_at_pinned_timing(
     )
 
 
+# Production break caught: publishing a zero-count source observation histogram
+# after every requested kindergarten region returned a valid but empty response.
+@pytest.mark.asyncio
+async def test_kindergarten_fetch_rejects_no_raw_source_rows(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = kindergarten_payload()
+        payload["sggList"] = request.url.params["sggCode"]
+        payload["kinderInfo"] = []
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(SourceDataError, match="no source rows"):
+            await KindergartenSource(
+                api_key="test-key",
+                client=client,
+                region_codes_path=write_region_fixture(tmp_path),
+                timing="20261",
+            ).fetch()
+
+
 @pytest.mark.asyncio
 async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
