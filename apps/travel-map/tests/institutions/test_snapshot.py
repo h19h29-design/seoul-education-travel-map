@@ -755,8 +755,116 @@ def test_snapshot_requires_institution_and_manifest_source_as_of_match(
 
     with pytest.raises(
         SnapshotIntegrityError,
-        match="sourceAsOf does not match manifest source TEST_NEIS",
+        match="sourceAsOf is absent from manifest source TEST_NEIS",
     ):
+        verify_snapshot(fixture)
+
+
+# Production break caught: rejecting a bounded raw-source date range even when every
+# persisted institution date is represented by the reviewed source histogram.
+def test_snapshot_accepts_bounded_date_histogram_and_mixed_institution_dates(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    set_source_histogram(
+        fixture,
+        {"2026-04-23": 1, "2026-06-07": 9},
+        source_as_of="2026-06-07",
+    )
+    set_all_institution_dates(fixture, "2026-06-07")
+    set_institution_date(fixture, 0, "2026-04-23")
+
+    verified = verify_snapshot(fixture)
+
+    assert verified.manifest.sources[0].source_as_of == "2026-06-07"
+    assert verified.manifest.sources[0].source_observation_date_counts == {
+        "2026-04-23": 1,
+        "2026-06-07": 9,
+    }
+
+
+# Production break caught: accepting nonpositive raw counts or a source window wider
+# than the reviewed 90-day bound.
+@pytest.mark.parametrize(
+    "histogram",
+    [
+        {"2026-04-23": 0, "2026-06-07": 10},
+        {"2026-04-23": 1, "2026-07-23": 9},
+    ],
+)
+def test_snapshot_rejects_invalid_observation_date_histogram(
+    tmp_path: Path,
+    histogram: dict[str, int],
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    latest = max(histogram)
+    set_source_histogram(fixture, histogram, source_as_of=latest)
+    set_all_institution_dates(fixture, latest)
+
+    with pytest.raises(SnapshotIntegrityError, match="observation date"):
+        verify_snapshot(fixture)
+
+
+# Production break caught: allowing a legacy manifest to omit the reviewed raw-date
+# evidence entirely.
+def test_snapshot_rejects_missing_observation_date_histogram(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    manifest["sources"][0].pop("sourceObservationDateCounts")
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(SnapshotIntegrityError, match="manifest.json fields"):
+        verify_snapshot(fixture)
+
+
+# Production break caught: accepting a raw-date histogram that does not account for
+# every fetched source row.
+def test_snapshot_rejects_observation_date_histogram_count_sum_mismatch(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    set_source_histogram(
+        fixture,
+        {"2026-08-01": 9},
+        source_as_of="2026-08-01",
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="fetchedRowCount"):
+        verify_snapshot(fixture)
+
+
+# Production break caught: allowing sourceAsOf to claim a date other than the latest
+# reviewed observation date.
+def test_snapshot_rejects_observation_histogram_maximum_mismatch(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    set_source_histogram(
+        fixture,
+        {"2026-07-31": 10},
+        source_as_of="2026-08-01",
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="latest observation date"):
+        verify_snapshot(fixture)
+
+
+# Production break caught: accepting a persisted institution vintage that was not
+# observed in the source response bound into the manifest.
+def test_snapshot_rejects_institution_date_absent_from_observation_histogram(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    set_source_histogram(
+        fixture,
+        {"2026-07-31": 1, "2026-08-01": 9},
+        source_as_of="2026-08-01",
+    )
+    set_institution_date(fixture, 0, "2026-06-30")
+
+    with pytest.raises(SnapshotIntegrityError, match="observation date histogram"):
         verify_snapshot(fixture)
 
 
@@ -1125,6 +1233,48 @@ def change_jsonl_record(
         encoding="utf-8",
     )
     refresh_manifest_hash(snapshot_root, filename)
+
+
+def set_source_histogram(
+    snapshot_root: Path,
+    histogram: dict[str, int],
+    *,
+    source_as_of: str,
+) -> None:
+    manifest = read_manifest(snapshot_root)
+    source = manifest["sources"][0]
+    source["sourceObservationDateCounts"] = histogram
+    source["sourceAsOf"] = source_as_of
+    write_manifest(snapshot_root, manifest)
+
+
+def set_all_institution_dates(snapshot_root: Path, source_as_of: str) -> None:
+    path = snapshot_root / "fixture-001" / "institutions.jsonl"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        record["sourceAsOf"] = source_as_of
+    path.write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+    refresh_manifest_hash(snapshot_root, "institutions.jsonl")
+
+
+def set_institution_date(
+    snapshot_root: Path,
+    record_index: int,
+    source_as_of: str,
+) -> None:
+    change_jsonl_record(
+        snapshot_root,
+        "institutions.jsonl",
+        record_index=record_index,
+        field_name="sourceAsOf",
+        value=source_as_of,
+    )
 
 
 def replace_jsonl_fragment(

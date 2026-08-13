@@ -43,6 +43,7 @@ _SOURCE_FIELDS = {
     "attribution",
     "fetchedAt",
     "sourceAsOf",
+    "sourceObservationDateCounts",
     "rawSha256",
     "sourceNormalizedSha256",
     "normalizedSha256",
@@ -605,13 +606,14 @@ def _verify_source_counts(
                 "do not match rowCount"
             )
     source_dates = {
-        source.source: source.source_as_of for source in manifest.sources
+        source.source: source.source_observation_date_counts
+        for source in manifest.sources
     }
     for institution in institutions:
-        if institution.source_as_of != source_dates[institution.source]:
+        if institution.source_as_of not in source_dates[institution.source]:
             raise SnapshotIntegrityError(
-                f"institution {institution.institution_id} sourceAsOf does not "
-                f"match manifest source {institution.source}"
+                f"institution {institution.institution_id} sourceAsOf is absent "
+                f"from manifest source {institution.source} observation date histogram"
             )
     if sum(declared.values()) != len(institutions):
         raise SnapshotIntegrityError(

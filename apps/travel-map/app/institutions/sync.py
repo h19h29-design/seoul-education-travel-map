@@ -482,13 +482,6 @@ def build_candidate_snapshot(
     issues: list[str] = []
     for record in records:
         _validate_source_record(record)
-    source_dates: dict[str, set[str]] = defaultdict(set)
-    for record in records:
-        source_dates[record.source].add(record.source_as_of)
-    if any(len(dates) != 1 for dates in source_dates.values()):
-        raise SnapshotQualityError(
-            "each source must have one exact source_as_of"
-        )
     if source_provenance is None:
         raise SnapshotQualityError("source provenance is required")
     expected_sources = {record.source for record in records}
@@ -527,6 +520,10 @@ def build_candidate_snapshot(
             sites,
             previous,
             snapshot_id,
+            source_as_of_by_source={
+                source: provenance.source_observation_date_counts[-1][0]
+                for source, provenance in source_provenance.items()
+            },
         )
         previous_active = sum(
             item.status is InstitutionStatus.ACTIVE
@@ -557,6 +554,9 @@ def build_candidate_snapshot(
                 attribution=prior.attribution,
                 fetched_at=prior.fetched_at,
                 source_as_of=prior.source_as_of,
+                source_observation_date_counts=tuple(
+                    sorted(prior.source_observation_date_counts.items())
+                ),
                 raw_sha256=prior.raw_sha256,
                 page_count=prior.page_count,
                 row_count=prior.normalized_row_count,
@@ -621,6 +621,10 @@ def build_candidate_snapshot(
     snapshot_as_of = max(
         (
             [item.source_as_of for item in institutions]
+            + [
+                item.source_as_of
+                for item in effective_source_provenance.values()
+            ]
             + [
                 item.source_as_of
                 for item in effective_enrichment_provenance.values()
@@ -1225,12 +1229,59 @@ def _is_pinned_sen_source_attestation(
     )
 
 
+def _validated_source_observation_date_counts(
+    value: object,
+    *,
+    fetched_row_count: object,
+    source_as_of: object,
+) -> dict[str, int] | None:
+    if type(fetched_row_count) is not int or type(source_as_of) is not str:
+        return None
+    if type(value) is dict:
+        raw_pairs = tuple(value.items())
+        require_sorted = False
+    elif type(value) is tuple:
+        raw_pairs = value
+        require_sorted = True
+    else:
+        return None
+    pairs: list[tuple[str, int]] = []
+    parsed_dates = []
+    for pair in raw_pairs:
+        if type(pair) is not tuple or len(pair) != 2:
+            return None
+        observed_date, count = pair
+        if type(observed_date) is not str or type(count) is not int or count <= 0:
+            return None
+        try:
+            parsed_date = datetime.fromisoformat(observed_date).date()
+        except ValueError:
+            return None
+        if parsed_date.isoformat() != observed_date:
+            return None
+        pairs.append((observed_date, count))
+        parsed_dates.append(parsed_date)
+    sorted_pairs = tuple(sorted(pairs))
+    if (
+        not pairs
+        or require_sorted
+        and tuple(pairs) != sorted_pairs
+        or len(dict(pairs)) != len(pairs)
+        or sum(count for _, count in pairs) != fetched_row_count
+        or sorted_pairs[-1][0] != source_as_of
+    ):
+        return None
+    parsed_dates.sort()
+    if (parsed_dates[-1] - parsed_dates[0]).days > 90:
+        return None
+    return dict(sorted_pairs)
+
+
 def _validate_source_provenance(
     source_name: str,
     provenance: SourceProvenance,
     records: list[SourceInstitutionRecord],
 ) -> None:
-    source_dates = {record.source_as_of for record in records}
     fetched_row_count = provenance.fetched_row_count
     checked_fetched_row_count = (
         fetched_row_count if type(fetched_row_count) is int else -1
@@ -1239,13 +1290,22 @@ def _validate_source_provenance(
     expected_normalized_hash = normalized_records_sha256(
         [_record_before_enrichment(record) for record in records]
     )
+    source_observation_date_counts = _validated_source_observation_date_counts(
+        provenance.source_observation_date_counts,
+        fetched_row_count=checked_fetched_row_count,
+        source_as_of=provenance.source_as_of,
+    )
+    record_date_counts = Counter(record.source_as_of for record in records)
     if (
         provenance.endpoint != _SOURCE_ENDPOINTS[source_name]
         or provenance.license_name != _SOURCE_LICENSES[source_name]
         or provenance.attribution != _SOURCE_ATTRIBUTIONS[source_name]
         or provenance.request_region_code != _EXPECTED_REGION_CODES[source_name]
-        or provenance.source_as_of not in source_dates
-        or len(source_dates) != 1
+        or source_observation_date_counts is None
+        or any(
+            observed_count > source_observation_date_counts.get(observed_date, 0)
+            for observed_date, observed_count in record_date_counts.items()
+        )
         or not _source_pagination_is_valid(
             source_name,
             provenance.page_count,
@@ -1570,12 +1630,10 @@ def _preserve_missing_records(
     sites: list[InstitutionSite],
     previous: VerifiedSnapshot,
     snapshot_id: str,
+    source_as_of_by_source: Mapping[str, str],
 ) -> tuple[list[Institution], list[InstitutionSite]]:
     current_ids = {item.institution_id for item in institutions}
     current_site_ids = {item.site_id for item in sites}
-    source_dates = {
-        item.source: item.source_as_of for item in institutions
-    }
     for old in previous.institutions:
         if old.institution_id in current_ids:
             sites.extend(
@@ -1587,7 +1645,7 @@ def _preserve_missing_records(
                 and old_site.site_id not in current_site_ids
             )
             continue
-        source_as_of = source_dates.get(old.source, old.source_as_of)
+        source_as_of = source_as_of_by_source.get(old.source, old.source_as_of)
         institutions.append(
             old.model_copy(
                 update={
@@ -1636,7 +1694,6 @@ def _candidate_manifest(
         current_by_source[record.source].append(record)
     sources = []
     for source_name, source_rows in sorted(by_source.items()):
-        source_as_of = max(row.source_as_of for row in source_rows)
         if source_provenance is None or source_name not in source_provenance:
             raise SnapshotQualityError(
                 "source provenance is required for every output source"
@@ -1651,7 +1708,10 @@ def _candidate_manifest(
                 "licenseName": provenance.license_name,
                 "attribution": provenance.attribution,
                 "fetchedAt": provenance.fetched_at,
-                "sourceAsOf": source_as_of,
+                "sourceAsOf": provenance.source_as_of,
+                "sourceObservationDateCounts": dict(
+                    provenance.source_observation_date_counts
+                ),
                 "rawSha256": provenance.raw_sha256,
                 "sourceNormalizedSha256": provenance.normalized_sha256,
                 "normalizedSha256": (
@@ -2497,7 +2557,12 @@ def _recheck_source_provenance(
             if row.status is not InstitutionStatus.MISSING_FROM_SOURCE
         ]
         preserved_count = len(rows) - current_count
-        source_dates = {row.source_as_of for row in rows}
+        source_observation_date_counts = _validated_source_observation_date_counts(
+            entry.get("sourceObservationDateCounts"),
+            fetched_row_count=entry.get("fetchedRowCount"),
+            source_as_of=entry.get("sourceAsOf"),
+        )
+        current_date_counts = Counter(row.source_as_of for row in current_rows)
         timing = entry.get("requestTiming")
         source_normalized_matches = current_count == 0 or (
             entry.get("sourceNormalizedSha256")
@@ -2512,8 +2577,16 @@ def _recheck_source_provenance(
             or entry.get("licenseName") != _SOURCE_LICENSES[source]
             or entry.get("attribution") != _SOURCE_ATTRIBUTIONS[source]
             or entry.get("requestRegionCode") != _EXPECTED_REGION_CODES[source]
-            or entry.get("sourceAsOf") not in source_dates
-            or len(source_dates) != 1
+            or source_observation_date_counts is None
+            or any(
+                row.source_as_of not in source_observation_date_counts
+                for row in rows
+            )
+            or any(
+                observed_count
+                > source_observation_date_counts.get(observed_date, 0)
+                for observed_date, observed_count in current_date_counts.items()
+            )
             or not _source_pagination_is_valid(
                 source,
                 entry.get("pageCount"),

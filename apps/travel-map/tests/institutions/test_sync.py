@@ -9,12 +9,13 @@ import subprocess
 import sys
 import threading
 import traceback
+from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
-from typing import cast
+from typing import Any, cast
 
 import app.institutions.sources.kindergarten as kindergarten_module
 import app.institutions.sources.neis as neis_module
@@ -2109,7 +2110,9 @@ def test_manifest_persists_cross_source_possible_match_pairs(
     )
 
 
-def test_candidate_rejects_mixed_source_dates_before_writing(tmp_path: Path) -> None:
+# Production break caught: rejecting record-level source vintages that are all bound
+# by the raw-source observation histogram.
+def test_candidate_persists_mixed_source_observation_dates(tmp_path: Path) -> None:
     first = source_record(institution_id="neis:B10:7010001")
     second = SourceInstitutionRecord(
         **{
@@ -2117,16 +2120,140 @@ def test_candidate_rejects_mixed_source_dates_before_writing(tmp_path: Path) -> 
             "source_as_of": "2026-08-09",
         }
     )
+    records = (first, second)
 
-    with pytest.raises(SnapshotQualityError, match="source_as_of"):
+    candidate = build_test_candidate(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="mixed-source-dates",
+        coverage=TEST_COVERAGE,
+    )
+    manifest = json.loads(
+        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["sources"][0]["sourceObservationDateCounts"] == {
+        "2026-08-09": 1,
+        "2026-08-10": 1,
+    }
+    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
+    assert {row.source_as_of for row in verify_snapshot(tmp_path).institutions} == {
+        "2026-08-09",
+        "2026-08-10",
+    }
+
+
+# Production break caught: writing a candidate whose institution vintage does not
+# occur in the supplied raw-source observation histogram.
+def test_candidate_rejects_unobserved_source_date_before_writing(
+    tmp_path: Path,
+) -> None:
+    records = (
+        source_record(institution_id="neis:B10:7010001"),
+        replace(
+            source_record(institution_id="neis:B10:7010002"),
+            source_as_of="2026-08-09",
+        ),
+    )
+    valid = source_provenance_for(records)["NEIS"]
+    invalid = replace(
+        valid,
+        source_observation_date_counts=(
+            ("2026-08-08", 1),
+            ("2026-08-10", 1),
+        ),
+    )
+
+    with pytest.raises(SnapshotQualityError, match="source provenance"):
         build_test_candidate(
-            records=(first, second),
+            records=records,
             previous=None,
             output_root=tmp_path,
-            snapshot_id="mixed-source-dates",
+            snapshot_id="unobserved-source-date",
             coverage=TEST_COVERAGE,
+            source_provenance={"NEIS": invalid},
         )
-    assert not (tmp_path / ".mixed-source-dates.candidate").exists()
+    assert not (tmp_path / ".unobserved-source-date.candidate").exists()
+
+
+# Production break caught: deriving snapshotAsOf only from selectable institutions
+# when a later reviewed source observation belongs to a filtered raw row.
+def test_candidate_snapshot_as_of_includes_latest_raw_observation(
+    tmp_path: Path,
+) -> None:
+    record = replace(source_record(), source_as_of="2026-04-23")
+    provenance = replace(
+        source_provenance_for((record,))["NEIS"],
+        fetched_row_count=2,
+        source_as_of="2026-06-07",
+        source_observation_date_counts=(
+            ("2026-04-23", 1),
+            ("2026-06-07", 1),
+        ),
+    )
+
+    candidate = build_test_candidate(
+        records=(record,),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="latest-raw-observation",
+        coverage=TEST_COVERAGE,
+        source_provenance={"NEIS": provenance},
+    )
+    manifest = json.loads(
+        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["snapshotAsOf"] == "2026-06-07"
+    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
+
+
+# Production break caught: retaining an older preserved institution date instead of
+# advancing it to the latest observation in the current raw-source histogram.
+def test_missing_institution_uses_current_observation_histogram_maximum(
+    tmp_path: Path,
+) -> None:
+    initial_records = (
+        source_record(institution_id="neis:B10:7010001"),
+        source_record(institution_id="neis:B10:7010002"),
+    )
+    initial = build_test_candidate(
+        records=initial_records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="histogram-before-missing",
+        coverage=TEST_COVERAGE,
+    )
+    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
+    current = replace(initial_records[0], source_as_of="2026-04-23")
+    provenance = replace(
+        source_provenance_for((current,))["NEIS"],
+        fetched_row_count=2,
+        source_as_of="2026-06-07",
+        source_observation_date_counts=(
+            ("2026-04-23", 1),
+            ("2026-06-07", 1),
+        ),
+    )
+
+    candidate = build_test_candidate(
+        records=(current,),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="histogram-after-missing",
+        coverage=TEST_COVERAGE,
+        source_provenance={"NEIS": provenance},
+    )
+    rows = [
+        json.loads(line)
+        for line in (candidate.candidate_path / "institutions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    preserved = next(row for row in rows if row["status"] == "MISSING_FROM_SOURCE")
+    assert preserved["sourceAsOf"] == "2026-06-07"
 
 
 # Production break caught: replacing an approved pointer after a source loses 40%
@@ -3674,6 +3801,55 @@ def test_promotion_runs_task3_strict_checks_before_pointer(
     assert not (tmp_path / "current.json").exists()
 
 
+# Production break caught: trusting a correctly signed candidate whose reviewed
+# histogram does not contain the persisted institution's source vintage.
+def test_review_and_approval_reject_signed_unobserved_institution_date(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_candidate_manifest = sync_module._candidate_manifest
+
+    def forged_candidate_manifest(
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        manifest = cast(Any, real_candidate_manifest)(*args, **kwargs)
+        source = cast(list[dict[str, object]], manifest["sources"])[0]
+        source["sourceAsOf"] = "2026-08-09"
+        source["sourceObservationDateCounts"] = {"2026-08-09": 1}
+        return manifest
+
+    with monkeypatch.context() as legacy_context:
+        legacy_context.setattr(
+            sync_module,
+            "_candidate_manifest",
+            forged_candidate_manifest,
+        )
+        candidate = build_test_candidate(
+            records=(source_record(),),
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id="signed-unobserved-date",
+            coverage=TEST_COVERAGE,
+        )
+
+    with pytest.raises(SnapshotQualityError, match="source provenance"):
+        build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    with pytest.raises(SnapshotQualityError, match="source provenance"):
+        approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest="0" * 64,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert not (tmp_path / "current.json").exists()
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
@@ -3770,6 +3946,7 @@ def test_manifest_replays_live_source_provenance(tmp_path: Path) -> None:
         normalized_sha256=normalized_records_sha256(
             [_before_enrichment(official_record)]
         ),
+        source_observation_date_counts=(("2026-08-10", 2),),
     )
     enrichment = EnrichmentProvenance(
         source="OFFICIAL_STANDARD_SCHOOL_LOCATION",
@@ -3808,6 +3985,9 @@ def test_manifest_replays_live_source_provenance(tmp_path: Path) -> None:
     assert manifest["sources"][0]["pageCount"] == 2
     assert manifest["sources"][0]["fetchedAt"] == "2026-08-10T09:00:00Z"
     assert manifest["sources"][0]["fetchedRowCount"] == 2
+    assert manifest["sources"][0]["sourceObservationDateCounts"] == {
+        "2026-08-10": 2
+    }
     assert manifest["sources"][0]["normalizedRowCount"] == 1
     assert manifest["sources"][0]["preservedRowCount"] == 0
     assert manifest["sources"][0]["requestRegionCode"] == "B10"
@@ -4761,9 +4941,23 @@ def source_provenance_for(
             normalized_sha256=normalized_records_sha256(
                 [_before_enrichment(record) for record in source_records]
             ),
+            source_observation_date_counts=source_observation_date_counts_for(
+                source,
+                source_records,
+            ),
         )
         for source, source_records in grouped.items()
     }
+
+
+def source_observation_date_counts_for(
+    source: str,
+    records: list[SourceInstitutionRecord],
+) -> tuple[tuple[str, int], ...]:
+    counts = Counter(record.source_as_of for record in records)
+    if source == "SEN_REVIEWED_CSV":
+        counts[max(counts)] += 1
+    return tuple(sorted(counts.items()))
 
 
 def standard_enrichment_provenance(

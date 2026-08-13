@@ -243,6 +243,7 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
     attribution: str
     fetched_at: str
     source_as_of: str
+    source_observation_date_counts: dict[str, int]
     raw_sha256: str
     source_normalized_sha256: str
     normalized_sha256: str
@@ -302,6 +303,22 @@ class SourceSnapshotInfo(_StrictSnapshotModel):
             raise ValueError(
                 "normalizedRowCount + preservedRowCount must equal rowCount"
             )
+        return self
+
+    @model_validator(mode="after")
+    def observation_dates_are_consistent(self) -> Self:
+        pairs = tuple(sorted(self.source_observation_date_counts.items()))
+        if not pairs or sum(count for _, count in pairs) != self.fetched_row_count:
+            raise ValueError(
+                "source observation dates do not match fetchedRowCount"
+            )
+        if any(type(count) is not int or count <= 0 for _, count in pairs):
+            raise ValueError("source observation date count must be positive")
+        parsed_dates = tuple(_parse_iso_date(value) for value, _ in pairs)
+        if pairs[-1][0] != self.source_as_of:
+            raise ValueError("sourceAsOf must equal the latest observation date")
+        if (parsed_dates[-1] - parsed_dates[0]).days > 90:
+            raise ValueError("source observation date span exceeds 90 days")
         return self
 
     @field_validator("request_timing")
