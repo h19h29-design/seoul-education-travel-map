@@ -286,7 +286,7 @@ def reconcile_selectable_school_counts(
         )
         source_validation_passed = (
             actual_sources == [expected_source]
-            and len(actual_source_as_of) == 1
+            and _reconciliation_dates_are_valid(actual_source_as_of)
         )
         evidence = benchmark.category_evidence[institution_type]
         categories[institution_type] = {
@@ -340,6 +340,14 @@ def reconcile_selectable_school_counts(
         ),
     }
     return result
+
+
+def _reconciliation_dates_are_valid(values: list[str]) -> bool:
+    try:
+        parsed = [date.fromisoformat(value) for value in values]
+    except ValueError:
+        return False
+    return bool(parsed) and (max(parsed) - min(parsed)).days <= 90
 
 
 def build_sync_preflight_audit(

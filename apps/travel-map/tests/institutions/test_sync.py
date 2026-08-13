@@ -942,6 +942,42 @@ def test_school_reconciliation_rejects_actual_source_contamination() -> None:
     assert audit["passed"] is False
 
 
+def test_school_reconciliation_accepts_verified_mixed_record_vintages() -> None:
+    records = records_for_type_counts({"HIGH_SCHOOL": 2})
+    mixed = (
+        replace(records[0], source_as_of="2026-04-23"),
+        replace(records[1], source_as_of="2026-06-07"),
+    )
+
+    audit = reconcile_selectable_school_counts(
+        mixed,
+        benchmark=reviewed_counts_fixture({"HIGH_SCHOOL": 2}),
+    )
+
+    assert audit["categories"]["HIGH_SCHOOL"]["actualSourceAsOf"] == [
+        "2026-04-23",
+        "2026-06-07",
+    ]
+    assert audit["categories"]["HIGH_SCHOOL"]["sourceValidationPassed"] is True
+    assert audit["passed"] is True
+
+
+def test_school_reconciliation_rejects_record_vintage_span_over_90_days() -> None:
+    records = records_for_type_counts({"HIGH_SCHOOL": 2})
+    mixed = (
+        replace(records[0], source_as_of="2026-04-01"),
+        replace(records[1], source_as_of="2026-07-01"),
+    )
+
+    audit = reconcile_selectable_school_counts(
+        mixed,
+        benchmark=reviewed_counts_fixture({"HIGH_SCHOOL": 2}),
+    )
+
+    assert audit["categories"]["HIGH_SCHOOL"]["sourceValidationPassed"] is False
+    assert audit["passed"] is False
+
+
 def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
