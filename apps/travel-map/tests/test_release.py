@@ -23,14 +23,17 @@ FIXTURE_SNAPSHOT = ROOT / "tests/fixtures/institutions/snapshot"
 
 # Production break caught: a release check treating the intentionally absent
 # production snapshot as an empty-but-deployable institution catalog.
-def test_release_preflight_blocks_when_the_production_snapshot_is_absent() -> None:
+def test_release_preflight_blocks_when_the_production_snapshot_is_absent(
+    tmp_path: Path,
+) -> None:
     completed = _run_smoke(
         {
             "TRAVEL_MAP_LIVE_SMOKE": "1",
             "KAKAO_REST_API_KEY": "test-rest",
             "SEOUL_TRANSIT_SERVICE_KEY": "test-transit",
             "OPINET_CERT_KEY": "test-opinet",
-        }
+        },
+        arguments=("--snapshot-root", str(tmp_path / "missing-snapshot")),
     )
 
     assert completed.returncode == 2
@@ -125,7 +128,8 @@ def test_release_context_contains_only_the_current_verified_snapshot(
     source_root = tmp_path / "travel-map"
     shutil.copytree(ROOT, source_root)
     snapshots = source_root / "resources/institution-snapshots"
-    snapshots.mkdir(exist_ok=True)
+    shutil.rmtree(snapshots)
+    snapshots.mkdir()
     shutil.copytree(
         FIXTURE_SNAPSHOT / "fixture-001",
         snapshots / "fixture-001",
@@ -165,7 +169,8 @@ def test_release_staging_rejects_candidate_without_current_pointer(
     source_root = tmp_path / "travel-map"
     shutil.copytree(ROOT, source_root)
     snapshots = source_root / "resources/institution-snapshots"
-    snapshots.mkdir(exist_ok=True)
+    shutil.rmtree(snapshots)
+    snapshots.mkdir()
     shutil.copytree(
         FIXTURE_SNAPSHOT / "fixture-001",
         snapshots / ".candidate-review.candidate",
@@ -329,7 +334,12 @@ def test_live_smoke_reads_an_explicit_env_file_without_echoing_credentials(
 
     completed = _run_smoke(
         {"TRAVEL_MAP_LIVE_SMOKE": "1"},
-        arguments=("--env-file", str(env_file)),
+        arguments=(
+            "--env-file",
+            str(env_file),
+            "--snapshot-root",
+            str(tmp_path / "missing-snapshot"),
+        ),
     )
 
     assert completed.returncode == 2
@@ -472,7 +482,8 @@ def _release_source_with_current_snapshot(tmp_path: Path) -> Path:
     source_root = tmp_path / "travel-map"
     shutil.copytree(ROOT, source_root)
     snapshots = source_root / "resources/institution-snapshots"
-    snapshots.mkdir(exist_ok=True)
+    shutil.rmtree(snapshots)
+    snapshots.mkdir()
     shutil.copytree(
         FIXTURE_SNAPSHOT / "fixture-001",
         snapshots / "fixture-001",
