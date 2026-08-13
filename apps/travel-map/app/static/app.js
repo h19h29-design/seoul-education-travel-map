@@ -47,6 +47,10 @@ const institutionTypeName = {
   SPECIAL_SCHOOL: "특수학교",
   MISC_SCHOOL: "각종학교·고등기술학교",
   LIFELONG_EDUCATION_FACILITY: "학력인정 평생교육시설",
+  BROADCAST_SCHOOL: "방송통신학교",
+  FOREIGN_SCHOOL: "외국인학교",
+  MISC_SCHOOL_PROGRAM: "각종학교 과정",
+  ALTERNATIVE_EDUCATION_CENTER: "대안교육 위탁기관",
 };
 const foundationTypeName = {
   NATIONAL: "국립",

@@ -32,9 +32,9 @@ _INSTITUTION_TYPES = {
     "\uc911\ud559\uad50": "MIDDLE_SCHOOL",
     "\uace0\ub4f1\ud559\uad50": "HIGH_SCHOOL",
     "\ud2b9\uc218\ud559\uad50": "SPECIAL_SCHOOL",
-    "\uc678\uad6d\uc778\ud559\uad50": "MISC_SCHOOL",
-    "\ubc29\uc1a1\ud1b5\uc2e0\uc911\ud559\uad50": "MIDDLE_SCHOOL",
-    "\ubc29\uc1a1\ud1b5\uc2e0\uace0\ub4f1\ud559\uad50": "HIGH_SCHOOL",
+    "\uc678\uad6d\uc778\ud559\uad50": "FOREIGN_SCHOOL",
+    "\ubc29\uc1a1\ud1b5\uc2e0\uc911\ud559\uad50": "BROADCAST_SCHOOL",
+    "\ubc29\uc1a1\ud1b5\uc2e0\uace0\ub4f1\ud559\uad50": "BROADCAST_SCHOOL",
     "\uac01\uc885\ud559\uad50(\ucd08)": "MISC_SCHOOL",
     "\uac01\uc885\ud559\uad50(\uc911)": "MISC_SCHOOL",
     "\uac01\uc885\ud559\uad50(\uace0)": "MISC_SCHOOL",
@@ -45,6 +45,12 @@ _INSTITUTION_TYPES = {
     "\ud3c9\uc0dd\ud559\uad50(\uace0)-3\ub1446\ud559\uae30": "LIFELONG_EDUCATION_FACILITY",
 }
 _NONSELECTABLE_TYPES = {"\uacf5\ub3d9\uc2e4\uc2b5\uc18c"}
+_INSTITUTION_TYPE_OVERRIDES = {
+    "\uafc8\ud0c0\ub798\ud559\uad50": "ALTERNATIVE_EDUCATION_CENTER",
+    "\uc5ec\uba85\ud559\uad50(\uc911)": "MISC_SCHOOL_PROGRAM",
+    "\uc9c0\uad6c\ucd0c\ud559\uad50 \uc911\ud559\uad50": "MISC_SCHOOL_PROGRAM",
+    "\uc9c0\uad6c\ucd0c\ud559\uad50 \uace0\ub4f1\ud559\uad50": "MISC_SCHOOL_PROGRAM",
+}
 
 
 class NeisSource:
@@ -259,16 +265,18 @@ def _parse_row(row: object) -> tuple[SourceInstitutionRecord, str]:
             raise SourceDataError("NEIS row is not in the B10 source region")
         school_code = _required_string(row, "SD_SCHUL_CODE")
         foundation = _FOUNDATION_TYPES[_required_string(row, "FOND_SC_NM")]
-        institution_type = _INSTITUTION_TYPES[
-            _required_string(row, "SCHUL_KND_SC_NM")
-        ]
+        official_name = _required_string(row, "SCHUL_NM")
+        institution_type = _INSTITUTION_TYPE_OVERRIDES.get(
+            official_name,
+            _INSTITUTION_TYPES[_required_string(row, "SCHUL_KND_SC_NM")],
+        )
         road_address = _required_string(row, "ORG_RDNMA")
         loaded = _yyyymmdd_as_iso(_required_string(row, "LOAD_DTM"))
     except (KeyError, ValueError) as exc:
         raise SourceDataError("NEIS row contains an unsupported value") from exc
     record = SourceInstitutionRecord(
         institution_id=f"neis:B10:{school_code}",
-        official_name=_required_string(row, "SCHUL_NM"),
+        official_name=official_name,
         institution_type=institution_type,
         foundation_type=foundation,
         education_office=_required_string(row, "JU_ORG_NM"),

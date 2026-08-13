@@ -175,9 +175,9 @@ def test_source_ids_are_namespaced_and_private_schools_are_kept() -> None:
 @pytest.mark.parametrize(
     ("source_type", "expected_type"),
     [
-        ("\uc678\uad6d\uc778\ud559\uad50", "MISC_SCHOOL"),
-        ("\ubc29\uc1a1\ud1b5\uc2e0\uc911\ud559\uad50", "MIDDLE_SCHOOL"),
-        ("\ubc29\uc1a1\ud1b5\uc2e0\uace0\ub4f1\ud559\uad50", "HIGH_SCHOOL"),
+        ("\uc678\uad6d\uc778\ud559\uad50", "FOREIGN_SCHOOL"),
+        ("\ubc29\uc1a1\ud1b5\uc2e0\uc911\ud559\uad50", "BROADCAST_SCHOOL"),
+        ("\ubc29\uc1a1\ud1b5\uc2e0\uace0\ub4f1\ud559\uad50", "BROADCAST_SCHOOL"),
         ("\uac01\uc885\ud559\uad50(\ucd08)", "MISC_SCHOOL"),
         ("\uac01\uc885\ud559\uad50(\uc911)", "MISC_SCHOOL"),
         ("\uac01\uc885\ud559\uad50(\uace0)", "MISC_SCHOOL"),
@@ -195,6 +195,35 @@ def test_neis_maps_every_verified_selectable_school_type(
     payload = neis_payload(source_type=source_type)
 
     assert parse_neis_rows(payload)[0].institution_type == expected_type
+
+
+@pytest.mark.parametrize(
+    ("school_name", "source_type", "expected_type"),
+    [
+        ("꿈타래학교", "각종학교(고)", "ALTERNATIVE_EDUCATION_CENTER"),
+        ("여명학교(중)", "각종학교(중)", "MISC_SCHOOL_PROGRAM"),
+        ("지구촌학교 중학교", "각종학교(중)", "MISC_SCHOOL_PROGRAM"),
+        ("지구촌학교 고등학교", "각종학교(고)", "MISC_SCHOOL_PROGRAM"),
+    ],
+)
+def test_neis_preserves_noncounted_misc_programs_as_selectable_types(
+    school_name: str,
+    source_type: str,
+    expected_type: str,
+) -> None:
+    payload = neis_payload(source_type=source_type)
+    row = payload["schoolInfo"][1]["row"][0]  # type: ignore[index]
+    row["SCHUL_NM"] = school_name
+
+    assert parse_neis_rows(payload)[0].institution_type == expected_type
+
+
+def test_neis_does_not_reclassify_other_misc_schools_by_level() -> None:
+    payload = neis_payload(source_type="각종학교(중)")
+    row = payload["schoolInfo"][1]["row"][0]  # type: ignore[index]
+    row["SCHUL_NM"] = "국립국악중학교"
+
+    assert parse_neis_rows(payload)[0].institution_type == "MISC_SCHOOL"
 
 
 # Production break caught: publishing a training facility as a route-selectable school.
@@ -869,6 +898,26 @@ def test_school_reconciliation_keeps_lifelong_facilities_outside_school_counts()
 
     assert audit["categories"]["ELEMENTARY_SCHOOL"]["actualCount"] == 1
     assert audit["reportedTotals"][0]["actualCount"] == 1
+    assert audit["passed"] is True
+
+
+def test_school_reconciliation_keeps_parallel_school_systems_outside_counts() -> None:
+    benchmark = reviewed_counts_fixture(
+        {"MIDDLE_SCHOOL": 1, "HIGH_SCHOOL": 1, "MISC_SCHOOL": 1}
+    )
+    records = records_for_type_counts(
+        {
+            "MIDDLE_SCHOOL": 1,
+            "HIGH_SCHOOL": 1,
+            "MISC_SCHOOL": 1,
+            "BROADCAST_SCHOOL": 6,
+            "FOREIGN_SCHOOL": 17,
+        }
+    )
+
+    audit = reconcile_selectable_school_counts(records, benchmark=benchmark)
+
+    assert audit["reportedTotals"][0]["actualCount"] == 3
     assert audit["passed"] is True
 
 
