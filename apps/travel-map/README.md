@@ -207,7 +207,10 @@ docker run --rm --init -p 8080:8080 \
 ## NAS production operations (administrators only)
 
 The public NAS deployment is available at
-<https://travel.h19h19.synology.me>. GitHub
+<https://travel.h19h19.com>. Cloudflare Tunnel is the only supported public
+entry point. The former `travel.h19h19.synology.me` endpoint is retained only
+as a temporary rollback path and must not be published as the service URL.
+GitHub
 [`h19h29-design/seoul-education-travel-map`](https://github.com/h19h29-design/seoul-education-travel-map)
 is the canonical source and GitLab
 [`h19h19/seoul-education-travel-map`](https://gitlab.aigov.go.kr/h19h19/seoul-education-travel-map)
@@ -222,6 +225,11 @@ moving the live workload to the 10 TB archive volume would add latency without
 a meaningful capacity benefit. Keep recovery copies on `/volume2` instead:
 
 - Compose: `/volume1/docker/seoul-education-travel-map/compose.yml`
+- Cloudflare Compose:
+  `/volume1/docker/seoul-education-travel-map/cloudflared-compose.yml`
+- Cloudflare tunnel token:
+  `/volume1/docker/seoul-education-travel-map/cloudflared-token`
+  (`0400`, owned by the connector UID; never print or copy its value)
 - Runtime secrets: `/volume1/docker/seoul-education-travel-map/runtime.env`
   (`0600 root:root`)
 - Backups: `/volume2/docker-1/backups/seoul-education-travel-map/<UTC stamp>`
@@ -229,9 +237,25 @@ a meaningful capacity benefit. Keep recovery copies on `/volume2` instead:
 
 The Compose service binds only `127.0.0.1:18080`, uses a read-only root
 filesystem, drops all capabilities, and reaches the public internet only via
-the DSM HTTPS reverse proxy. Configure Docker's `json-file` logger with
-`max-size: 10m` and `max-file: 5`. Do not remove the previous image until the
-replacement has passed health and route checks.
+the Cloudflare Tunnel connector. The connector named
+`seoul-education-travel-map-nas` routes `travel.h19h19.com` to
+`http://127.0.0.1:18080`, with a terminal HTTP 404 catch-all. Its tunnel ID is
+`46f538d4-52b1-4a7f-8b56-694c1050bdf3`. Pin the connector to
+`cloudflare/cloudflared@sha256:0aa26e284f05e6c77ae375b8c9c11d9eb6a448fb7bcd8d40f31cb6176189eb38`
+(`2026.8.2`) and keep its token outside Compose and Git. Configure Docker's
+`json-file` logger with `max-size: 10m` and `max-file: 5`. Do not remove the
+previous image until the replacement has passed health and route checks.
+
+The production allow-lists must name the Cloudflare hostname exactly:
+
+```text
+ALLOWED_HOSTS=["127.0.0.1","localhost","travel.h19h19.com","travel.h19h19.synology.me"]
+ALLOWED_ORIGINS=["https://travel.h19h19.com","https://travel.h19h19.synology.me"]
+```
+
+The Synology values exist only to make rollback possible. Kakao Developers
+must allow the exact JavaScript SDK domain `https://travel.h19h19.com`; its
+REST key remains server-only.
 
 For each update:
 
@@ -245,13 +269,33 @@ For each update:
    to a new
    root-only backup directory on `/volume2`.
 4. Change only the image tag in Compose and run `docker compose up -d`.
+   Restart the Cloudflare connector separately only when its pinned image,
+   token, or remote ingress configuration changes.
 5. Require container health plus internal and public `/healthz`, HTTPS/TLS,
    CSP, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, and
-   the 30-case route review before removing any rollback asset. Also confirm the
-   final image contains no `._*`, `.DS_Store`, `.env`, tests, raw data, or build
-   artifacts.
+   the 30-case route review before removing any rollback asset. Confirm the
+   public response is served through Cloudflare and the Kakao map renders.
+   Triage browser console errors without weakening CSP. Also confirm the final image contains no
+   `._*`, `.DS_Store`, `.env`, tests, raw data, or build artifacts.
 6. To roll back, restore the preceding image tag in Compose and run
-   `docker compose up -d` again.
+   `docker compose up -d` again. If the tunnel itself is unavailable, enable
+   the retained Synology endpoint only for the rollback window rather than
+   changing the published service URL.
+
+Useful non-secret checks on the NAS are:
+
+```sh
+docker compose -f /volume1/docker/seoul-education-travel-map/compose.yml ps
+docker compose -f /volume1/docker/seoul-education-travel-map/cloudflared-compose.yml ps
+curl -fsS -H 'Host: travel.h19h19.com' http://127.0.0.1:18080/healthz
+curl -fsS https://travel.h19h19.com/healthz
+```
+
+The 2026-08-16 cutover backup is stored at
+`/volume2/docker-1/backups/seoul-education-travel-map/cloudflare-cutover-20260816T081726Z`.
+The deployed application image is
+`seoul-education-travel-map:20260814T004744Z-469c13f`; the Cloudflare connector
+has four active QUIC registrations under normal operation.
 
 Create a new `/volume2` backup after every runtime-secret rotation even if the
 application image is unchanged. Never copy a runtime environment file into the
@@ -264,3 +308,11 @@ Seoul bus API still needs a key approved specifically for the public-data
 `ws.bus.go.kr` service, and the current Opinet key returns an empty price list;
 until those operator issues are resolved, the application keeps the Kakao
 routes and reports unavailable fuel cost as unknown rather than estimating it.
+
+After the 2026-08-16 Cloudflare cutover, external verification confirmed DNS
+proxying, HTTP/2, `/healthz`, CSP and security headers, the Kakao map SDK with
+21 rendered tiles, institution/place lookup, and a live trip preview containing
+transit, car, and walk routes. Cloudflare's optional analytics beacon and one
+optional Kakao SDK inline style remain blocked by the strict CSP; the map and
+route features operate without relaxing that policy. This does not change the
+Seoul bus and Opinet limitations above.
