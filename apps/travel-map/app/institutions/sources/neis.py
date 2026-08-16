@@ -1,7 +1,9 @@
 import hashlib
+import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from datetime import date
+from typing import cast
 
 import httpx
 
@@ -12,7 +14,13 @@ from app.institutions.sources.common import (
     SourceProvenance,
     get_json_with_retry,
     normalized_records_sha256,
+    observation_date_counts,
+    source_as_of_for,
     utc_now,
+)
+from app.institutions.sources.neis_classification import (
+    NeisUnclassifiedPolicy,
+    validate_unclassified_school_counts,
 )
 
 _ENDPOINT = "https://open.neis.go.kr/hub/schoolInfo"
@@ -32,34 +40,15 @@ _INSTITUTION_TYPES = {
     "\uc911\ud559\uad50": "MIDDLE_SCHOOL",
     "\uace0\ub4f1\ud559\uad50": "HIGH_SCHOOL",
     "\ud2b9\uc218\ud559\uad50": "SPECIAL_SCHOOL",
-    "\uc678\uad6d\uc778\ud559\uad50": "FOREIGN_SCHOOL",
-    "\ubc29\uc1a1\ud1b5\uc2e0\uc911\ud559\uad50": "BROADCAST_SCHOOL",
-    "\ubc29\uc1a1\ud1b5\uc2e0\uace0\ub4f1\ud559\uad50": "BROADCAST_SCHOOL",
+    "\uc678\uad6d\uc778\ud559\uad50": "MISC_SCHOOL",
+    "\ubc29\uc1a1\ud1b5\uc2e0\uc911\ud559\uad50": "MIDDLE_SCHOOL",
+    "\ubc29\uc1a1\ud1b5\uc2e0\uace0\ub4f1\ud559\uad50": "HIGH_SCHOOL",
     "\uac01\uc885\ud559\uad50(\ucd08)": "MISC_SCHOOL",
     "\uac01\uc885\ud559\uad50(\uc911)": "MISC_SCHOOL",
     "\uac01\uc885\ud559\uad50(\uace0)": "MISC_SCHOOL",
     "\uace0\ub4f1\uae30\uc220\ud559\uad50": "MISC_SCHOOL",
-    "\ud3c9\uc0dd\ud559\uad50(\ucd08)-3\ub1446\ud559\uae30": "LIFELONG_EDUCATION_FACILITY",
-    "\ud3c9\uc0dd\ud559\uad50(\uc911)-2\ub1446\ud559\uae30": "LIFELONG_EDUCATION_FACILITY",
-    "\ud3c9\uc0dd\ud559\uad50(\uace0)-2\ub1446\ud559\uae30": "LIFELONG_EDUCATION_FACILITY",
-    "\ud3c9\uc0dd\ud559\uad50(\uace0)-3\ub1446\ud559\uae30": "LIFELONG_EDUCATION_FACILITY",
 }
 _NONSELECTABLE_TYPES = {"\uacf5\ub3d9\uc2e4\uc2b5\uc18c"}
-_INSTITUTION_TYPE_OVERRIDES = {
-    "\uafc8\ud0c0\ub798\ud559\uad50": "ALTERNATIVE_EDUCATION_CENTER",
-    "\uc5ec\uba85\ud559\uad50(\uc911)": "MISC_SCHOOL_PROGRAM",
-    "\uc9c0\uad6c\ucd0c\ud559\uad50 \uc911\ud559\uad50": "MISC_SCHOOL_PROGRAM",
-    "\uc9c0\uad6c\ucd0c\ud559\uad50 \uace0\ub4f1\ud559\uad50": "MISC_SCHOOL_PROGRAM",
-}
-_SEOUL_DISTRICTS = frozenset(
-    {
-        "강남구", "강동구", "강북구", "강서구", "관악구", "광진구",
-        "구로구", "금천구", "노원구", "도봉구", "동대문구", "동작구",
-        "마포구", "서대문구", "서초구", "성동구", "성북구", "송파구",
-        "양천구", "영등포구", "용산구", "은평구", "종로구", "중구",
-        "중랑구",
-    }
-)
 
 
 class NeisSource:
@@ -68,6 +57,7 @@ class NeisSource:
         *,
         api_key: str,
         client: httpx.AsyncClient,
+        unclassified_policy: NeisUnclassifiedPolicy,
         page_size: int = 1_000,
     ) -> None:
         if not api_key.strip():
@@ -76,6 +66,7 @@ class NeisSource:
             raise SourceDataError("NEIS page size must be between 1 and 1000")
         self._api_key = api_key
         self._client = client
+        self._unclassified_policy = unclassified_policy
         self._page_size = page_size
 
     async def fetch(self) -> SourceFetchResult:
@@ -95,7 +86,8 @@ class NeisSource:
         pages: list[bytes] = []
         records: list[SourceInstitutionRecord] = []
         seen_page_ids: set[tuple[str, ...]] = set()
-        fetched_raw_rows: list[object] = []
+        raw_source_dates: list[str] = []
+        raw_school_kind_counts: Counter[str] = Counter()
         declared_total: int | None = None
         raw_row_count = 0
         cumulative_raw_bytes = 0
@@ -135,6 +127,9 @@ class NeisSource:
             elif total != declared_total:
                 raise SourceDataError("NEIS list_total_count changed during pagination")
             raw_rows = _neis_rows(payload)
+            raw_source_dates.extend(_raw_neis_load_dates(raw_rows))
+            raw_labels = tuple(_required_school_kind_label(row) for row in raw_rows)
+            raw_school_kind_counts.update(raw_labels)
             if len(raw_rows) > self._page_size:
                 raise SourceDataError("NEIS returned more rows than requested page size")
             if raw_row_count + len(raw_rows) > declared_total:
@@ -156,10 +151,12 @@ class NeisSource:
             if page_ids in seen_page_ids:
                 raise SourceDataError("NEIS returned a repeated page")
             seen_page_ids.add(page_ids)
-            parsed = parse_neis_rows(payload)
+            parsed = parse_neis_rows(
+                payload,
+                unclassified_policy=self._unclassified_policy,
+            )
             pages.append(raw)
             raw_row_count += len(raw_rows)
-            fetched_raw_rows.extend(raw_rows)
             records.extend(parsed)
             if not raw_rows and raw_row_count < declared_total:
                 raise SourceDataError("NEIS pagination ended before list_total_count")
@@ -168,10 +165,13 @@ class NeisSource:
             raise SourceDataError("NEIS row count does not match list_total_count")
         if not records:
             raise SourceDataError("NEIS returned no selectable source rows")
-        source_observation_date_counts = _sorted_observation_date_counts(
-            fetched_raw_rows
+        raw_counts = observation_date_counts(raw_source_dates)
+        normalized_counts = observation_date_counts(
+            record.source_as_of for record in records
         )
-        source_as_of = source_observation_date_counts[-1][0]
+        unclassified_counts = validate_unclassified_school_counts(
+            tuple(records), self._unclassified_policy
+        )
         return SourceFetchResult(
             records=tuple(records),
             provenance=SourceProvenance(
@@ -180,7 +180,9 @@ class NeisSource:
                 license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
                 attribution="Ministry of Education NEIS education data",
                 fetched_at=utc_now(),
-                source_as_of=source_as_of,
+                source_as_of=source_as_of_for(raw_counts),
+                source_observation_date_counts=raw_counts,
+                normalized_observation_date_counts=normalized_counts,
                 raw_sha256=hashlib.sha256(b"".join(pages)).hexdigest(),
                 page_count=len(pages),
                 row_count=len(records),
@@ -188,39 +190,40 @@ class NeisSource:
                 request_region_code="B10",
                 request_timing=None,
                 normalized_sha256=normalized_records_sha256(records),
-                source_observation_date_counts=source_observation_date_counts,
+                unclassified_school_kind_counts=tuple(unclassified_counts.items()),
+                unclassified_school_policy_sha256=self._unclassified_policy.sha256,
+                source_category_counts=tuple(sorted(raw_school_kind_counts.items())),
             ),
         )
 
 
-def parse_neis_rows(payload: Mapping[str, object]) -> tuple[SourceInstitutionRecord, ...]:
+def parse_neis_rows(
+    payload: Mapping[str, object],
+    *,
+    unclassified_policy: NeisUnclassifiedPolicy | None = None,
+) -> tuple[SourceInstitutionRecord, ...]:
     rows = _neis_rows(payload)
-    _sorted_observation_date_counts(rows)
+    _raw_neis_load_dates(rows)
+
     selectable_rows = [
         row
         for row in rows
-        if _required_string_from_object(row, "SCHUL_KND_SC_NM")
-        not in _NONSELECTABLE_TYPES
+        if _required_school_kind_label(row) not in _NONSELECTABLE_TYPES
     ]
-    return tuple(record for record, _loaded in map(_parse_row, selectable_rows))
+    return tuple(
+        _parse_row(row, unclassified_policy=unclassified_policy)[0]
+        for row in selectable_rows
+    )
 
 
-def _sorted_observation_date_counts(
-    raw_rows: list[object],
-) -> tuple[tuple[str, int], ...]:
+def _raw_neis_load_dates(rows: list[object]) -> tuple[str, ...]:
     try:
-        counts = Counter(
+        return tuple(
             _yyyymmdd_as_iso(_required_string_from_object(row, "LOAD_DTM"))
-            for row in raw_rows
+            for row in rows
         )
     except ValueError as exc:
         raise SourceDataError("NEIS row contains an unsupported value") from exc
-    dates = tuple(sorted(counts.items()))
-    if not dates or (
-        date.fromisoformat(dates[-1][0]) - date.fromisoformat(dates[0][0])
-    ).days > 90:
-        raise SourceDataError("NEIS observation date span exceeds 90 days")
-    return dates
 
 
 def _neis_rows(payload: Mapping[str, object]) -> list[object]:
@@ -234,7 +237,7 @@ def _neis_rows(payload: Mapping[str, object]) -> list[object]:
         rows = rows_node["row"]
     except KeyError as exc:
         raise SourceDataError("NEIS schoolInfo response shape is invalid") from exc
-    return rows
+    return cast(list[object], rows)
 
 
 def _raise_neis_error(payload: Mapping[str, object]) -> None:
@@ -265,7 +268,11 @@ def _neis_total(payload: Mapping[str, object]) -> int:
         raise SourceDataError("NEIS list_total_count is missing") from exc
 
 
-def _parse_row(row: object) -> tuple[SourceInstitutionRecord, str]:
+def _parse_row(
+    row: object,
+    *,
+    unclassified_policy: NeisUnclassifiedPolicy | None,
+) -> tuple[SourceInstitutionRecord, str]:
     if type(row) is not dict:
         raise SourceDataError("NEIS row must be an object")
     try:
@@ -274,18 +281,22 @@ def _parse_row(row: object) -> tuple[SourceInstitutionRecord, str]:
             raise SourceDataError("NEIS row is not in the B10 source region")
         school_code = _required_string(row, "SD_SCHUL_CODE")
         foundation = _FOUNDATION_TYPES[_required_string(row, "FOND_SC_NM")]
-        official_name = _required_string(row, "SCHUL_NM")
-        institution_type = _INSTITUTION_TYPE_OVERRIDES.get(
-            official_name,
-            _INSTITUTION_TYPES[_required_string(row, "SCHUL_KND_SC_NM")],
-        )
+        raw_kind = _required_school_kind_label(row)
+        if raw_kind in _INSTITUTION_TYPES:
+            institution_type = _INSTITUTION_TYPES[raw_kind]
+            source_kind_label = raw_kind
+        elif unclassified_policy is not None and raw_kind in unclassified_policy.labels:
+            institution_type = "UNCLASSIFIED_SCHOOL"
+            source_kind_label = raw_kind
+        else:
+            raise SourceDataError("NEIS row contains an unsupported value")
         road_address = _required_string(row, "ORG_RDNMA")
         loaded = _yyyymmdd_as_iso(_required_string(row, "LOAD_DTM"))
     except (KeyError, ValueError) as exc:
         raise SourceDataError("NEIS row contains an unsupported value") from exc
     record = SourceInstitutionRecord(
         institution_id=f"neis:B10:{school_code}",
-        official_name=official_name,
+        official_name=_required_string(row, "SCHUL_NM"),
         institution_type=institution_type,
         foundation_type=foundation,
         education_office=_required_string(row, "JU_ORG_NM"),
@@ -297,6 +308,7 @@ def _parse_row(row: object) -> tuple[SourceInstitutionRecord, str]:
         source_region_code="B10",
         source_as_of=loaded,
         coordinate_quality="MISSING",
+        source_kind_label=source_kind_label,
     )
     return record, loaded
 
@@ -314,11 +326,27 @@ def _required_string_from_object(row: object, name: str) -> str:
     return _required_string(row, name)
 
 
+def _required_school_kind_label(row: object) -> str:
+    if type(row) is not dict:
+        raise SourceDataError("NEIS row must be an object")
+    value = row.get("SCHUL_KND_SC_NM")
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or not unicodedata.is_normalized("NFC", value)
+    ):
+        raise SourceDataError(
+            "NEIS school kind label must be a nonblank exact string"
+        )
+    return value
+
+
 def _district_from_address(address: str) -> str:
-    for part in address.replace(",", " ").split():
-        if part in _SEOUL_DISTRICTS:
-            return part
-    raise SourceDataError("NEIS road address has no Seoul district")
+    parts = address.split()
+    if len(parts) < 2:
+        raise SourceDataError("NEIS road address has no district")
+    return parts[1]
 
 
 def _yyyymmdd_as_iso(value: str) -> str:

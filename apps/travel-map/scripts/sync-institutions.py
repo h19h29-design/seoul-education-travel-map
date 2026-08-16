@@ -13,6 +13,12 @@ from app.institutions.snapshot import verify_snapshot
 from app.institutions.sources.common import EnrichmentProvenance, SourceDataError
 from app.institutions.sources.kindergarten import KindergartenSource
 from app.institutions.sources.neis import NeisSource
+from app.institutions.sources.neis_classification import (
+    load_neis_unclassified_policy,
+)
+from app.institutions.sources.school_count_profile import (
+    load_school_count_population_profile,
+)
 from app.institutions.sources.sen import SenCsvSource
 from app.institutions.sources.sen_counts import load_reviewed_school_counts
 from app.institutions.sources.standard_school import (
@@ -21,6 +27,7 @@ from app.institutions.sources.standard_school import (
 )
 from app.institutions.sync import (
     SnapshotQualityError,
+    bind_school_count_population_profile,
     build_candidate_snapshot,
     build_sync_preflight_audit,
     emit_sync_preflight_audit,
@@ -71,6 +78,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--school-count-population-profile",
+        type=Path,
+        default=Path(
+            "apps/travel-map/resources/institution-sources/"
+            "school-count-population-profile.csv"
+        ),
+    )
+    parser.add_argument(
+        "--neis-unclassified-policy",
+        type=Path,
+        default=Path(
+            "apps/travel-map/resources/institution-sources/"
+            "neis-unclassified-school-kinds.csv"
+        ),
+    )
+    parser.add_argument(
         "--snapshot-root",
         type=Path,
         default=Path("apps/travel-map/resources/institution-snapshots"),
@@ -86,12 +109,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def run(args: argparse.Namespace, keys: dict[str, str]) -> str:
+async def run(args: argparse.Namespace, keys: dict[str, str]) -> None:
     credential_holders: list[
         NeisSource | KindergartenSource | KakaoLocalClient
     ] = []
     try:
-        return await _run_with_keys(args, keys, credential_holders)
+        await _run_with_keys(args, keys, credential_holders)
     finally:
         for holder in credential_holders:
             holder.clear_credentials()
@@ -105,10 +128,20 @@ async def _run_with_keys(
     credential_holders: list[
         NeisSource | KindergartenSource | KakaoLocalClient
     ],
-) -> str:
+) -> None:
+    policy = load_neis_unclassified_policy(args.neis_unclassified_policy)
+    population_profile = load_school_count_population_profile(
+        args.school_count_population_profile,
+        unclassified_policy=policy,
+    )
+    benchmark = load_reviewed_school_counts(args.school_counts)
     timeout = httpx.Timeout(5.0, connect=2.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
-        neis_source = NeisSource(api_key=keys["NEIS_API_KEY"], client=http)
+        neis_source = NeisSource(
+            api_key=keys["NEIS_API_KEY"],
+            client=http,
+            unclassified_policy=policy,
+        )
         credential_holders.append(neis_source)
         kindergarten_source = KindergartenSource(
             api_key=keys["KINDERGARTEN_API_KEY"],
@@ -131,22 +164,27 @@ async def _run_with_keys(
             neis_result.records,
             standard_result.locations,
         )
-        benchmark = load_reviewed_school_counts(args.school_counts)
-        reconciliation = reconcile_selectable_school_counts(
-            neis_result.records + kindergarten_result.records,
-            benchmark=benchmark,
-        )
         all_records = (
             neis_records + kindergarten_result.records + sen_result.records
         )
-        source_provenance = {
-            item.source: item
-            for item in (
-                neis_result.provenance,
-                kindergarten_result.provenance,
-                sen_result.provenance,
-            )
-        }
+        source_provenance = bind_school_count_population_profile(
+            {
+                item.source: item
+                for item in (
+                    neis_result.provenance,
+                    kindergarten_result.provenance,
+                    sen_result.provenance,
+                )
+            },
+            profile=population_profile,
+        )
+        reconciliation = reconcile_selectable_school_counts(
+            neis_result.records + kindergarten_result.records,
+            benchmark=benchmark,
+            population_profile=population_profile,
+            source_provenance=source_provenance,
+            unclassified_policy=policy,
+        )
         emit_sync_preflight_audit(
             build_sync_preflight_audit(
                 all_records,
@@ -202,11 +240,22 @@ async def _run_with_keys(
         snapshot_id=snapshot_id,
         coverage=coverage,
         source_provenance=source_provenance,
+        school_count_reconciliation=reconciliation,
         enrichment_provenance=enrichments,
     )
     if candidate.issues:
         raise SnapshotQualityError("; ".join(candidate.issues))
-    return candidate.snapshot_id
+    print(
+        json.dumps(
+            {
+                "snapshotId": snapshot_id,
+                "status": "CANDIDATE_REVIEW_REQUIRED",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 def main() -> int:
@@ -227,7 +276,7 @@ def main() -> int:
         return 2
     keys = {name: os.environ[name] for name in _REQUIRED_KEYS}
     try:
-        snapshot_id = asyncio.run(run(args, keys))
+        asyncio.run(run(args, keys))
     except (SourceDataError, SnapshotQualityError, OSError, ValueError) as exc:
         for name in keys:
             keys[name] = ""
@@ -235,17 +284,6 @@ def main() -> int:
         return 1
     for name in keys:
         keys[name] = ""
-    print(
-        json.dumps(
-            {
-                "snapshotId": snapshot_id,
-                "status": "CANDIDATE_REVIEW_REQUIRED",
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    )
     return 0
 
 

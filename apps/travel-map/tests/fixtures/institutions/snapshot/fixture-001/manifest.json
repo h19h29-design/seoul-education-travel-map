@@ -15,6 +15,8 @@
       "fetchedAt": "2026-08-01T00:00:00Z",
       "sourceAsOf": "2026-08-01",
       "sourceObservationDateCounts": {"2026-08-01": 10},
+      "normalizedObservationDateCounts": {"2026-08-01": 9},
+      "preservedObservationDateCounts": {"2026-08-01": 1},
       "rawSha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "sourceNormalizedSha256": "2222222222222222222222222222222222222222222222222222222222222222",
       "normalizedSha256": "2222222222222222222222222222222222222222222222222222222222222222",
@@ -22,9 +24,14 @@
       "requestTiming": null,
       "pageCount": 1,
       "fetchedRowCount": 10,
-      "normalizedRowCount": 10,
-      "preservedRowCount": 0,
-      "rowCount": 10
+      "normalizedRowCount": 9,
+      "preservedRowCount": 1,
+      "rowCount": 10,
+      "unclassifiedSchoolKindCounts": {},
+      "unclassifiedSchoolPolicySha256": null,
+      "sourceCategoryCounts": {},
+      "sourcePopulationRoleCounts": {},
+      "sourcePopulationProfileSha256": null
     }
   ],
   "enrichments": [],
@@ -39,6 +46,7 @@
   "countsByFoundation": {"PUBLIC": 10},
   "countsByStatus": {"ACTIVE": 6, "CLOSED": 1, "MISSING_FROM_SOURCE": 1, "REVIEW_REQUIRED": 1, "TEMPORARILY_CLOSED": 1},
   "coordinateQualityCounts": {"ENTRANCE": 10, "ROOFTOP": 2},
+  "schoolCountReconciliation": null,
   "diff": {
     "previousSnapshotId": null,
     "addedCount": 10,

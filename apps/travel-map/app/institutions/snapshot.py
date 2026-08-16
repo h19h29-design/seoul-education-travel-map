@@ -10,7 +10,18 @@ from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from app.institutions.models import Institution, InstitutionSite, SnapshotManifest
+from app.institutions.models import (
+    PRODUCTION_INSTITUTION_SOURCES,
+    TEST_FIXTURE_INSTITUTION_SOURCES,
+    Institution,
+    InstitutionSite,
+    InstitutionStatus,
+    SnapshotManifest,
+)
+from app.institutions.sources.neis_classification import (
+    PINNED_POLICY_SHA256,
+    NeisUnclassifiedPolicy,
+)
 
 _SAFE_SNAPSHOT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _MANIFEST_FIELDS = {
@@ -34,6 +45,7 @@ _MANIFEST_FIELDS = {
     "countsByFoundation",
     "countsByStatus",
     "coordinateQualityCounts",
+    "schoolCountReconciliation",
     "diff",
 }
 _SOURCE_FIELDS = {
@@ -44,6 +56,8 @@ _SOURCE_FIELDS = {
     "fetchedAt",
     "sourceAsOf",
     "sourceObservationDateCounts",
+    "normalizedObservationDateCounts",
+    "preservedObservationDateCounts",
     "rawSha256",
     "sourceNormalizedSha256",
     "normalizedSha256",
@@ -54,6 +68,11 @@ _SOURCE_FIELDS = {
     "normalizedRowCount",
     "preservedRowCount",
     "rowCount",
+    "unclassifiedSchoolKindCounts",
+    "unclassifiedSchoolPolicySha256",
+    "sourceCategoryCounts",
+    "sourcePopulationRoleCounts",
+    "sourcePopulationProfileSha256",
 }
 _ENRICHMENT_FIELDS = {
     "source",
@@ -405,6 +424,7 @@ def _verify_records(
     institutions: tuple[Institution, ...],
     sites: tuple[InstitutionSite, ...],
 ) -> None:
+    _verify_exact_source_contract(manifest)
     if len(institutions) != manifest.institution_count:
         raise SnapshotIntegrityError(
             "institutionCount does not match institutions.jsonl row count"
@@ -424,6 +444,9 @@ def _verify_records(
         (item.institution_id for item in institutions),
         "institutionId",
     )
+    institutions_by_id = {
+        institution.institution_id: institution for institution in institutions
+    }
     _unique_ids((item.site_id for item in sites), "siteId")
     _verify_lineage(institutions, institution_ids)
     for institution in institutions:
@@ -439,6 +462,14 @@ def _verify_records(
             raise SnapshotIntegrityError(
                 f"ACTIVE institution {institution.institution_id} is not effective "
                 "on snapshotAsOf"
+            )
+        if institution.institution_type == "UNCLASSIFIED_SCHOOL" and (
+            institution.source not in {"NEIS", "TEST_NEIS"}
+            or institution.status is not InstitutionStatus.REVIEW_REQUIRED
+            or institution.status_source != "OFFICIAL_CLASSIFICATION_PENDING"
+        ):
+            raise SnapshotIntegrityError(
+                "unclassified institution must remain pending official classification"
             )
     for site in sites:
         if site.institution_id not in institution_ids:
@@ -464,6 +495,14 @@ def _verify_records(
             raise SnapshotIntegrityError(
                 f"ACTIVE site {site.site_id} is not effective on snapshotAsOf"
             )
+        if (
+            institutions_by_id[site.institution_id].institution_type
+            == "UNCLASSIFIED_SCHOOL"
+            and site.status is not InstitutionStatus.REVIEW_REQUIRED
+        ):
+            raise SnapshotIntegrityError(
+                "unclassified institution sites must remain review required"
+            )
 
     _verify_count_map(
         manifest.counts_by_type,
@@ -486,7 +525,29 @@ def _verify_records(
         "coordinateQualityCounts",
     )
     _verify_source_counts(manifest, institutions)
+    _verify_school_count_reconciliation(manifest, institutions)
     _verify_possible_matches(manifest, institution_ids)
+
+
+def _verify_exact_source_contract(manifest: SnapshotManifest) -> None:
+    source_names = {source.source for source in manifest.sources}
+    production_contract = (
+        len(manifest.sources) == len(PRODUCTION_INSTITUTION_SOURCES)
+        and source_names == PRODUCTION_INSTITUTION_SOURCES
+        and manifest.approved_by_role == "data-steward"
+        and manifest.school_count_reconciliation is not None
+    )
+    test_fixture_contract = (
+        len(manifest.sources) == 1
+        and source_names == TEST_FIXTURE_INSTITUTION_SOURCES
+        and manifest.approved_by_role == "TEST_FIXTURE_REVIEWER"
+        and manifest.school_count_reconciliation is None
+    )
+    if not (production_contract or test_fixture_contract):
+        raise SnapshotIntegrityError(
+            "manifest must use the exact production source set or exact "
+            "synthetic test fixture"
+        )
 
 
 def _verify_possible_matches(
@@ -605,19 +666,145 @@ def _verify_source_counts(
                 f"source {source.source} normalized/preserved row counts "
                 "do not match rowCount"
             )
-    source_dates = {
-        source.source: source.source_observation_date_counts
-        for source in manifest.sources
-    }
-    for institution in institutions:
-        if institution.source_as_of not in source_dates[institution.source]:
+    for source in manifest.sources:
+        current = [
+            item
+            for item in institutions
+            if item.source == source.source
+            and item.status is not InstitutionStatus.MISSING_FROM_SOURCE
+        ]
+        preserved = [
+            item
+            for item in institutions
+            if item.source == source.source
+            and item.status is InstitutionStatus.MISSING_FROM_SOURCE
+        ]
+        _assert_observation_histogram(
+            source.normalized_observation_date_counts,
+            current,
+            source=source.source,
+            label="normalized",
+        )
+        _assert_observation_histogram(
+            source.preserved_observation_date_counts,
+            preserved,
+            source=source.source,
+            label="preserved",
+        )
+        unclassified_rows = [
+            institution
+            for institution in institutions
+            if institution.source == source.source
+            and institution.institution_type == "UNCLASSIFIED_SCHOOL"
+        ]
+        if source.source != "NEIS":
+            if (
+                source.unclassified_school_kind_counts
+                or source.unclassified_school_policy_sha256 is not None
+            ):
+                raise SnapshotIntegrityError(
+                    "unclassified provenance is reserved for NEIS"
+                )
+            continue
+        if (
+            sum(source.unclassified_school_kind_counts.values())
+            != len(unclassified_rows)
+            or not _matches_pinned_unclassified_policy(
+                source.unclassified_school_kind_counts,
+                source.unclassified_school_policy_sha256,
+            )
+        ):
             raise SnapshotIntegrityError(
-                f"institution {institution.institution_id} sourceAsOf is absent "
-                f"from manifest source {institution.source} observation date histogram"
+                "unclassified provenance does not match reviewed policy"
             )
     if sum(declared.values()) != len(institutions):
         raise SnapshotIntegrityError(
             "source rowCount sum does not match institutionCount"
+        )
+
+
+def _verify_school_count_reconciliation(
+    manifest: SnapshotManifest,
+    institutions: tuple[Institution, ...],
+) -> None:
+    reconciliation = manifest.school_count_reconciliation
+    if reconciliation is None:
+        return
+    manifest_sources = {source.source for source in manifest.sources}
+    if not manifest_sources & {"NEIS", "KINDERGARTEN_INFO"}:
+        return
+    expected_type_counts = {
+        "KINDERGARTEN_INFO": {"KINDERGARTEN": 706},
+        "NEIS": {
+            "ELEMENTARY_SCHOOL": 610,
+            "HIGH_SCHOOL": 324,
+            "MIDDLE_SCHOOL": 391,
+            "MISC_SCHOOL": 39,
+            "SPECIAL_SCHOOL": 32,
+            "UNCLASSIFIED_SCHOOL": 18,
+        },
+    }
+    for source_name, expected in expected_type_counts.items():
+        current = [
+            institution
+            for institution in institutions
+            if institution.source == source_name
+            and institution.status is not InstitutionStatus.MISSING_FROM_SOURCE
+        ]
+        actual = dict(
+            sorted(Counter(row.institution_type for row in current).items())
+        )
+        if actual != expected:
+            raise SnapshotIntegrityError(
+                "persisted normalized population does not match reconciliation"
+            )
+    quarantined = [
+        institution
+        for institution in institutions
+        if institution.source == "NEIS"
+        and institution.status is not InstitutionStatus.MISSING_FROM_SOURCE
+        and institution.institution_type == "UNCLASSIFIED_SCHOOL"
+    ]
+    if len(quarantined) != 18 or any(
+        institution.status is not InstitutionStatus.REVIEW_REQUIRED
+        or institution.status_source != "OFFICIAL_CLASSIFICATION_PENDING"
+        for institution in quarantined
+    ):
+        raise SnapshotIntegrityError(
+            "persisted population status does not match reconciliation"
+        )
+
+
+def _matches_pinned_unclassified_policy(
+    counts: dict[str, int],
+    sha256: str | None,
+) -> bool:
+    if sha256 != PINNED_POLICY_SHA256:
+        return False
+    try:
+        NeisUnclassifiedPolicy(
+            counts=tuple(counts.items()),
+            sha256=sha256,
+            reviewed_as_of="2026-08-13",
+            reviewer_role="data-steward",
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def _assert_observation_histogram(
+    declared: dict[str, int],
+    rows: list[Institution],
+    *,
+    source: str,
+    label: str,
+) -> None:
+    actual = dict(sorted(Counter(item.source_as_of for item in rows).items()))
+    if declared != actual:
+        raise SnapshotIntegrityError(
+            f"source {source} {label} observation date counts do not match "
+            "institution records"
         )
 
 

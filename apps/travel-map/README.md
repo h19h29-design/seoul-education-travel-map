@@ -56,73 +56,101 @@ and performance and outage fallback verification.
 
 Production accepts only the normalized snapshot selected by `resources/institution-snapshots/current.json`. Its pointer, approval metadata, hashes, and row schemas are validated at image build and startup. Never copy from `tests/fixtures` to this directory.
 
-With NEIS, kindergarten, and Kakao REST synchronization keys configured:
+The snapshot workflow below is administrator-only. The public map does not
+expose review or approval controls.
 
 ```sh
-review_dir=$(mktemp -d "${TMPDIR:-/tmp}/institution-review.XXXXXX")
-chmod 700 "$review_dir"
-trap 'rm -rf -- "$review_dir"' EXIT HUP INT TERM
+# 1. Networked, credentialed: creates .<id>.candidate only.
+uv run --project apps/travel-map python apps/travel-map/scripts/sync-institutions.py \
+  --env-file /secure/path/travel-map-sync.env
 
-uv run --project apps/travel-map python \
-  apps/travel-map/scripts/sync-institutions.py \
-  --env-file apps/travel-map/.env | tee "$review_dir/institution-sync.jsonl"
-
-snapshot_id=$(tail -n 1 "$review_dir/institution-sync.jsonl" | \
-  uv run --project apps/travel-map python -c \
-  'import json,sys; print(json.load(sys.stdin)["snapshotId"])')
+# 2. Credential-free: inspect source counts, observation-date histograms,
+#    quarantine IDs, coordinate quality, provenance hashes, and diff.
 uv run --project apps/travel-map python \
   apps/travel-map/scripts/review-institution-snapshot.py \
-  --snapshot-id "$snapshot_id" | tee "$review_dir/institution-review.json"
+  --snapshot-id '<candidate-id>'
 
-less "$review_dir/institution-review.json"
-review_digest=$(uv run --project apps/travel-map python -c \
-  'import json,sys; print(json.load(open(sys.argv[1]))["reviewDigest"])' \
-  "$review_dir/institution-review.json")
+# 3. After a data steward independently records the review, publish exactly
+#    the inspected digest. This is the only command that can update current.json.
 uv run --project apps/travel-map python \
   apps/travel-map/scripts/approve-institution-snapshot.py \
-  --snapshot-id "$snapshot_id" \
-  --review-digest "$review_digest" \
+  --snapshot-id '<candidate-id>' --review-digest '<64-lowercase-hex>' \
   --reviewer-role data-steward
 ```
 
-`snapshot_id` comes from the final JSON line emitted by the sync command. Before
-continuing past `less`, an authorized data reviewer must inspect the source,
-institution-type, foundation-type, district, status, and coordinate counts;
-quarantine IDs; institution and site diffs; and each source's earliest/latest
-date, span, and raw-row counts. The temporary review directory is owner-only
-and the trap deletes it on shell exit or interruption. Only the sync command
-reads provider credentials; review and approval are offline and
-credential-free. Candidate creation alone does not update `current.json` or
-unblock release. A missing or invalid approved snapshot is a release blocker,
-never permission to substitute a sample catalog.
+The expected NEIS observation-date distribution is `1413/1/1` until official
+source dates converge. This histogram is review provenance: it is neither an
+automatic rejection nor permission to normalize or collapse distinct dates.
+Release remains blocked until step 3 publishes the independently reviewed
+digest. A missing or invalid approved snapshot is a release blocker, never
+permission to substitute a sample catalog.
 
-### Administrator data review notes
+Coordinate recovery remains fail-closed. The geocoder treats only the leading
+`서울특별시`, `서울시`, and `서울` tokens as equivalent; the district, road name,
+building number, and every remaining token must match exactly, and exactly one
+Kakao road-address result must remain. It does not issue fallback or keyword
+requests and does not lower the 98% quality gate.
 
-These notes are for synchronization and release administrators; they are not
-shown in the public user interface.
+Completing offline tests does not authorize another live sync. Obtain explicit
+approval for one candidate-only run, inspect only aggregate coordinate-quality
+and provenance counts, then use the separate review and approval commands. Never
+approve a candidate that still reports a coordinate-quality issue.
 
-- The 2026-03-10 Seoul education preliminary table reports 724 kindergartens
-  and 2,092 institutions in its preliminary school-count population. It remains
-  an informational audit total and is not rewritten.
-- The source-specific completeness gate for the public kindergarten catalog is
-  the official Kindergarten Info April 2026 disclosure: Seoul code `11`, all 25
-  districts, 706 disclosed kindergartens (295 public and 411 private). The same
-  706 records must be returned by the approved `basicInfo2` OpenAPI timing
-  `20261`; the preliminary 724 count must not be used to weaken this exact API
-  population check.
-- NEIS categories that are separate selectable systems—foreign schools,
-  broadcast schools, school-form lifelong-education facilities, and reviewed
-  alternative/miscellaneous programs—remain searchable but are not folded into
-  the ordinary elementary, middle, high, special, or miscellaneous-school count
-  gates.
-- Review packets may retain non-active rows for completeness and audit. Only an
-  institution with an `ACTIVE` default site is exposed as a route origin. The
-  reviewer must examine aggregate quarantine counts and must never manually turn
-  missing or out-of-Seoul coordinates into active sites.
+### Temporary school-count variance review (administrators only)
 
-Candidate directories, signed sync transactions, and the local attestation key
-are operator state. They are ignored by Git. Only the approved snapshot selected
-by `current.json` is eligible for version control and release staging.
+The temporary population profile exists because the official preliminary
+school-count table and the live source disclosures have different observation
+dates and populations. It makes those differences explicit and reviewable; it
+must not be used to silently redefine the official benchmark. The pinned source
+contract is 1,415 NEIS rows fetched, 1,414 NEIS rows normalized, and 706
+kindergarten rows for disclosure timing `20261` as of `2026-04-01`.
+
+The six reviewed comparisons below use signed `actual - expected` differences:
+
+| Category | Official expected | Profile actual | Signed difference |
+| --- | ---: | ---: | ---: |
+| Elementary school | 609 | 610 | +1 |
+| Middle school | 390 | 390 | 0 |
+| High school | 319 | 319 | 0 |
+| Special school | 32 | 32 | 0 |
+| Miscellaneous school | 18 | 22 | +4 |
+| Kindergarten | 724 | 706 | -18 |
+
+Broadcast middle/high schools and foreign schools remain in the normalized
+catalog as supplementary populations, but they are not added to the benchmark
+actuals above. The 18 lifelong-school rows remain quarantined pending official
+classification. The single joint workshop row is nonselectable and excluded
+from the normalized NEIS population.
+
+For every candidate, run the sync, inspect the emitted
+`PRE_PROMOTION_RECONCILIATION`, generate and inspect the credential-free review
+packet, and only then pass that exact packet digest to the separate approval
+command as a `data-steward`. Synchronization itself never approves or updates
+`current.json`. Do not change the population profile unless there is new
+official evidence, a design review, passing tests, and explicit `data-steward`
+approval. General-user instructions and public UI copy must not expose internal
+population labels, quarantined identifiers, provenance hashes, or credentials;
+these details belong only in the administrator review workflow.
+
+### NEIS lifelong-school quarantine review
+
+The sync command loads the reviewed NEIS quarantine policy from
+`resources/institution-sources/neis-unclassified-school-kinds.csv`. Its current
+total is 18 and it contains exactly these labels and counts:
+
+- `평생학교(고)-2년6학기`: 7
+- `평생학교(고)-3년6학기`: 4
+- `평생학교(중)-2년6학기`: 5
+- `평생학교(초)-3년6학기`: 2
+
+These entries must remain `UNCLASSIFIED_SCHOOL` with `REVIEW_REQUIRED` status;
+they are quarantine records, not selectable schools. Before copying the review
+digest in step 3, inspect the pre-promotion audit's
+`reconciliation.unclassifiedSchoolKindCounts` and confirm it matches the four
+labels above. A new label or any count drift fails closed: stop the workflow,
+do not approve the candidate, and investigate the official source. When
+official classification or revised statistics become available, make a new
+reviewed policy change before resuming synchronization.
 
 ## Live smoke and manual approval
 
@@ -175,3 +203,64 @@ docker run --rm --init -p 8080:8080 \
   --env-file /secure/path/travel-map-production.env \
   seoul-education-travel-map:0.1.0
 ```
+
+## NAS production operations (administrators only)
+
+The public NAS deployment is available at
+<https://travel.h19h19.synology.me>. GitHub
+[`h19h29-design/seoul-education-travel-map`](https://github.com/h19h29-design/seoul-education-travel-map)
+is the canonical source and GitLab
+[`h19h19/seoul-education-travel-map`](https://gitlab.aigov.go.kr/h19h19/seoul-education-travel-map)
+is its automated mirror. Do not build from the older monorepo checkout or from
+files copied out of a running container. GitHub Actions runs warning-strict
+Python tests, Ruff, mypy, and Playwright before a reviewed change is considered
+releasable.
+
+Keep the stateless application and Docker image on SSD volume `/volume1`. The
+image is about 271 MiB and the allowlisted build context is about 3.3 MiB, so
+moving the live workload to the 10 TB archive volume would add latency without
+a meaningful capacity benefit. Keep recovery copies on `/volume2` instead:
+
+- Compose: `/volume1/docker/seoul-education-travel-map/compose.yml`
+- Runtime secrets: `/volume1/docker/seoul-education-travel-map/runtime.env`
+  (`0600 root:root`)
+- Backups: `/volume2/docker-1/backups/seoul-education-travel-map/<UTC stamp>`
+  (`0700 root:root`; files `0600 root:root`)
+
+The Compose service binds only `127.0.0.1:18080`, uses a read-only root
+filesystem, drops all capabilities, and reaches the public internet only via
+the DSM HTTPS reverse proxy. Configure Docker's `json-file` logger with
+`max-size: 10m` and `max-file: 5`. Do not remove the previous image until the
+replacement has passed health and route checks.
+
+For each update:
+
+1. Confirm GitLab and GitHub `main` point to the same reviewed commit.
+2. Stage the allowlisted context with `prepare-release-context.py`, then build a
+   new immutable image tag containing the snapshot ID and short Git SHA. Set
+   `COPYFILE_DISABLE=1` when archiving or transferring the context from macOS,
+   and require `find <context> -name '._*' -o -name '.DS_Store'` to return no
+   paths before the Docker build.
+3. Copy `compose.yml` and the current `runtime.env`, and save the current image,
+   to a new
+   root-only backup directory on `/volume2`.
+4. Change only the image tag in Compose and run `docker compose up -d`.
+5. Require container health plus internal and public `/healthz`, HTTPS/TLS,
+   CSP, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, and
+   the 30-case route review before removing any rollback asset. Also confirm the
+   final image contains no `._*`, `.DS_Store`, `.env`, tests, raw data, or build
+   artifacts.
+6. To roll back, restore the preceding image tag in Compose and run
+   `docker compose up -d` again.
+
+Create a new `/volume2` backup after every runtime-secret rotation even if the
+application image is unchanged. Never copy a runtime environment file into the
+Git repository, Docker context, image, CI artifact, or administrator report.
+
+The 2026-08-14 30-case review covered all 25 Seoul districts, 11 institution
+types, three foundation types, two 12 km buffer cases, and one out-of-coverage
+case. Kakao transit, walk, and car routes remained available. The separate
+Seoul bus API still needs a key approved specifically for the public-data
+`ws.bus.go.kr` service, and the current Opinet key returns an empty price list;
+until those operator issues are resolved, the application keeps the Kakao
+routes and reports unavailable fuel cost as unknown rather than estimating it.

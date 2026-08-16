@@ -2,15 +2,224 @@ import hashlib
 import json
 import re
 import shutil
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import pytest
-from app.institutions.models import Institution, InstitutionSite, SnapshotDiff
+from app.institutions.models import (
+    Institution,
+    InstitutionSite,
+    SchoolCountReconciliation,
+    SnapshotDiff,
+)
 from app.institutions.snapshot import SnapshotIntegrityError, verify_snapshot
 from pydantic import ValidationError
 
 SNAPSHOT_ROOT = Path("apps/travel-map/tests/fixtures/institutions/snapshot")
+REVIEWED_SCHOOL_COUNT_RECONCILIATION = {
+    "profileStatus": "TEMPORARY_PRELIMINARY_VARIANCE",
+    "profileSha256": (
+        "e904a254ab4f0fa264a0ec3894827e6bebbb2b94ab263bf635594c812dd7df06"
+    ),
+    "benchmarkSha256": (
+        "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332"
+    ),
+    "sources": {
+        "KINDERGARTEN_INFO": {
+            "fetchedCount": 706,
+            "normalizedCount": 706,
+            "roleCounts": {"BENCHMARK": 706},
+        },
+        "NEIS": {
+            "fetchedCount": 1415,
+            "normalizedCount": 1414,
+            "roleCounts": {
+                "BENCHMARK": 1373,
+                "NONSELECTABLE": 1,
+                "QUARANTINED": 18,
+                "SUPPLEMENTARY": 23,
+            },
+        },
+    },
+    "categories": {
+        "ELEMENTARY_SCHOOL": {
+            "expectedCount": 609,
+            "actualCount": 610,
+            "deltaCount": 1,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "HIGH_SCHOOL": {
+            "expectedCount": 319,
+            "actualCount": 319,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+        "KINDERGARTEN": {
+            "expectedCount": 724,
+            "actualCount": 706,
+            "deltaCount": -18,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "MIDDLE_SCHOOL": {
+            "expectedCount": 390,
+            "actualCount": 390,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+        "MISC_SCHOOL": {
+            "expectedCount": 18,
+            "actualCount": 22,
+            "deltaCount": 4,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "SPECIAL_SCHOOL": {
+            "expectedCount": 32,
+            "actualCount": 32,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+    },
+    "passed": True,
+}
+
+
+def test_school_count_reconciliation_accepts_only_reviewed_camel_case_shape() -> None:
+    parsed = SchoolCountReconciliation.model_validate(
+        REVIEWED_SCHOOL_COUNT_RECONCILIATION
+    )
+
+    assert parsed.profile_sha256 == REVIEWED_SCHOOL_COUNT_RECONCILIATION[
+        "profileSha256"
+    ]
+
+
+# Production break caught: an internal snake_case spelling bypassing the exact
+# signed JSON contract even though no producer emits that spelling.
+def test_school_count_reconciliation_rejects_snake_case_field() -> None:
+    payload = deepcopy(REVIEWED_SCHOOL_COUNT_RECONCILIATION)
+    payload["profile_status"] = payload.pop("profileStatus")
+
+    with pytest.raises(ValidationError):
+        SchoolCountReconciliation.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("passed",), False),
+        (("profileSha256",), "f" * 64),
+        (("benchmarkSha256",), "f" * 64),
+        (("sources", "NEIS", "fetchedCount"), True),
+        (("sources", "NEIS", "normalizedCount"), 1415),
+        (("sources", "NEIS", "roleCounts", "QUARANTINED"), 17),
+        (("categories", "ELEMENTARY_SCHOOL", "actualCount"), 609),
+        (("categories", "ELEMENTARY_SCHOOL", "deltaCount"), 0),
+        (("categories", "ELEMENTARY_SCHOOL", "status"), "MATCHED"),
+    ],
+)
+def test_school_count_reconciliation_rejects_unreviewed_values(
+    path: tuple[str, ...],
+    value: object,
+) -> None:
+    payload = deepcopy(REVIEWED_SCHOOL_COUNT_RECONCILIATION)
+    selected: dict[str, Any] = payload
+    for name in path[:-1]:
+        selected = selected[name]
+    selected[path[-1]] = value
+
+    with pytest.raises(ValidationError):
+        SchoolCountReconciliation.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("sources",),
+        ("sources", "NEIS", "roleCounts"),
+        ("categories",),
+    ],
+)
+def test_school_count_reconciliation_rejects_unsorted_mapping_keys(
+    path: tuple[str, ...],
+) -> None:
+    payload = deepcopy(REVIEWED_SCHOOL_COUNT_RECONCILIATION)
+    selected: dict[str, Any] = payload
+    for name in path:
+        selected = selected[name]
+    reversed_items = reversed(tuple(selected.items()))
+    replacement = dict(reversed_items)
+    parent: dict[str, Any] = payload
+    for name in path[:-1]:
+        parent = parent[name]
+    parent[path[-1]] = replacement
+
+    with pytest.raises(ValidationError):
+        SchoolCountReconciliation.model_validate(payload)
+
+
+# Production break caught: treating the explicitly identified synthetic fixture
+# exception as an ordinary production snapshot schema omission.
+def test_snapshot_accepts_only_identified_test_fixture_without_reconciliation() -> None:
+    snapshot = verify_snapshot(SNAPSHOT_ROOT)
+
+    assert snapshot.manifest.school_count_reconciliation is None
+    assert snapshot.manifest.approved_by_role == "TEST_FIXTURE_REVIEWER"
+    assert snapshot.manifest.sources[0].source_category_counts == {}
+    assert snapshot.manifest.sources[0].source_population_role_counts == {}
+    assert snapshot.manifest.sources[0].source_population_profile_sha256 is None
+
+
+# Production break caught: accepting source provenance that omits the required
+# privacy-safe unclassified-school aggregate fields for a non-NEIS source.
+def test_snapshot_requires_empty_unclassified_provenance_for_other_sources(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["unclassifiedSchoolKindCounts"] = {}
+    source["unclassifiedSchoolPolicySha256"] = None
+    write_manifest(fixture, manifest)
+
+    verified = verify_snapshot(fixture)
+
+    assert verified.manifest.sources[0].unclassified_school_kind_counts == {}
+    assert verified.manifest.sources[0].unclassified_school_policy_sha256 is None
+
+
+@pytest.mark.parametrize("target", ["institution", "site"])
+def test_snapshot_rejects_active_unclassified_records(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    institution_index = 0 if target == "institution" else 8
+    change_jsonl_record(
+        fixture,
+        "institutions.jsonl",
+        record_index=institution_index,
+        field_name="institutionType",
+        value="UNCLASSIFIED_SCHOOL",
+    )
+    change_jsonl_record(
+        fixture,
+        "institutions.jsonl",
+        record_index=institution_index,
+        field_name="source",
+        value="NEIS",
+    )
+    if target == "site":
+        change_jsonl_record(
+            fixture,
+            "institutions.jsonl",
+            record_index=institution_index,
+            field_name="statusSource",
+            value="OFFICIAL_CLASSIFICATION_PENDING",
+        )
+
+    with pytest.raises(SnapshotIntegrityError, match="unclassified"):
+        verify_snapshot(fixture)
 
 
 # Production break caught: loading bytes that no longer match the approved manifest.
@@ -295,7 +504,7 @@ def test_snapshot_recomputes_source_row_counts(tmp_path: Path) -> None:
             "normalizedRowCount must not exceed fetchedRowCount",
         ),
         (
-            {"normalizedRowCount": 9},
+            {"normalizedRowCount": 8},
             r"normalizedRowCount \+ preservedRowCount must equal rowCount",
         ),
     ],
@@ -311,6 +520,107 @@ def test_snapshot_rejects_impossible_source_count_relations(
     write_manifest(fixture, manifest)
 
     with pytest.raises(SnapshotIntegrityError, match=message):
+        verify_snapshot(fixture)
+
+
+# Production break caught: accepting noncanonical raw observation histograms that
+# cannot be bound exactly to the fetched source rows.
+@pytest.mark.parametrize(
+    ("counts", "match"),
+    [
+        ({"2026-08-01": 0}, "positive"),
+        ({"2026-08-01": 9}, "fetchedRowCount"),
+    ],
+)
+def test_snapshot_rejects_invalid_source_observation_date_counts(
+    tmp_path: Path,
+    counts: dict[str, int],
+    match: str,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceObservationDateCounts"] = counts
+    source["normalizedObservationDateCounts"] = {"2026-08-01": 9}
+    source["preservedObservationDateCounts"] = {"2026-08-01": 1}
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(SnapshotIntegrityError, match=match):
+        verify_snapshot(fixture)
+
+
+# Production break caught: accepting an ordered-map histogram whose raw JSON key
+# order is noncanonical even though the date/count pairs are otherwise valid.
+def test_snapshot_rejects_unsorted_source_observation_date_count_keys(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceAsOf"] = None
+    source["sourceObservationDateCounts"] = {
+        "2026-07-31": 1,
+        "2026-08-01": 9,
+    }
+    write_manifest(fixture, manifest)
+    manifest_path = fixture / "fixture-001" / "manifest.json"
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    canonical = (
+        '"sourceObservationDateCounts":{"2026-07-31":1,"2026-08-01":9}'
+    )
+    unsorted = (
+        '"sourceObservationDateCounts":{"2026-08-01":9,"2026-07-31":1}'
+    )
+    assert canonical in manifest_text
+    manifest_path.write_text(
+        manifest_text.replace(canonical, unsorted, 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="sorted"):
+        verify_snapshot(fixture)
+
+
+# Production break caught: keeping a single sourceAsOf label for a mixed raw fetch.
+def test_snapshot_rejects_mixed_dates_with_non_null_source_as_of(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceObservationDateCounts"] = {
+        "2026-07-31": 1,
+        "2026-08-01": 9,
+    }
+    source["normalizedObservationDateCounts"] = {"2026-08-01": 10}
+    source["preservedObservationDateCounts"] = {}
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(SnapshotIntegrityError, match="sourceAsOf"):
+        verify_snapshot(fixture)
+
+
+# Production break caught: trusting a declared normalized histogram after the
+# persisted institution row dates have changed.
+def test_snapshot_rejects_row_dates_that_do_not_match_normalized_histogram(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceObservationDateCounts"] = {"2026-08-01": 10}
+    source["normalizedObservationDateCounts"] = {"2026-08-01": 9}
+    source["preservedObservationDateCounts"] = {"2026-08-01": 1}
+    write_manifest(fixture, manifest)
+    change_jsonl_record(
+        fixture,
+        "institutions.jsonl",
+        record_index=0,
+        field_name="sourceAsOf",
+        value="2026-07-31",
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="observation date counts"):
         verify_snapshot(fixture)
 
 
@@ -685,11 +995,36 @@ def test_snapshot_rejects_source_as_of_after_fetch(tmp_path: Path) -> None:
     fixture = copy_fixture_snapshot(tmp_path)
     manifest = read_manifest(fixture)
     manifest["sources"][0]["sourceAsOf"] = "2026-08-02"
+    manifest["sources"][0]["sourceObservationDateCounts"] = {"2026-08-02": 10}
+    manifest["sources"][0]["normalizedObservationDateCounts"] = {"2026-08-02": 9}
+    manifest["sources"][0]["preservedObservationDateCounts"] = {"2026-08-02": 1}
     write_manifest(fixture, manifest)
 
     with pytest.raises(
         SnapshotIntegrityError,
         match="sourceAsOf must not be later than fetchedAt date",
+    ):
+        verify_snapshot(fixture)
+
+
+# Production break caught: bypassing fetch chronology by setting sourceAsOf to
+# null while one raw mixed-vintage histogram key is later than fetchedAt.
+def test_snapshot_rejects_mixed_source_observation_date_after_fetch(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    source = manifest["sources"][0]
+    source["sourceAsOf"] = None
+    source["sourceObservationDateCounts"] = {
+        "2026-08-01": 9,
+        "2026-08-02": 1,
+    }
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(
+        SnapshotIntegrityError,
+        match="observation dates must not be later than fetchedAt date",
     ):
         verify_snapshot(fixture)
 
@@ -739,6 +1074,29 @@ def test_snapshot_rejects_source_as_of_after_manifest_snapshot_as_of(
         verify_snapshot(fixture)
 
 
+# Production break caught: bypassing snapshot chronology with null sourceAsOf
+# even though mixed observation histograms are later than snapshotAsOf.
+def test_snapshot_rejects_mixed_observation_date_after_snapshot_as_of(
+    tmp_path: Path,
+) -> None:
+    fixture = copy_fixture_snapshot(tmp_path)
+    manifest = read_manifest(fixture)
+    manifest["snapshotAsOf"] = "2026-07-31"
+    source = manifest["sources"][0]
+    source["sourceAsOf"] = None
+    source["sourceObservationDateCounts"] = {
+        "2026-07-31": 1,
+        "2026-08-01": 9,
+    }
+    write_manifest(fixture, manifest)
+
+    with pytest.raises(
+        SnapshotIntegrityError,
+        match="observation date must not be later than manifest snapshotAsOf",
+    ):
+        verify_snapshot(fixture)
+
+
 # Production break caught: mixing institution rows from a different source vintage
 # while preserving the same source name and row count.
 def test_snapshot_requires_institution_and_manifest_source_as_of_match(
@@ -755,116 +1113,8 @@ def test_snapshot_requires_institution_and_manifest_source_as_of_match(
 
     with pytest.raises(
         SnapshotIntegrityError,
-        match="sourceAsOf is absent from manifest source TEST_NEIS",
+        match="normalized observation date counts",
     ):
-        verify_snapshot(fixture)
-
-
-# Production break caught: rejecting a bounded raw-source date range even when every
-# persisted institution date is represented by the reviewed source histogram.
-def test_snapshot_accepts_bounded_date_histogram_and_mixed_institution_dates(
-    tmp_path: Path,
-) -> None:
-    fixture = copy_fixture_snapshot(tmp_path)
-    set_source_histogram(
-        fixture,
-        {"2026-04-23": 1, "2026-06-07": 9},
-        source_as_of="2026-06-07",
-    )
-    set_all_institution_dates(fixture, "2026-06-07")
-    set_institution_date(fixture, 0, "2026-04-23")
-
-    verified = verify_snapshot(fixture)
-
-    assert verified.manifest.sources[0].source_as_of == "2026-06-07"
-    assert verified.manifest.sources[0].source_observation_date_counts == {
-        "2026-04-23": 1,
-        "2026-06-07": 9,
-    }
-
-
-# Production break caught: accepting nonpositive raw counts or a source window wider
-# than the reviewed 90-day bound.
-@pytest.mark.parametrize(
-    "histogram",
-    [
-        {"2026-04-23": 0, "2026-06-07": 10},
-        {"2026-04-23": 1, "2026-07-23": 9},
-    ],
-)
-def test_snapshot_rejects_invalid_observation_date_histogram(
-    tmp_path: Path,
-    histogram: dict[str, int],
-) -> None:
-    fixture = copy_fixture_snapshot(tmp_path)
-    latest = max(histogram)
-    set_source_histogram(fixture, histogram, source_as_of=latest)
-    set_all_institution_dates(fixture, latest)
-
-    with pytest.raises(SnapshotIntegrityError, match="observation date"):
-        verify_snapshot(fixture)
-
-
-# Production break caught: allowing a legacy manifest to omit the reviewed raw-date
-# evidence entirely.
-def test_snapshot_rejects_missing_observation_date_histogram(
-    tmp_path: Path,
-) -> None:
-    fixture = copy_fixture_snapshot(tmp_path)
-    manifest = read_manifest(fixture)
-    manifest["sources"][0].pop("sourceObservationDateCounts")
-    write_manifest(fixture, manifest)
-
-    with pytest.raises(SnapshotIntegrityError, match="manifest.json fields"):
-        verify_snapshot(fixture)
-
-
-# Production break caught: accepting a raw-date histogram that does not account for
-# every fetched source row.
-def test_snapshot_rejects_observation_date_histogram_count_sum_mismatch(
-    tmp_path: Path,
-) -> None:
-    fixture = copy_fixture_snapshot(tmp_path)
-    set_source_histogram(
-        fixture,
-        {"2026-08-01": 9},
-        source_as_of="2026-08-01",
-    )
-
-    with pytest.raises(SnapshotIntegrityError, match="fetchedRowCount"):
-        verify_snapshot(fixture)
-
-
-# Production break caught: allowing sourceAsOf to claim a date other than the latest
-# reviewed observation date.
-def test_snapshot_rejects_observation_histogram_maximum_mismatch(
-    tmp_path: Path,
-) -> None:
-    fixture = copy_fixture_snapshot(tmp_path)
-    set_source_histogram(
-        fixture,
-        {"2026-07-31": 10},
-        source_as_of="2026-08-01",
-    )
-
-    with pytest.raises(SnapshotIntegrityError, match="latest observation date"):
-        verify_snapshot(fixture)
-
-
-# Production break caught: accepting a persisted institution vintage that was not
-# observed in the source response bound into the manifest.
-def test_snapshot_rejects_institution_date_absent_from_observation_histogram(
-    tmp_path: Path,
-) -> None:
-    fixture = copy_fixture_snapshot(tmp_path)
-    set_source_histogram(
-        fixture,
-        {"2026-07-31": 1, "2026-08-01": 9},
-        source_as_of="2026-08-01",
-    )
-    set_institution_date(fixture, 0, "2026-06-30")
-
-    with pytest.raises(SnapshotIntegrityError, match="observation date histogram"):
         verify_snapshot(fixture)
 
 
@@ -1233,48 +1483,6 @@ def change_jsonl_record(
         encoding="utf-8",
     )
     refresh_manifest_hash(snapshot_root, filename)
-
-
-def set_source_histogram(
-    snapshot_root: Path,
-    histogram: dict[str, int],
-    *,
-    source_as_of: str,
-) -> None:
-    manifest = read_manifest(snapshot_root)
-    source = manifest["sources"][0]
-    source["sourceObservationDateCounts"] = histogram
-    source["sourceAsOf"] = source_as_of
-    write_manifest(snapshot_root, manifest)
-
-
-def set_all_institution_dates(snapshot_root: Path, source_as_of: str) -> None:
-    path = snapshot_root / "fixture-001" / "institutions.jsonl"
-    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    for record in records:
-        record["sourceAsOf"] = source_as_of
-    path.write_text(
-        "".join(
-            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-            for record in records
-        ),
-        encoding="utf-8",
-    )
-    refresh_manifest_hash(snapshot_root, "institutions.jsonl")
-
-
-def set_institution_date(
-    snapshot_root: Path,
-    record_index: int,
-    source_as_of: str,
-) -> None:
-    change_jsonl_record(
-        snapshot_root,
-        "institutions.jsonl",
-        record_index=record_index,
-        field_name="sourceAsOf",
-        value=source_as_of,
-    )
 
 
 def replace_jsonl_fragment(

@@ -1,3 +1,6 @@
+import hashlib
+import json
+import shutil
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -6,6 +9,64 @@ import pytest
 from app.institutions.store import InstitutionStore, UnknownSiteError
 
 SNAPSHOT_ROOT = Path("apps/travel-map/tests/fixtures/institutions/snapshot")
+def load_store_with_verified_unclassified_school(tmp_path: Path) -> InstitutionStore:
+    snapshot_root = tmp_path / "verified-unclassified"
+    shutil.copytree(SNAPSHOT_ROOT, snapshot_root)
+    snapshot = snapshot_root / "fixture-001"
+    institution_path = snapshot / "institutions.jsonl"
+    institutions = [
+        json.loads(line)
+        for line in institution_path.read_text(encoding="utf-8").splitlines()
+    ]
+    quarantined = next(
+        item
+        for item in institutions
+        if item["institutionId"] == "test-neis:B10:REVIEW-PARENT"
+    )
+    quarantined.update(
+        {
+            "officialName": "공개 제외 평생학교",
+            "institutionType": "UNCLASSIFIED_SCHOOL",
+            "statusSource": "OFFICIAL_CLASSIFICATION_PENDING",
+        }
+    )
+    institution_bytes = (
+        "\n".join(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            for item in institutions
+        )
+        + "\n"
+    ).encode()
+    institution_path.write_bytes(institution_bytes)
+    site_path = snapshot / "sites.jsonl"
+    sites = [
+        json.loads(line)
+        for line in site_path.read_text(encoding="utf-8").splitlines()
+    ]
+    next(
+        item
+        for item in sites
+        if item["siteId"] == "test-neis:B10:REVIEW-PARENT:main"
+    )["status"] = "REVIEW_REQUIRED"
+    site_bytes = (
+        "\n".join(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            for item in sites
+        )
+        + "\n"
+    ).encode()
+    site_path.write_bytes(site_bytes)
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
+    manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
+    manifest["countsByType"]["ELEMENTARY_SCHOOL"] -= 1
+    manifest["countsByType"]["UNCLASSIFIED_SCHOOL"] = 1
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return InstitutionStore.load(snapshot_root)
 
 
 # Production break caught: collapsing two institutions because they share an address.
@@ -100,6 +161,42 @@ def test_search_lists_only_active_sites_of_active_institutions() -> None:
     assert store.search(query="휴교", limit=20) == ()
     assert store.search(query="검토", limit=20) == ()
     assert store.search(query="비활성", limit=20) == ()
+
+
+# Production break caught: allowing a review-required school with valid Seoul
+# coordinates to re-enter the public store index by name or direct site lookup.
+def test_review_required_school_is_excluded_from_every_public_store_boundary() -> None:
+    store = InstitutionStore.load(SNAPSHOT_ROOT)
+    quarantined_site_id = "test-neis:B10:REVIEW-PARENT:main"
+
+    assert store.search(query="검토학교", limit=20) == ()
+    assert all(
+        item.site_id != quarantined_site_id
+        for item in store.search(query="", institution_type="ELEMENTARY_SCHOOL")
+    )
+    with pytest.raises(UnknownSiteError, match="unknown or inactive institution site"):
+        store.require_site(quarantined_site_id)
+
+
+# The quarantine type must remain excluded even when its rows form a valid,
+# signed NEIS snapshot with complete policy provenance and valid coordinates.
+def test_verified_unclassified_school_is_excluded_from_every_public_store_boundary(
+    tmp_path: Path,
+) -> None:
+    store = load_store_with_verified_unclassified_school(tmp_path)
+    quarantined_site_id = "test-neis:B10:REVIEW-PARENT:main"
+
+    assert store.search(query="공개 제외", limit=20) == ()
+    assert (
+        store.search(
+            query="",
+            institution_type="UNCLASSIFIED_SCHOOL",
+            limit=20,
+        )
+        == ()
+    )
+    with pytest.raises(UnknownSiteError, match="unknown or inactive institution site"):
+        store.require_site(quarantined_site_id)
 
 
 # Production break caught: treating canonically equivalent Hangul, whitespace, or

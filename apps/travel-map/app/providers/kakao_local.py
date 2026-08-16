@@ -20,6 +20,7 @@ _KEYWORD_ENDPOINT = "https://dapi.kakao.com/v2/local/search/keyword.json"
 _REVERSE_ENDPOINT = "https://dapi.kakao.com/v2/local/geo/coord2address.json"
 _MAX_REQUEST_COUNT = 5_000
 _MAX_CUMULATIVE_BYTES = 25 * 1024 * 1024
+_SEOUL_ADDRESS_PREFIXES = frozenset({"서울", "서울시", "서울특별시"})
 
 
 @dataclass(frozen=True)
@@ -171,7 +172,8 @@ class KakaoLocalClient:
         if type(documents) is not list:
             raise SourceDataError("Kakao Local documents are missing")
         exact: list[dict[object, object]] = []
-        normalized = _normalize_address(address)
+        normalized_input = _normalize_address_whitespace(address)
+        canonical_input = _canonicalize_road_address(address)
         for document in documents:
             if type(document) is not dict:
                 raise SourceDataError("Kakao Local document is invalid")
@@ -179,22 +181,35 @@ class KakaoLocalClient:
             if type(road) is not dict:
                 continue
             road_name = road.get("address_name")
-            if type(road_name) is str and _normalize_address(road_name) == normalized:
+            if (
+                type(road_name) is str
+                and road_name.strip()
+                and _canonicalize_road_address(road_name) == canonical_input
+            ):
                 exact.append(document)
         if len(exact) != 1:
             return None
         selected = exact[0]
         try:
-            result = GeocodeResult(
-                road_address=address.strip(),
-                latitude=float(_required_string(selected, "y")),
-                longitude=float(_required_string(selected, "x")),
-                confidence="EXACT_ROAD_ADDRESS",
-            )
-            self._accepted.append(result)
-            return result
+            latitude = float(_required_string(selected, "y"))
+            longitude = float(_required_string(selected, "x"))
         except ValueError as exc:
             raise SourceDataError("Kakao Local coordinates are invalid") from exc
+        if (
+            not isfinite(latitude)
+            or not isfinite(longitude)
+            or not -90.0 <= latitude <= 90.0
+            or not -180.0 <= longitude <= 180.0
+        ):
+            raise SourceDataError("Kakao Local coordinates are invalid")
+        result = GeocodeResult(
+            road_address=normalized_input,
+            latitude=latitude,
+            longitude=longitude,
+            confidence="EXACT_ROAD_ADDRESS",
+        )
+        self._accepted.append(result)
+        return result
 
     def clear_credentials(self) -> None:
         self._rest_key = None
@@ -294,10 +309,15 @@ class KakaoLocalClient:
         )
 
 
-def _normalize_address(value: str) -> str:
-    normalized = " ".join(value.split())
-    if normalized.startswith("서울특별시 "):
-        return "서울 " + normalized.removeprefix("서울특별시 ")
+def _normalize_address_whitespace(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _canonicalize_road_address(value: str) -> str:
+    normalized = _normalize_address_whitespace(value)
+    prefix, separator, remainder = normalized.partition(" ")
+    if separator and prefix in _SEOUL_ADDRESS_PREFIXES:
+        return f"서울 {remainder}"
     return normalized
 
 

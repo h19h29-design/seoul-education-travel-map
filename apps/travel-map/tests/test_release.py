@@ -10,9 +10,20 @@ from types import SimpleNamespace
 import pytest
 from app.contracts import TripPreviewResponse
 from app.institutions.snapshot import verify_snapshot
+from app.institutions.sync import (
+    approve_candidate_snapshot,
+    bind_school_count_population_profile,
+    build_candidate_review_packet,
+    build_candidate_snapshot,
+    reconcile_selectable_school_counts,
+)
 from app.policy.coverage import CoverageService
 from app.policy.models import CoverageState
 from app.policy.rules import RuleRepository
+from tests.institutions.population_fixtures import (
+    REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    reviewed_production_fixture,
+)
 
 ROOT = Path("apps/travel-map")
 SMOKE = ROOT / "scripts/smoke-live.py"
@@ -33,7 +44,7 @@ def test_release_preflight_blocks_when_the_production_snapshot_is_absent(
             "SEOUL_TRANSIT_SERVICE_KEY": "test-transit",
             "OPINET_CERT_KEY": "test-opinet",
         },
-        arguments=("--snapshot-root", str(tmp_path / "missing-snapshot")),
+        smoke=_isolated_smoke_without_snapshot(tmp_path),
     )
 
     assert completed.returncode == 2
@@ -53,6 +64,20 @@ def test_verified_resource_success_uses_the_existing_test_fixture_only() -> None
         buffer_distance_m=12_000,
     )
     assert coverage is not None
+
+
+# Production break caught: the schema-level TEST_NEIS exception escaping into a
+# Docker release merely because its synthetic snapshot is internally consistent.
+def test_release_context_rejects_test_fixture_population_exception(
+    tmp_path: Path,
+) -> None:
+    source_root = _release_source_with_current_snapshot(tmp_path)
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
+
+    with pytest.raises(ValueError, match="test institution snapshot"):
+        module["stage_release_context"](source_root, tmp_path / "context")
+
+    assert not (tmp_path / "context").exists()
 
 
 # Production break caught: a syntactically valid normalized boundary changed
@@ -125,10 +150,8 @@ def test_production_rule_preflight_requires_a_hash_for_every_rule(tmp_path: Path
 def test_release_context_contains_only_the_current_verified_snapshot(
     tmp_path: Path,
 ) -> None:
-    source_root = tmp_path / "travel-map"
-    shutil.copytree(ROOT, source_root)
+    source_root = _copy_release_source(tmp_path)
     snapshots = source_root / "resources/institution-snapshots"
-    shutil.rmtree(snapshots)
     snapshots.mkdir()
     shutil.copytree(
         FIXTURE_SNAPSHOT / "fixture-001",
@@ -143,7 +166,11 @@ def test_release_context_contains_only_the_current_verified_snapshot(
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
     stage_release_context = module["stage_release_context"]
     context_root = tmp_path / "context"
-    staged_snapshot_id = stage_release_context(source_root, context_root)
+    staged_snapshot_id = stage_release_context(
+        source_root,
+        context_root,
+        allow_test_fixture=True,
+    )
 
     assert staged_snapshot_id == "fixture-001"
     context_snapshots = context_root / "resources/institution-snapshots"
@@ -163,22 +190,141 @@ def test_release_context_contains_only_the_current_verified_snapshot(
     assert not (context_root / "e2e").exists()
 
 
-def test_release_staging_rejects_candidate_without_current_pointer(
+def test_release_context_blocks_candidate_until_exact_digest_approval(
     tmp_path: Path,
 ) -> None:
-    source_root = tmp_path / "travel-map"
-    shutil.copytree(ROOT, source_root)
-    snapshots = source_root / "resources/institution-snapshots"
-    shutil.rmtree(snapshots)
-    snapshots.mkdir()
-    shutil.copytree(
-        FIXTURE_SNAPSHOT / "fixture-001",
-        snapshots / ".candidate-review.candidate",
+    source_root = _copy_release_source(tmp_path)
+    snapshot_root = source_root / "resources/institution-snapshots"
+    snapshot_root.mkdir()
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    bound = bind_school_count_population_profile(provenance, profile=profile)
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
-    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="candidate_release_test")
+    coverage = CoverageService.from_geojson(
+        seoul_path=source_root / "resources/geodata/seoul.geojson",
+        buffer_distance_m=12_000,
+    )
+    build_candidate_snapshot(
+        records=records,
+        previous=None,
+        output_root=snapshot_root,
+        snapshot_id="release-review-candidate",
+        coverage=coverage,
+        source_provenance=bound,
+        school_count_reconciliation=reconciliation,
+    )
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
+    blocked_context = tmp_path / "blocked-context"
 
-    with pytest.raises((OSError, ValueError), match="current|snapshot"):
-        module["stage_release_context"](source_root, tmp_path / "context")
+    with pytest.raises(ValueError, match="snapshot pointer|current"):
+        module["stage_release_context"](source_root, blocked_context)
+
+    assert not blocked_context.exists()
+    packet = build_candidate_review_packet(
+        snapshot_id="release-review-candidate",
+        snapshot_root=snapshot_root,
+        coverage=coverage,
+    )
+    digest = packet["reviewDigest"]
+    assert isinstance(digest, str)
+    assert packet["unclassifiedSchoolKindCounts"] == dict(
+        REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+    )
+    assert (
+        packet["unclassifiedSchoolPolicySha256"]
+        == REVIEWED_NEIS_UNCLASSIFIED_POLICY.sha256
+    )
+    approve_candidate_snapshot(
+        snapshot_id="release-review-candidate",
+        review_digest=digest,
+        reviewer_role="data-steward",
+        snapshot_root=snapshot_root,
+        coverage=coverage,
+    )
+
+    staged_id = module["stage_release_context"](
+        source_root,
+        tmp_path / "approved-context",
+    )
+
+    assert staged_id == "release-review-candidate"
+
+
+# Production break caught: a validly reviewed NEIS/KGI-only snapshot can otherwise
+# stage for production while silently omitting all reviewed SEN institutions.
+def test_release_context_rejects_approved_snapshot_missing_a_production_source(
+    tmp_path: Path,
+) -> None:
+    source_root = _copy_release_source(tmp_path)
+    snapshot_root = source_root / "resources/institution-snapshots"
+    snapshot_root.mkdir()
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    bound = bind_school_count_population_profile(provenance, profile=profile)
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    coverage = CoverageService.from_geojson(
+        seoul_path=source_root / "resources/geodata/seoul.geojson",
+        buffer_distance_m=12_000,
+    )
+    candidate = build_candidate_snapshot(
+        records=records,
+        previous=None,
+        output_root=snapshot_root,
+        snapshot_id="release-missing-sen",
+        coverage=coverage,
+        source_provenance=bound,
+        school_count_reconciliation=reconciliation,
+    )
+    packet = build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=snapshot_root,
+        coverage=coverage,
+    )
+    approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=packet["reviewDigest"],
+        reviewer_role="data-steward",
+        snapshot_root=snapshot_root,
+        coverage=coverage,
+    )
+    manifest_path = snapshot_root / candidate.snapshot_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sources"] = [
+        source
+        for source in manifest["sources"]
+        if source["source"] != "SEN_REVIEWED_CSV"
+    ]
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
+
+    with pytest.raises(ValueError, match="production source set"):
+        module["stage_release_context"](
+            source_root,
+            tmp_path / "missing-source-context",
+        )
+
+    assert not (tmp_path / "missing-source-context").exists()
 
 
 def test_release_context_omits_unlisted_files_from_selected_snapshot_and_rules(
@@ -194,7 +340,11 @@ def test_release_context_omits_unlisted_files_from_selected_snapshot_and_rules(
 
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
     context_root = tmp_path / "context"
-    module["stage_release_context"](source_root, context_root)
+    module["stage_release_context"](
+        source_root,
+        context_root,
+        allow_test_fixture=True,
+    )
 
     staged_snapshot = context_root / "resources/institution-snapshots/fixture-001"
     staged_rules = context_root / "resources/rules"
@@ -233,7 +383,11 @@ def test_release_context_allowlists_only_production_app_files(tmp_path: Path) ->
 
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
     context_root = tmp_path / "context"
-    module["stage_release_context"](source_root, context_root)
+    module["stage_release_context"](
+        source_root,
+        context_root,
+        allow_test_fixture=True,
+    )
 
     staged_app = context_root / "app"
     assert (context_root / ".dockerignore").is_file()
@@ -265,7 +419,11 @@ def test_release_context_omits_every_hidden_application_path(tmp_path: Path) -> 
 
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
     context_root = tmp_path / "context"
-    module["stage_release_context"](source_root, context_root)
+    module["stage_release_context"](
+        source_root,
+        context_root,
+        allow_test_fixture=True,
+    )
 
     staged_app = context_root / "app"
     assert (staged_app / "main.py").is_file()
@@ -287,7 +445,11 @@ def test_release_context_rejects_an_application_symlink(tmp_path: Path) -> None:
     module = runpy.run_path(str(PREPARE_CONTEXT), run_name="release_context_test")
 
     with pytest.raises(ValueError, match="symlink"):
-        module["stage_release_context"](source_root, tmp_path / "context")
+        module["stage_release_context"](
+            source_root,
+            tmp_path / "context",
+            allow_test_fixture=True,
+        )
 
 
 # Production break caught: enabling a billed live check by accident or allowing
@@ -334,12 +496,8 @@ def test_live_smoke_reads_an_explicit_env_file_without_echoing_credentials(
 
     completed = _run_smoke(
         {"TRAVEL_MAP_LIVE_SMOKE": "1"},
-        arguments=(
-            "--env-file",
-            str(env_file),
-            "--snapshot-root",
-            str(tmp_path / "missing-snapshot"),
-        ),
+        arguments=("--env-file", str(env_file)),
+        smoke=_isolated_smoke_without_snapshot(tmp_path),
     )
 
     assert completed.returncode == 2
@@ -479,10 +637,8 @@ def test_live_case_report_maps_provider_failures_to_safe_statuses(
 
 
 def _release_source_with_current_snapshot(tmp_path: Path) -> Path:
-    source_root = tmp_path / "travel-map"
-    shutil.copytree(ROOT, source_root)
+    source_root = _copy_release_source(tmp_path)
     snapshots = source_root / "resources/institution-snapshots"
-    shutil.rmtree(snapshots)
     snapshots.mkdir()
     shutil.copytree(
         FIXTURE_SNAPSHOT / "fixture-001",
@@ -491,6 +647,18 @@ def _release_source_with_current_snapshot(tmp_path: Path) -> Path:
     (snapshots / "current.json").write_text(
         json.dumps({"snapshotId": "fixture-001"}),
         encoding="utf-8",
+    )
+    return source_root
+
+
+def _copy_release_source(tmp_path: Path) -> Path:
+    """Copy tracked release inputs without the ignored live snapshot runtime."""
+
+    source_root = tmp_path / "travel-map"
+    shutil.copytree(
+        ROOT,
+        source_root,
+        ignore=shutil.ignore_patterns("institution-snapshots"),
     )
     return source_root
 
@@ -566,6 +734,8 @@ def test_release_container_artifacts_exclude_non_runtime_payloads() -> None:
     for forbidden in (
         ".env",
         ".git",
+        "**/._*",
+        "**/.DS_Store",
         "tests/",
         "e2e/",
         "resources/geodata/source/",
@@ -585,6 +755,7 @@ def _run_smoke(
     extra_environment: dict[str, str],
     *,
     arguments: tuple[str, ...] = (),
+    smoke: Path = SMOKE,
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     for name in (
@@ -596,10 +767,17 @@ def _run_smoke(
         environment.pop(name, None)
     environment.update(extra_environment)
     return subprocess.run(
-        [sys.executable, str(SMOKE.resolve()), *arguments],
+        [sys.executable, str(smoke.resolve()), *arguments],
         cwd=Path.cwd(),
         env=environment,
         check=False,
         capture_output=True,
         text=True,
     )
+
+
+def _isolated_smoke_without_snapshot(tmp_path: Path) -> Path:
+    smoke = tmp_path / "travel-map/scripts/smoke-live.py"
+    smoke.parent.mkdir(parents=True)
+    shutil.copy2(SMOKE, smoke)
+    return smoke

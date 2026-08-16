@@ -81,12 +81,6 @@ def parse_args() -> argparse.Namespace:
         description="Run bounded live release smoke cases only with explicit opt-in."
     )
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument(
-        "--snapshot-root",
-        type=Path,
-        default=_SNAPSHOT_ROOT,
-        help=argparse.SUPPRESS,
-    )
     return parser.parse_args()
 
 
@@ -298,7 +292,7 @@ def main() -> int:
         _emit({"status": "BLOCKED_MISSING_CREDENTIALS"})
         return 2
     try:
-        verify_snapshot(args.snapshot_root)
+        verify_snapshot(_SNAPSHOT_ROOT)
     except SnapshotIntegrityError:
         _emit({"status": "BLOCKED_MISSING_APPROVED_SNAPSHOT"})
         return 2

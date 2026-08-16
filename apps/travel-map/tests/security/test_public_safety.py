@@ -71,6 +71,26 @@ def test_public_ui_has_strict_kakao_compatible_content_security_policy() -> None
     assert "unsafe-inline" not in response.headers["content-security-policy"]
 
 
+# Break caught: public HTML, static assets, and API responses relying only on
+# CSP/HSTS while browsers remain free to MIME-sniff, over-share referrers, or
+# grant unused device capabilities.
+def test_public_responses_set_browser_hardening_headers() -> None:
+    with TestClient(create_app()) as client:
+        responses = (
+            client.get("/"),
+            client.get("/static/app.js"),
+            client.get("/healthz"),
+        )
+
+    for response in responses:
+        assert response.status_code == 200
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+        assert response.headers["permissions-policy"] == (
+            "geolocation=(), camera=(), microphone=()"
+        )
+
+
 # Break caught: CORS preflight short-circuiting before exact Host validation and
 # accepting an untrusted host with a configured browser origin.
 def test_invalid_host_is_rejected_before_cors_preflight(client) -> None:

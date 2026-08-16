@@ -13,6 +13,7 @@ from app.institutions.sources.common import (
     SourceProvenance,
     get_json_with_retry,
     normalized_records_sha256,
+    observation_date_counts,
     utc_now,
 )
 
@@ -87,7 +88,6 @@ class KindergartenSource:
         pages: list[bytes] = []
         cumulative_bytes = 0
         records: list[SourceInstitutionRecord] = []
-        fetched_raw_row_count = 0
         for sido_code, sgg_code, _district in regions:
             seen_page_ids: set[tuple[str, ...]] = set()
             page = 1
@@ -127,7 +127,6 @@ class KindergartenSource:
                     source_as_of=_timing_as_date(self._timing),
                     expected_timing=self._timing,
                 )
-                fetched_raw_row_count += len(_raw_kindergarten_rows(payload))
                 page_ids = tuple(record.institution_id for record in parsed)
                 if page_ids in seen_page_ids:
                     raise SourceDataError("kindergarten returned a repeated page")
@@ -137,11 +136,11 @@ class KindergartenSource:
                 if len(parsed) < self._page_size:
                     break
                 page += 1
-        if fetched_raw_row_count == 0:
-            raise SourceDataError("kindergarten returned no source rows")
         ids = [record.institution_id for record in records]
         if len(ids) != len(set(ids)):
             raise SourceDataError("kindergarten source returned duplicate identifiers")
+        source_as_of = _timing_as_date(self._timing)
+        counts = observation_date_counts(source_as_of for _ in records)
         return SourceFetchResult(
             records=tuple(records),
             provenance=SourceProvenance(
@@ -150,17 +149,17 @@ class KindergartenSource:
                 license_name="PUBLIC_DATA_PORTAL_TERMS",
                 attribution="Ministry of Education Kindergarten Info",
                 fetched_at=utc_now(),
-                source_as_of=_timing_as_date(self._timing),
+                source_as_of=source_as_of,
+                source_observation_date_counts=counts,
+                normalized_observation_date_counts=counts,
                 raw_sha256=hashlib.sha256(b"".join(pages)).hexdigest(),
                 page_count=len(pages),
                 row_count=len(records),
-                fetched_row_count=fetched_raw_row_count,
+                fetched_row_count=len(records),
                 request_region_code="11",
                 request_timing=self._timing,
                 normalized_sha256=normalized_records_sha256(records),
-                source_observation_date_counts=(
-                    (_timing_as_date(self._timing), fetched_raw_row_count),
-                ),
+                source_category_counts=(("KINDERGARTEN_TOTAL", len(records)),),
             ),
         )
 
@@ -191,13 +190,6 @@ def parse_kindergarten_rows(
     else:
         raise SourceDataError("kindergarten source timing must be pinned")
     return tuple(_parse_row(row, selected_as_of) for row in rows)
-
-
-def _raw_kindergarten_rows(payload: Mapping[str, object]) -> list[object]:
-    rows = payload.get("kinderInfo")
-    if type(rows) is not list:
-        raise SourceDataError("kindergarten source rows are missing")
-    return rows
 
 
 def parse_kindergarten_region_codes(

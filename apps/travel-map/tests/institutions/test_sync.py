@@ -2,30 +2,38 @@ import argparse
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import threading
 import traceback
+import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
-from typing import Any, cast
+from typing import cast
 
 import app.institutions.sources.kindergarten as kindergarten_module
 import app.institutions.sources.neis as neis_module
+import app.institutions.sources.neis_classification as neis_classification_module
 import app.institutions.sources.standard_school as standard_school_module
 import app.institutions.sync as sync_module
 import app.providers.kakao_local as kakao_module
 import httpx
 import pytest
-from app.institutions.models import InstitutionStatus
-from app.institutions.snapshot import VerifiedSnapshot, verify_snapshot
+from app.institutions.models import Institution, InstitutionSite, InstitutionStatus
+from app.institutions.snapshot import (
+    SnapshotIntegrityError,
+    VerifiedSnapshot,
+    verify_snapshot,
+)
 from app.institutions.sources.common import (
     EnrichmentProvenance,
     SourceDataError,
@@ -35,6 +43,8 @@ from app.institutions.sources.common import (
     SourceProvenance,
     get_json_with_retry,
     normalized_records_sha256,
+    observation_date_counts,
+    source_as_of_for,
 )
 from app.institutions.sources.kindergarten import (
     KindergartenSource,
@@ -42,6 +52,18 @@ from app.institutions.sources.kindergarten import (
     parse_kindergarten_rows,
 )
 from app.institutions.sources.neis import NeisSource, parse_neis_rows
+from app.institutions.sources.neis_classification import (
+    PINNED_POLICY_SHA256,
+    NeisUnclassifiedPolicy,
+    load_neis_unclassified_policy,
+    validate_unclassified_school_counts,
+)
+from app.institutions.sources.school_count_profile import (
+    PINNED_POPULATION_PROFILE_SHA256,
+    SchoolCountPopulationProfile,
+    SchoolPopulationRow,
+    load_school_count_population_profile,
+)
 from app.institutions.sources.sen import SenCsvSource, parse_sen_csv
 from app.institutions.sources.sen_counts import (
     ReportedSchoolTotal,
@@ -58,8 +80,6 @@ from app.institutions.store import InstitutionStore
 from app.institutions.sync import (
     SnapshotBuildResult,
     SnapshotQualityError,
-    approve_candidate_snapshot,
-    build_candidate_review_packet,
     build_candidate_snapshot,
     build_sync_preflight_audit,
     emit_sync_preflight_audit,
@@ -68,7 +88,12 @@ from app.institutions.sync import (
     reconcile_selectable_school_counts,
 )
 from app.policy.coverage import CoverageService
-from app.providers.kakao_local import KakaoLocalClient
+from app.policy.models import CoverageState
+from app.providers.kakao_local import GeocodeResult, KakaoLocalClient
+from tests.institutions.population_fixtures import (
+    reviewed_population_fixture as shared_reviewed_population_fixture,
+)
+from tests.institutions.population_fixtures import reviewed_production_fixture
 
 SOURCE_FIXTURES = Path("apps/travel-map/tests/fixtures/institutions/sources")
 SOURCE_RESOURCES = Path("apps/travel-map/resources/institution-sources")
@@ -76,6 +101,705 @@ TEST_COVERAGE = CoverageService.from_geojson(
     seoul_path="apps/travel-map/resources/geodata/seoul.geojson",
     buffer_distance_m=12_000,
 )
+
+
+class _AlwaysSeoulCoverage:
+    def classify(self, _coordinate: object) -> CoverageState:
+        return CoverageState.SEOUL
+
+
+FAST_TEST_COVERAGE = cast(CoverageService, _AlwaysSeoulCoverage())
+REVIEWED_NEIS_UNCLASSIFIED_POLICY = NeisUnclassifiedPolicy(
+    counts=(
+        ("평생학교(고)-2년6학기", 7),
+        ("평생학교(고)-3년6학기", 4),
+        ("평생학교(중)-2년6학기", 5),
+        ("평생학교(초)-3년6학기", 2),
+    ),
+    sha256=PINNED_POLICY_SHA256,
+    reviewed_as_of="2026-08-13",
+    reviewer_role="data-steward",
+)
+
+
+def test_school_count_population_profile_loads_exact_reviewed_contract() -> None:
+    profile = load_school_count_population_profile(
+        SOURCE_RESOURCES / "school-count-population-profile.csv",
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    assert profile.sha256 == PINNED_POPULATION_PROFILE_SHA256
+    assert profile.status == "TEMPORARY_PRELIMINARY_VARIANCE"
+    assert profile.approved_variances == (
+        ("ELEMENTARY_SCHOOL", 1),
+        ("HIGH_SCHOOL", 0),
+        ("KINDERGARTEN", -18),
+        ("MIDDLE_SCHOOL", 0),
+        ("MISC_SCHOOL", 4),
+        ("SPECIAL_SCHOOL", 0),
+    )
+    assert profile.source_totals() == {
+        "KINDERGARTEN_INFO": 706,
+        "NEIS": 1_415,
+    }
+    assert profile.role_counts("NEIS") == {
+        "BENCHMARK": 1_373,
+        "NONSELECTABLE": 1,
+        "QUARANTINED": 18,
+        "SUPPLEMENTARY": 23,
+    }
+
+
+# Production break caught: reconciliation shown during preflight can be omitted
+# from the signed candidate and changed before a data steward reviews it.
+def test_candidate_binds_population_provenance_and_school_count_reconciliation(
+    tmp_path: Path,
+) -> None:
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    candidate = build_candidate_snapshot(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="reviewed-school-count-candidate",
+        coverage=TEST_COVERAGE,
+        source_provenance=bound,
+        school_count_reconciliation=reconciliation,
+    )
+    manifest = json.loads(
+        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest["schoolCountReconciliation"] == reconciliation
+    by_source = {entry["source"]: entry for entry in manifest["sources"]}
+    for source in ("KINDERGARTEN_INFO", "NEIS"):
+        assert by_source[source]["sourceCategoryCounts"] == dict(
+            bound[source].source_category_counts
+        )
+        assert by_source[source]["sourcePopulationRoleCounts"] == dict(
+            bound[source].source_population_role_counts
+        )
+        assert (
+            by_source[source]["sourcePopulationProfileSha256"]
+            == PINNED_POPULATION_PROFILE_SHA256
+        )
+
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    assert packet["schoolCountReconciliation"] == reconciliation
+    assert packet["schoolCountReconciliationSha256"] == (
+        sync_module._manifest_section_sha256(reconciliation)
+    )
+    packet_text = json.dumps(packet, ensure_ascii=False, sort_keys=True)
+    assert records[0].official_name not in packet_text
+    assert records[0].road_address not in packet_text
+
+
+# Production break caught: a candidate whose provenance matches only the rows it
+# happens to contain can silently omit a whole reviewed production source.
+@pytest.mark.parametrize(
+    "removed_source",
+    ("NEIS", "KINDERGARTEN_INFO", "SEN_REVIEWED_CSV"),
+)
+def test_candidate_requires_every_exact_production_source(
+    tmp_path: Path,
+    removed_source: str,
+) -> None:
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    remaining_records = tuple(
+        record for record in records if record.source != removed_source
+    )
+    fully_bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    bound = {
+        source: item
+        for source, item in fully_bound.items()
+        if source != removed_source
+    }
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=fully_bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="production source set"):
+        build_candidate_snapshot(
+            records=remaining_records,
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id=f"missing-production-{removed_source.lower()}",
+            coverage=FAST_TEST_COVERAGE,
+            source_provenance=bound,
+            school_count_reconciliation=reconciliation,
+        )
+
+    assert not any(tmp_path.glob(".*.candidate"))
+
+
+# Production break caught: an allowlisted-looking fourth source escaping review
+# because candidate completeness only compares provenance with supplied records.
+def test_candidate_rejects_an_extra_production_source(tmp_path: Path) -> None:
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    extra = replace(
+        next(record for record in records if record.source == "SEN_REVIEWED_CSV"),
+        institution_id="extra:unreviewed",
+        source="EXTRA_REVIEWED_CSV",
+        source_region_code="SEOUL",
+    )
+    extra_provenance = replace(
+        provenance["SEN_REVIEWED_CSV"],
+        source="EXTRA_REVIEWED_CSV",
+        normalized_sha256=normalized_records_sha256((extra,)),
+        row_count=1,
+        fetched_row_count=1,
+        source_observation_date_counts=((extra.source_as_of, 1),),
+        normalized_observation_date_counts=((extra.source_as_of, 1),),
+    )
+    bound = sync_module.bind_school_count_population_profile(
+        {**provenance, extra_provenance.source: extra_provenance},
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="production source set"):
+        build_candidate_snapshot(
+            records=(*records, extra),
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id="extra-production-source",
+            coverage=FAST_TEST_COVERAGE,
+            source_provenance=bound,
+            school_count_reconciliation=reconciliation,
+        )
+
+    assert not (tmp_path / ".extra-production-source.candidate").exists()
+
+
+# Production break caught: previous-row preservation runs after incoming source
+# validation and must not merge the synthetic fixture identity into production.
+def test_candidate_rejects_test_source_preserved_into_production_output(
+    tmp_path: Path,
+) -> None:
+    fixture = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="fixture-before-production",
+        coverage=FAST_TEST_COVERAGE,
+    )
+    promote_snapshot(fixture, tmp_path, coverage=FAST_TEST_COVERAGE)
+    pointer = tmp_path / "current.json"
+    pointer_before = pointer.read_bytes()
+
+    with pytest.raises(SnapshotQualityError, match="production source set"):
+        build_reviewed_population_candidate(
+            previous=verify_snapshot(tmp_path),
+            output_root=tmp_path,
+            snapshot_id="production-preserving-fixture",
+            include_reviewed_sen=True,
+        )
+
+    assert not (tmp_path / ".production-preserving-fixture.candidate").exists()
+    assert not (tmp_path / "production-preserving-fixture").exists()
+    assert pointer.read_bytes() == pointer_before
+
+
+# Production break caught: an attacker who can rewrite public snapshot metadata
+# and re-sign the transaction can alter the reviewed population after digest review.
+def test_final_approval_replays_population_and_reconciliation_before_pointer_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    candidate = build_candidate_snapshot(
+        records=records,
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="school-count-replay-attacks",
+        coverage=FAST_TEST_COVERAGE,
+        source_provenance=bound,
+        school_count_reconciliation=reconciliation,
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
+    )
+    reviewed_digest = packet["reviewDigest"]
+    assert isinstance(reviewed_digest, str)
+    manifest_path = candidate.candidate_path / "manifest.json"
+    original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    pointer = tmp_path / "current.json"
+    original_pointer = pointer.read_bytes() if pointer.exists() else None
+    tampered = copy.deepcopy(original_manifest)
+    neis_source = next(
+        entry for entry in tampered["sources"] if entry["source"] == "NEIS"
+    )
+    neis_source["sourceCategoryCounts"]["초등학교"] = 609
+    sync_module._write_json(manifest_path, tampered)
+    resign_candidate(candidate, tmp_path)
+    signed_transaction = sync_module._load_build_transaction(
+        tmp_path,
+        candidate.snapshot_id,
+    )
+    sync_module._transaction_attests_manifest(signed_transaction, tampered)
+
+    with pytest.raises(SnapshotQualityError, match="schema"):
+        sync_module._validate_unapproved_manifest_schema(tampered)
+    assert (pointer.read_bytes() if pointer.exists() else None) == original_pointer
+
+
+    sync_module._write_json(manifest_path, original_manifest)
+    resign_candidate(candidate, tmp_path)
+
+    institution_path = candidate.candidate_path / "institutions.jsonl"
+    original_institution_bytes = institution_path.read_bytes()
+    persisted = [
+        json.loads(line)
+        for line in institution_path.read_text(encoding="utf-8").splitlines()
+    ]
+    elementary = next(
+        row
+        for row in persisted
+        if row["source"] == "NEIS"
+        and row["institutionType"] == "ELEMENTARY_SCHOOL"
+    )
+    elementary["institutionType"] = "MIDDLE_SCHOOL"
+    changed_institutions = [
+        Institution.model_validate_json(json.dumps(row, ensure_ascii=False))
+        for row in persisted
+    ]
+    changed_bytes = sync_module._jsonl_bytes(changed_institutions)
+    institution_path.write_bytes(changed_bytes)
+    sites = [
+        InstitutionSite.model_validate_json(line)
+        for line in (candidate.candidate_path / "sites.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    sites_by_parent: dict[str, list[InstitutionSite]] = {
+        institution.institution_id: [] for institution in changed_institutions
+    }
+    for site in sites:
+        sites_by_parent[site.institution_id].append(site)
+    tampered_manifest = copy.deepcopy(original_manifest)
+    tampered_manifest["institutionsSha256"] = hashlib.sha256(changed_bytes).hexdigest()
+    tampered_manifest["countsByType"]["ELEMENTARY_SCHOOL"] -= 1
+    tampered_manifest["countsByType"]["MIDDLE_SCHOOL"] += 1
+    neis_entry = next(
+        entry for entry in tampered_manifest["sources"] if entry["source"] == "NEIS"
+    )
+    neis_rows = [
+        row for row in changed_institutions if row.source == "NEIS"
+    ]
+    neis_entry["sourceNormalizedSha256"] = (
+        sync_module._normalized_persisted_source_sha256(
+            neis_rows,
+            sites_by_parent,
+            before_enrichment=True,
+        )
+    )
+    neis_entry["normalizedSha256"] = sync_module._normalized_persisted_source_sha256(
+        neis_rows,
+        sites_by_parent,
+    )
+    sync_module._write_json(manifest_path, tampered_manifest)
+    resign_candidate(candidate, tmp_path)
+
+    with pytest.raises(SnapshotQualityError, match="population|reconciliation"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=FAST_TEST_COVERAGE,
+        )
+    assert (pointer.read_bytes() if pointer.exists() else None) == original_pointer
+
+    institution_path.write_bytes(original_institution_bytes)
+    sync_module._write_json(manifest_path, original_manifest)
+    resign_candidate(candidate, tmp_path)
+    real_replace = os.replace
+    pointer_failure_pending = True
+
+    def fail_pointer_once(source: str | Path, destination: str | Path) -> None:
+        nonlocal pointer_failure_pending
+        if Path(destination).name == "current.json" and pointer_failure_pending:
+            pointer_failure_pending = False
+            raise OSError("simulated pointer failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_pointer_once)
+    with pytest.raises(OSError, match="simulated pointer failure"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=reviewed_digest,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=FAST_TEST_COVERAGE,
+        )
+    assert not pointer.exists()
+
+    replayed_digest = sync_module.approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=reviewed_digest,
+        reviewer_role="data-steward",
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
+    )
+    idempotent_digest = sync_module.approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=reviewed_digest,
+        reviewer_role="data-steward",
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
+    )
+    assert replayed_digest == idempotent_digest == reviewed_digest
+
+
+# Production break caught: removing the complete reviewed SEN source, updating all
+# public hashes, and re-attesting the transaction can otherwise preserve the old
+# pointer relationship while publishing a two-source production snapshot.
+def test_re_attested_source_removal_is_rejected_without_pointer_change(
+    tmp_path: Path,
+) -> None:
+    baseline = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="complete-source-baseline",
+        include_reviewed_sen=True,
+    )
+    promote_snapshot(baseline, tmp_path, coverage=FAST_TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_reviewed_population_candidate(
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="source-removal-candidate",
+        include_reviewed_sen=True,
+    )
+    remove_candidate_source(
+        candidate,
+        tmp_path,
+        source="SEN_REVIEWED_CSV",
+    )
+
+    with pytest.raises(SnapshotQualityError, match="production source set"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=FAST_TEST_COVERAGE,
+        )
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+    assert verify_snapshot(tmp_path).manifest.snapshot_id == baseline.snapshot_id
+
+
+# Production break caught: persisted verification trusting a valid data-steward
+# manifest after one complete production source and its records are removed.
+def test_snapshot_verification_rejects_missing_production_source(
+    tmp_path: Path,
+) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="verify-complete-source-set",
+        include_reviewed_sen=True,
+    )
+    promote_snapshot(candidate, tmp_path, coverage=FAST_TEST_COVERAGE)
+    remove_snapshot_source(
+        tmp_path / candidate.snapshot_id,
+        source="SEN_REVIEWED_CSV",
+    )
+
+    with pytest.raises(SnapshotIntegrityError, match="production source set"):
+        verify_snapshot(tmp_path)
+
+
+# Production break caught: the narrow test-fixture identity exception must not
+# disable replay of the source hashes that authenticate its persisted records.
+@pytest.mark.parametrize("operation", ["review", "approve"])
+def test_test_fixture_source_hash_tampering_fails_before_pointer_mutation(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    baseline = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id=f"fixture-hash-baseline-{operation}",
+        coverage=FAST_TEST_COVERAGE,
+    )
+    promote_snapshot(baseline, tmp_path, coverage=FAST_TEST_COVERAGE)
+    pointer = tmp_path / "current.json"
+    original_pointer = pointer.read_bytes()
+    candidate = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id=f"fixture-hash-candidate-{operation}",
+        coverage=FAST_TEST_COVERAGE,
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    fixture_source = next(
+        entry for entry in manifest["sources"] if entry["source"] == "TEST_NEIS"
+    )
+    fixture_source["sourceNormalizedSha256"] = "f" * 64
+    sync_module._write_json(manifest_path, manifest)
+    resign_candidate(candidate, tmp_path)
+
+    forged_packet = dict(packet)
+    forged_packet["candidateManifestSha256"] = hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    forged_packet["sourceProvenanceSha256"] = (
+        sync_module._manifest_section_sha256(manifest["sources"])
+    )
+    forged_packet.pop("reviewDigest")
+    forged_review_digest = sync_module._manifest_section_sha256(forged_packet)
+
+    with pytest.raises(SnapshotQualityError, match="source provenance"):
+        if operation == "review":
+            sync_module.build_candidate_review_packet(
+                snapshot_id=candidate.snapshot_id,
+                snapshot_root=tmp_path,
+                coverage=FAST_TEST_COVERAGE,
+            )
+        else:
+            sync_module.approve_candidate_snapshot(
+                snapshot_id=candidate.snapshot_id,
+                review_digest=forged_review_digest,
+                reviewer_role="TEST_FIXTURE_REVIEWER",
+                snapshot_root=tmp_path,
+                coverage=FAST_TEST_COVERAGE,
+            )
+    assert pointer.read_bytes() == original_pointer
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("각종학교(고)", "각종학교(고) "),
+        ("NEIS,고등학교,319", "NEIS,고등학교,320"),
+        ("NONSELECTABLE", "SUPPLEMENTARY"),
+        ("MISC_SCHOOL,BENCHMARK,MISC_SCHOOL", "HIGH_SCHOOL,BENCHMARK,MISC_SCHOOL"),
+        ("KINDERGARTEN,BENCHMARK,KINDERGARTEN", "KINDERGARTEN,BENCHMARK,MISC_SCHOOL"),
+        ("kindergarten_timing=20261", "kindergarten_timing=20262"),
+        ("kindergarten_source_as_of=2026-04-01", "kindergarten_source_as_of=2026-04-02"),
+        (
+            "benchmark_raw_sha256=6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70",
+            "benchmark_raw_sha256=" + "0" * 64,
+        ),
+        (
+            "unclassified_policy_sha256=2a9222d34083261c42ba51fd4430dd6b84b2210908a13e377a64cc69298c51a1",
+            "unclassified_policy_sha256=" + "0" * 64,
+        ),
+        (
+            "NEIS,각종학교(고),13,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL\nNEIS,각종학교(중),7,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL",
+            "NEIS,각종학교(중),7,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL\nNEIS,각종학교(고),13,MISC_SCHOOL,BENCHMARK,MISC_SCHOOL",
+        ),
+        (
+            "NEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL\n",
+            "NEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL\nNEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL\n",
+        ),
+        ("# reviewer_role=data-steward", "# reviewer_role=data-steward\n# unreviewed=1"),
+        (
+            "source,source_category,observed_count,normalized_type,reconciliation_role,benchmark_type",
+            "source,source_category,observed_count,normalized_type,reconciliation_role,benchmark_type,extra",
+        ),
+    ],
+)
+def test_school_count_population_profile_rejects_resource_trust_boundary_mutations(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    path = tmp_path / "profile.csv"
+    content = (SOURCE_RESOURCES / "school-count-population-profile.csv").read_text(
+        encoding="utf-8"
+    )
+    path.write_text(content.replace(old, new, 1), encoding="utf-8")
+
+    with pytest.raises(SourceDataError):
+        load_school_count_population_profile(
+            path,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
+def test_school_count_population_profile_rejects_malformed_utf8_resource(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "profile.csv"
+    path.write_bytes(b"# normalized_sha256=" + b"0" * 64 + b"\n\xff")
+
+    with pytest.raises(SourceDataError):
+        load_school_count_population_profile(
+            path,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
+def test_school_count_population_profile_rejects_crlf_normalized_resource(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "profile.csv"
+    content = (
+        SOURCE_RESOURCES / "school-count-population-profile.csv"
+    ).read_bytes()
+    path.write_bytes(content.replace(b"\n", b"\r\n"))
+
+    with pytest.raises(SourceDataError, match="LF|SHA-256"):
+        load_school_count_population_profile(
+            path,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
+def test_school_count_population_profile_rejects_symlinked_resource(
+    tmp_path: Path,
+) -> None:
+    link = tmp_path / "profile-link.csv"
+    link.symlink_to(SOURCE_RESOURCES / "school-count-population-profile.csv")
+
+    with pytest.raises(SourceDataError, match="symlink|regular"):
+        load_school_count_population_profile(
+            link,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
+def test_school_count_population_profile_rejects_oversized_resource_before_decode(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "profile.csv"
+    path.write_bytes(b"x" * 16_385)
+
+    with pytest.raises(SourceDataError, match="size limit"):
+        load_school_count_population_profile(
+            path,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
+
+
+def test_school_count_population_profile_rejects_subclass_spoofs_and_contract_drift() -> None:
+    profile = load_school_count_population_profile(
+        SOURCE_RESOURCES / "school-count-population-profile.csv",
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    class SpoofedString(str):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            return False
+
+    class SpoofedTuple(tuple):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+    with pytest.raises(ValueError):
+        SchoolPopulationRow(
+            source=SpoofedString("NEIS"),
+            source_category="고등학교",
+            observed_count=319,
+            normalized_type="HIGH_SCHOOL",
+            reconciliation_role="BENCHMARK",
+            benchmark_type="HIGH_SCHOOL",
+        )
+    with pytest.raises(ValueError):
+        SchoolCountPopulationProfile(
+            sha256=SpoofedString(PINNED_POPULATION_PROFILE_SHA256),
+            status=profile.status,
+            reviewed_as_of=profile.reviewed_as_of,
+            reviewer_role=profile.reviewer_role,
+            neis_region_code=profile.neis_region_code,
+            neis_fetched_row_count=profile.neis_fetched_row_count,
+            neis_normalized_row_count=profile.neis_normalized_row_count,
+            kindergarten_timing=profile.kindergarten_timing,
+            kindergarten_source_as_of=profile.kindergarten_source_as_of,
+            kindergarten_fetched_row_count=profile.kindergarten_fetched_row_count,
+            benchmark_source_url=profile.benchmark_source_url,
+            benchmark_source_as_of=profile.benchmark_source_as_of,
+            benchmark_raw_sha256=profile.benchmark_raw_sha256,
+            unclassified_policy_sha256=profile.unclassified_policy_sha256,
+            approved_variances=SpoofedTuple(profile.approved_variances),
+            rows=profile.rows,
+        )
+    with pytest.raises(ValueError):
+        SchoolCountPopulationProfile(
+            sha256=profile.sha256,
+            status="APPROVED",
+            reviewed_as_of=profile.reviewed_as_of,
+            reviewer_role=profile.reviewer_role,
+            neis_region_code=profile.neis_region_code,
+            neis_fetched_row_count=profile.neis_fetched_row_count,
+            neis_normalized_row_count=profile.neis_normalized_row_count,
+            kindergarten_timing=profile.kindergarten_timing,
+            kindergarten_source_as_of=profile.kindergarten_source_as_of,
+            kindergarten_fetched_row_count=profile.kindergarten_fetched_row_count,
+            benchmark_source_url=profile.benchmark_source_url,
+            benchmark_source_as_of=profile.benchmark_source_as_of,
+            benchmark_raw_sha256=profile.benchmark_raw_sha256,
+            unclassified_policy_sha256=profile.unclassified_policy_sha256,
+            approved_variances=profile.approved_variances,
+            rows=profile.rows,
+        )
 
 
 def load_json(name: str) -> dict[str, object]:
@@ -95,7 +819,10 @@ def assert_secret_absent_from_app_traceback(
     current = traceback_value
     while current is not None:
         frame = current.tb_frame
-        if "/apps/travel-map/app/" in frame.f_code.co_filename:
+        if (
+            "apps/travel-map/app/" in frame.f_code.co_filename
+            or "apps/travel-map/scripts/" in frame.f_code.co_filename
+        ):
             assert not _contains_secret(frame.f_locals, secret)
         current = current.tb_next
 
@@ -175,17 +902,13 @@ def test_source_ids_are_namespaced_and_private_schools_are_kept() -> None:
 @pytest.mark.parametrize(
     ("source_type", "expected_type"),
     [
-        ("\uc678\uad6d\uc778\ud559\uad50", "FOREIGN_SCHOOL"),
-        ("\ubc29\uc1a1\ud1b5\uc2e0\uc911\ud559\uad50", "BROADCAST_SCHOOL"),
-        ("\ubc29\uc1a1\ud1b5\uc2e0\uace0\ub4f1\ud559\uad50", "BROADCAST_SCHOOL"),
+        ("\uc678\uad6d\uc778\ud559\uad50", "MISC_SCHOOL"),
+        ("\ubc29\uc1a1\ud1b5\uc2e0\uc911\ud559\uad50", "MIDDLE_SCHOOL"),
+        ("\ubc29\uc1a1\ud1b5\uc2e0\uace0\ub4f1\ud559\uad50", "HIGH_SCHOOL"),
         ("\uac01\uc885\ud559\uad50(\ucd08)", "MISC_SCHOOL"),
         ("\uac01\uc885\ud559\uad50(\uc911)", "MISC_SCHOOL"),
         ("\uac01\uc885\ud559\uad50(\uace0)", "MISC_SCHOOL"),
         ("\uace0\ub4f1\uae30\uc220\ud559\uad50", "MISC_SCHOOL"),
-        ("\ud3c9\uc0dd\ud559\uad50(\ucd08)-3\ub1446\ud559\uae30", "LIFELONG_EDUCATION_FACILITY"),
-        ("\ud3c9\uc0dd\ud559\uad50(\uc911)-2\ub1446\ud559\uae30", "LIFELONG_EDUCATION_FACILITY"),
-        ("\ud3c9\uc0dd\ud559\uad50(\uace0)-2\ub1446\ud559\uae30", "LIFELONG_EDUCATION_FACILITY"),
-        ("\ud3c9\uc0dd\ud559\uad50(\uace0)-3\ub1446\ud559\uae30", "LIFELONG_EDUCATION_FACILITY"),
     ],
 )
 def test_neis_maps_every_verified_selectable_school_type(
@@ -197,35 +920,6 @@ def test_neis_maps_every_verified_selectable_school_type(
     assert parse_neis_rows(payload)[0].institution_type == expected_type
 
 
-@pytest.mark.parametrize(
-    ("school_name", "source_type", "expected_type"),
-    [
-        ("꿈타래학교", "각종학교(고)", "ALTERNATIVE_EDUCATION_CENTER"),
-        ("여명학교(중)", "각종학교(중)", "MISC_SCHOOL_PROGRAM"),
-        ("지구촌학교 중학교", "각종학교(중)", "MISC_SCHOOL_PROGRAM"),
-        ("지구촌학교 고등학교", "각종학교(고)", "MISC_SCHOOL_PROGRAM"),
-    ],
-)
-def test_neis_preserves_noncounted_misc_programs_as_selectable_types(
-    school_name: str,
-    source_type: str,
-    expected_type: str,
-) -> None:
-    payload = neis_payload(source_type=source_type)
-    row = payload["schoolInfo"][1]["row"][0]  # type: ignore[index]
-    row["SCHUL_NM"] = school_name
-
-    assert parse_neis_rows(payload)[0].institution_type == expected_type
-
-
-def test_neis_does_not_reclassify_other_misc_schools_by_level() -> None:
-    payload = neis_payload(source_type="각종학교(중)")
-    row = payload["schoolInfo"][1]["row"][0]  # type: ignore[index]
-    row["SCHUL_NM"] = "국립국악중학교"
-
-    assert parse_neis_rows(payload)[0].institution_type == "MISC_SCHOOL"
-
-
 # Production break caught: publishing a training facility as a route-selectable school.
 def test_neis_explicitly_excludes_nonselectable_joint_training_center() -> None:
     payload = neis_payload(source_type="\uacf5\ub3d9\uc2e4\uc2b5\uc18c")
@@ -233,32 +927,394 @@ def test_neis_explicitly_excludes_nonselectable_joint_training_center() -> None:
     assert parse_neis_rows(payload) == ()
 
 
-# Production break caught: a special-school campus annotation appears before the
-# canonical Seoul address, so positional token parsing returned "서울특별시" as a
-# district and blocked the entire live candidate.
-def test_neis_extracts_district_from_annotated_multicampus_address() -> None:
-    payload = neis_payload(source_type="특수학교")
-    row = payload["schoolInfo"][1]["row"][0]  # type: ignore[index]
-    row["ORG_RDNMA"] = (
-        "(본교) 서울특별시 도봉구 평화로15번길 9-26, "
-        "(초등) 도봉산길 27"
+def test_load_neis_unclassified_policy_accepts_exact_reviewed_resource() -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
     )
 
-    assert parse_neis_rows(payload)[0].district == "도봉구"
+    assert policy.counts == (
+        ("평생학교(고)-2년6학기", 7),
+        ("평생학교(고)-3년6학기", 4),
+        ("평생학교(중)-2년6학기", 5),
+        ("평생학교(초)-3년6학기", 2),
+    )
+    assert policy.sha256 == (
+        "2a9222d34083261c42ba51fd4430dd6b84b2210908a13e377a64cc69298c51a1"
+    )
+    assert policy.sha256 == PINNED_POLICY_SHA256
+    assert policy.reviewed_as_of == "2026-08-13"
+    assert policy.reviewer_role == "data-steward"
 
 
-# Production break caught: assigning every parsed NEIS row the newest page vintage
-# instead of the record's own raw LOAD_DTM value.
-def test_neis_parse_preserves_mixed_raw_load_dates_within_one_page() -> None:
+@pytest.mark.parametrize(
+    ("counts", "sha256"),
+    [
+        (
+            (("unreviewed-kind", 18),),
+            PINNED_POLICY_SHA256,
+        ),
+        (
+            (
+                ("평생학교(고)-2년6학기", 8),
+                ("평생학교(고)-3년6학기", 4),
+                ("평생학교(중)-2년6학기", 5),
+                ("평생학교(초)-3년6학기", 1),
+            ),
+            PINNED_POLICY_SHA256,
+        ),
+        (
+            (
+                ("평생학교(고)-2년6학기", 7),
+                ("평생학교(고)-3년6학기", 4),
+                ("평생학교(중)-2년6학기", 5),
+                ("평생학교(초)-3년6학기", 2),
+            ),
+            "0" * 64,
+        ),
+    ],
+)
+def test_neis_unclassified_policy_rejects_caller_supplied_contract_drift(
+    counts: tuple[tuple[str, int], ...],
+    sha256: str,
+) -> None:
+    with pytest.raises(SourceDataError, match="reviewed"):
+        NeisUnclassifiedPolicy(
+            counts=counts,
+            sha256=sha256,
+            reviewed_as_of="2026-08-13",
+            reviewer_role="data-steward",
+        )
+
+
+def test_neis_unclassified_policy_rejects_tuple_subclass_whitelist_spoof() -> None:
+    class SpoofedReviewedPair(tuple):
+        def __eq__(self, other: object) -> bool:
+            return type(other) is tuple and len(other) == 2
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter(("unreviewed-kind", 18))
+
+    counts = (
+        SpoofedReviewedPair(("unreviewed-kind", 18)),
+        ("평생학교(고)-3년6학기", 4),
+        ("평생학교(중)-2년6학기", 5),
+        ("평생학교(초)-3년6학기", 2),
+    )
+
+    with pytest.raises(SourceDataError, match="reviewed"):
+        NeisUnclassifiedPolicy(
+            counts=counts,
+            sha256=PINNED_POLICY_SHA256,
+            reviewed_as_of="2026-08-13",
+            reviewer_role="data-steward",
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["sha256", "reviewed_as_of", "reviewer_role"],
+)
+def test_neis_unclassified_policy_rejects_spoofed_string_metadata(
+    field: str,
+) -> None:
+    class SpoofedReviewedString(str):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            return False
+
+    values = {
+        "sha256": PINNED_POLICY_SHA256,
+        "reviewed_as_of": "2026-08-13",
+        "reviewer_role": "data-steward",
+    }
+    values[field] = SpoofedReviewedString("unreviewed")
+
+    with pytest.raises(SourceDataError, match="reviewed"):
+        NeisUnclassifiedPolicy(
+            counts=REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts,
+            sha256=values["sha256"],
+            reviewed_as_of=values["reviewed_as_of"],
+            reviewer_role=values["reviewer_role"],
+        )
+
+
+def test_neis_unclassified_policy_rejects_oversized_file_before_content_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "oversized-policy.csv"
+    path.write_bytes(b"x" * (16 * 1024 + 1))
+
+    def unexpected_content_open(*args: object, **kwargs: object) -> object:
+        raise AssertionError("oversized policy content was opened")
+
+    monkeypatch.setattr(Path, "open", unexpected_content_open)
+
+    with pytest.raises(SourceDataError, match="size limit"):
+        load_neis_unclassified_policy(path)
+
+
+def test_neis_unclassified_policy_uses_no_follow_descriptor_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    actual_open = os.open
+    calls: list[int] = []
+
+    def recording_open(path: object, flags: int, *args: object) -> int:
+        calls.append(flags)
+        return actual_open(path, flags, *args)
+
+    monkeypatch.setattr(neis_classification_module.os, "open", recording_open)
+
+    load_neis_unclassified_policy(resource)
+
+    assert calls
+    assert all(flags & os.O_NOFOLLOW for flags in calls)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("schemaVersion=1", "schemaVersion=2"),
+        (
+            "school_kind,expected_count,reason_code",
+            "school_kind,expected_count,reason_code,extra_column",
+        ),
+        (
+            "평생학교(고)-3년6학기,4,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(고)-2년6학기,7,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        (
+            "평생학교(중)-2년6학기,5,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(초)-3년6학기,2,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        (
+            "평생학교(고)-2년6학기,7,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(고)-2년6학기,True,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        ("OFFICIAL_CLASSIFICATION_PENDING", "DIFFERENT_REASON"),
+    ],
+)
+def test_neis_unclassified_policy_rejects_tampered_reviewed_resource(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    source = SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    path = tmp_path / "policy.csv"
+    body = source.read_text(encoding="utf-8").replace(old, new, 1)
+    path.write_text(body, encoding="utf-8")
+
+    with pytest.raises(SourceDataError, match="reviewed|SHA-256|policy"):
+        load_neis_unclassified_policy(path)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "school_kind,expected_count,reason_code",
+            "school_kind,expected_count,reason_code,extra_column",
+        ),
+        (
+            "school_kind,expected_count,reason_code",
+            "school_kind,expected_count",
+        ),
+        (
+            "평생학교(고)-3년6학기,4,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(고)-2년6학기,4,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        (
+            (
+                "평생학교(고)-2년6학기,7,OFFICIAL_CLASSIFICATION_PENDING\n"
+                "평생학교(고)-3년6학기,4,OFFICIAL_CLASSIFICATION_PENDING"
+            ),
+            (
+                "평생학교(고)-3년6학기,4,OFFICIAL_CLASSIFICATION_PENDING\n"
+                "평생학교(고)-2년6학기,7,OFFICIAL_CLASSIFICATION_PENDING"
+            ),
+        ),
+        (
+            "평생학교(초)-3년6학기,2,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(초)-3년6학기,0,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        (
+            "평생학교(초)-3년6학기,2,OFFICIAL_CLASSIFICATION_PENDING",
+            "평생학교(초)-3년6학기,True,OFFICIAL_CLASSIFICATION_PENDING",
+        ),
+        ("OFFICIAL_CLASSIFICATION_PENDING", "DIFFERENT_REASON"),
+    ],
+)
+def test_neis_unclassified_policy_rejects_malformed_rehashed_resource(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    old: str,
+    new: str,
+) -> None:
+    path = tmp_path / "policy.csv"
+    body = (SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv").read_text(
+        encoding="utf-8"
+    ).replace(old, new, 1)
+    path.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(
+        neis_classification_module,
+        "PINNED_POLICY_SHA256",
+        hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    )
+
+    with pytest.raises(SourceDataError, match="columns|labels|counts|rows"):
+        load_neis_unclassified_policy(path)
+
+
+def test_neis_unclassified_policy_rejects_symlinked_resource(tmp_path: Path) -> None:
+    link = tmp_path / "policy-link.csv"
+    link.symlink_to(SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv")
+
+    with pytest.raises(SourceDataError, match="symlink|regular"):
+        load_neis_unclassified_policy(link)
+
+
+def test_neis_quarantines_only_the_exact_reviewed_lifelong_school_labels() -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+    payload = neis_payload_rows(
+        *(label for label, count in policy.counts for _ in range(count))
+    )
+
+    records = parse_neis_rows(payload, unclassified_policy=policy)
+
+    assert Counter(row.institution_type for row in records) == {
+        "UNCLASSIFIED_SCHOOL": 18
+    }
+    assert {row.source_kind_label for row in records} == policy.labels
+    assert validate_unclassified_school_counts(records, policy) == dict(policy.counts)
+
+
+@pytest.mark.asyncio
+async def test_neis_binds_quarantine_histogram_and_policy_hash_to_provenance() -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+    payload = neis_payload_rows(
+        *(label for label, count in policy.counts for _ in range(count))
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await NeisSource(
+            api_key="test-key",
+            client=client,
+            unclassified_policy=policy,
+        ).fetch()
+
+    assert result.provenance.unclassified_school_kind_counts == policy.counts
+    assert result.provenance.unclassified_school_policy_sha256 == policy.sha256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_types",
+    [
+        ("평생학교(초)-3년6학기",) * 3
+        + ("평생학교(중)-2년6학기",) * 5
+        + ("평생학교(고)-2년6학기",) * 7
+        + ("평생학교(고)-3년6학기",) * 4,
+        ("평생학교(초)-3년6학기",) * 2
+        + ("평생학교(중)-2년6학기",) * 5
+        + ("평생학교(고)-2년6학기",) * 8
+        + ("평생학교(고)-3년6학기",) * 4,
+    ],
+)
+async def test_neis_rejects_quarantine_count_drift(
+    source_types: tuple[str, ...],
+) -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+    payload = neis_payload_rows(*source_types)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SourceDataError, match="counts"):
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=policy,
+                page_size=len(source_types),
+            ).fetch()
+
+
+@pytest.mark.asyncio
+async def test_neis_rejects_school_kind_whitespace_before_candidate_or_pointer_mutation(
+    tmp_path: Path,
+) -> None:
+    source_types = list(reviewed_neis_source_types())
+    source_types.insert(0, "고등학교 ")
+    payload = neis_payload_rows(*source_types)
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_root.mkdir()
+    pointer = snapshot_root / "current.json"
+    original_pointer = b'{"snapshotId":"approved-before-fetch"}\n'
+    pointer.write_bytes(original_pointer)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(SourceDataError, match="school kind|unsupported"):
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
+
+    assert not (snapshot_root / ".whitespace.candidate").exists()
+    assert pointer.read_bytes() == original_pointer
+
+
+def test_neis_rejects_non_nfc_school_kind_before_histogram_collection() -> None:
+    with pytest.raises(SourceDataError, match="exact string"):
+        neis_module._required_school_kind_label(
+            {"SCHUL_KND_SC_NM": unicodedata.normalize("NFD", "고등학교")}
+        )
+
+
+def test_neis_rejects_unknown_lifelong_school_label_before_candidate_creation() -> None:
+    policy = load_neis_unclassified_policy(
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+    payload = neis_payload_rows("평생학교(고)-4년8학기")
+
+    with pytest.raises(SourceDataError, match="unsupported"):
+        parse_neis_rows(payload, unclassified_policy=policy)
+
+
+def test_neis_policy_label_is_rejected_without_a_supplied_policy() -> None:
+    payload = neis_payload_rows("평생학교(초)-3년6학기")
+
+    with pytest.raises(SourceDataError, match="unsupported"):
+        parse_neis_rows(payload)
+
+
+# Production break caught: collapsing two raw vintages on one API page to one date.
+def test_neis_preserves_mixed_load_dates_within_one_page() -> None:
     payload = load_json("neis-school-info.json")
     rows = payload["schoolInfo"][1]["row"]  # type: ignore[index]
-    rows[0]["LOAD_DTM"] = "20260809"
-    rows[1]["LOAD_DTM"] = "20260810"
+    rows[0]["LOAD_DTM"] = "20260423"
+    rows[1]["LOAD_DTM"] = "20260607"
 
-    assert {record.source_as_of for record in parse_neis_rows(payload)} == {
-        "2026-08-09",
-        "2026-08-10",
-    }
+    assert [row.source_as_of for row in parse_neis_rows(payload)] == [
+        "2026-04-23",
+        "2026-06-07",
+    ]
 
 
 # Production break caught: treating a filtered-out row as if its vintage cannot
@@ -430,9 +1486,6 @@ def test_reviewed_sen_resource_matches_official_organization_totals() -> None:
     assert len(result.records) == 41
     assert result.provenance.row_count == 41
     assert result.provenance.fetched_row_count == 42
-    assert result.provenance.source_observation_date_counts == (
-        ("2026-08-10", 42),
-    )
     assert all(record.foundation_type == "PUBLIC" for record in result.records)
     assert all(record.source_region_code == "SEOUL" for record in result.records)
     assert all(not hasattr(record, "telephone") for record in result.records)
@@ -497,29 +1550,14 @@ def test_sen_multisite_parser_rejects_duplicate_or_second_default(
 def test_unresolved_sen_main_and_branch_are_both_persisted_for_review(
     tmp_path: Path,
 ) -> None:
-    result = SenCsvSource(
-        SOURCE_RESOURCES / "sen-institutions.csv",
-        expected_type_counts={
-            "HEADQUARTERS": 1,
-            "DISTRICT_OFFICE": 11,
-            "DIRECT_AGENCY": 8,
-            "LIFELONG_LEARNING_CENTER": 4,
-            "LIBRARY": 17,
-        },
-    ).load()
-
-    candidate = build_candidate_snapshot(
-        records=result.records,
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="unresolved-sen-multisite",
         coverage=TEST_COVERAGE,
-        source_provenance={result.provenance.source: result.provenance},
     )
 
-    assert candidate.issues == (
-        "coordinate validation success rate is below 98 percent",
-    )
+    assert candidate.issues == ()
     institutions = [
         json.loads(line)
         for line in (candidate.candidate_path / "institutions.jsonl")
@@ -582,11 +1620,21 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
         )
         for record in sen_result.records
     )
-    neis_records = tuple(
-        source_record(institution_id=f"neis:B10:7011{index:03d}")
-        for index in range(9)
+    profile, benchmark, population_records, population_provenance = (
+        reviewed_population_fixture()
     )
-    records = geocoded_sen + neis_records
+    bound_population = sync_module.bind_school_count_population_profile(
+        population_provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        population_records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound_population,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    records = geocoded_sen + population_records
     geocoded_count = sum(
         record.coordinate_quality == "GEOCODED"
         for record in records
@@ -614,34 +1662,22 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
             "GEOCODED",
         ),
     )
-    neis_provenance = source_provenance_for(neis_records)["NEIS"]
     candidate = build_candidate_snapshot(
         records=records,
         previous=None,
         output_root=tmp_path,
         snapshot_id="reviewed-sen-multisite",
-        coverage=TEST_COVERAGE,
+        coverage=FAST_TEST_COVERAGE,
         source_provenance={
+            **bound_population,
             sen_result.provenance.source: sen_result.provenance,
-            neis_provenance.source: neis_provenance,
         },
+        school_count_reconciliation=reconciliation,
         enrichment_provenance=(kakao,),
     )
 
     assert candidate.issues == ()
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-    district_counts = cast(dict[str, int], packet["districtCounts"])
-    assert len(district_counts) == 25
-    assert "가평군" not in district_counts
-    assert "가평군" not in json.dumps(packet, ensure_ascii=False, sort_keys=True)
-    assert "sen:agency-student" in packet["quarantinedInstitutionIds"]
-    assert "sen:agency-student:main" in packet["quarantinedSiteIds"]
-    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
-    verified = verify_snapshot(tmp_path)
+    promote_snapshot(candidate, tmp_path, coverage=FAST_TEST_COVERAGE)
     store = InstitutionStore.load(tmp_path)
 
     matches = store.search("강서도서관")
@@ -651,74 +1687,54 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
     }
     assert sum(item.site_name == "본관" for item in matches) == 1
     assert store.require_site("sen:gangseo-library:gayang").site_name == "가양관"
-    student = next(
-        institution
-        for institution in verified.institutions
-        if institution.institution_id == "sen:agency-student"
-    )
-    student_site = next(
-        site
-        for site in verified.sites
-        if site.site_id == "sen:agency-student:main"
-    )
-    assert student.status is InstitutionStatus.REVIEW_REQUIRED
-    assert student_site.status is InstitutionStatus.REVIEW_REQUIRED
-    assert store.search("학생교육원") == ()
-    with pytest.raises(LookupError, match="unknown or inactive"):
-        store.require_site(student_site.site_id)
 
 
 def test_reviewed_sen_provenance_is_accepted_by_candidate_builder(
     tmp_path: Path,
 ) -> None:
-    result = SenCsvSource(
-        SOURCE_RESOURCES / "sen-institutions.csv",
-        expected_type_counts={
-            "HEADQUARTERS": 1,
-            "DISTRICT_OFFICE": 11,
-            "DIRECT_AGENCY": 8,
-            "LIFELONG_LEARNING_CENTER": 4,
-            "LIBRARY": 17,
-        },
-    ).load()
-
-    candidate = build_candidate_snapshot(
-        records=result.records,
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="sen-provenance-contract",
         coverage=TEST_COVERAGE,
-        source_provenance={result.provenance.source: result.provenance},
     )
 
-    assert candidate.issues == (
-        "coordinate validation success rate is below 98 percent",
-    )
+    assert candidate.issues == ()
 
 
 def test_reviewed_sen_provenance_rejects_valid_looking_wrong_raw_digest(
     tmp_path: Path,
 ) -> None:
-    result = SenCsvSource(
-        SOURCE_RESOURCES / "sen-institutions.csv",
-        expected_type_counts={
-            "HEADQUARTERS": 1,
-            "DISTRICT_OFFICE": 11,
-            "DIRECT_AGENCY": 8,
-            "LIFELONG_LEARNING_CENTER": 4,
-            "LIBRARY": 17,
-        },
-    ).load()
-    forged = replace(result.provenance, raw_sha256="f" * 64)
+    profile, benchmark, records, provenance = reviewed_production_fixture()
+    provenance["SEN_REVIEWED_CSV"] = replace(
+        provenance["SEN_REVIEWED_CSV"],
+        raw_sha256="f" * 64,
+    )
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        tuple(
+            record
+            for record in records
+            if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        ),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
 
     with pytest.raises(SnapshotQualityError, match="source provenance"):
         build_candidate_snapshot(
-            records=result.records,
+            records=records,
             previous=None,
             output_root=tmp_path,
             snapshot_id="sen-wrong-raw-digest",
             coverage=TEST_COVERAGE,
-            source_provenance={forged.source: forged},
+            source_provenance=bound,
+            school_count_reconciliation=reconciliation,
         )
 
 
@@ -727,7 +1743,7 @@ def test_reviewed_school_count_resource_is_official_and_pinned() -> None:
         SOURCE_RESOURCES / "sen-annual-school-counts.csv"
     )
     assert benchmark.counts == {
-        "KINDERGARTEN": 706,
+        "KINDERGARTEN": 724,
         "ELEMENTARY_SCHOOL": 609,
         "MIDDLE_SCHOOL": 390,
         "HIGH_SCHOOL": 319,
@@ -735,17 +1751,11 @@ def test_reviewed_school_count_resource_is_official_and_pinned() -> None:
         "MISC_SCHOOL": 18,
     }
     assert benchmark.category_evidence["KINDERGARTEN"].source_as_of == (
-        "2026-04-01"
+        "2026-03-10"
     )
     assert (
         benchmark.category_evidence["KINDERGARTEN"].status
-        == "OFFICIAL_DISCLOSURE_2026_04"
-    )
-    assert benchmark.category_evidence["KINDERGARTEN"].source_url == (
-        "https://e-childschoolinfo.moe.go.kr/?mi=2782"
-    )
-    assert benchmark.category_evidence["KINDERGARTEN"].source_sha256 == (
-        "a64b2af7fcbe91892b438b80cfbca16567cbfd898d3f23d26ad24d66cd9ec0bd"
+        == "PRELIMINARY_2026"
     )
     assert benchmark.category_evidence["ELEMENTARY_SCHOOL"].source_as_of == (
         "2026-03-10"
@@ -784,23 +1794,15 @@ def test_reviewed_school_count_resource_is_official_and_pinned() -> None:
 @pytest.mark.parametrize(
     ("old", "new"),
     [
-        ("KINDERGARTEN,706,", "KINDERGARTEN,707,"),
+        ("KINDERGARTEN,724,", "KINDERGARTEN,725,"),
         (
             "https://enews.sen.go.kr/uploads/img_smart//",
             "https://attacker.invalid/",
         ),
         ("PRELIMINARY_2026", "FINAL_2026"),
         (
-            "532225bc7f1d2dd63e976880e53a4217b548e83e7dbc278363808aba41132907",
+            "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332",
             "f" * 64,
-        ),
-        (
-            "kindergarten_disclosure_total=706",
-            "kindergarten_disclosure_total=707",
-        ),
-        (
-            "kindergarten_disclosure_district_count=25",
-            "kindergarten_disclosure_district_count=24",
         ),
     ],
 )
@@ -819,209 +1821,1167 @@ def test_reviewed_school_count_resource_rejects_mutation(
         load_reviewed_school_counts(tampered)
 
 
+# Production break caught: accepting arbitrary percentage-close populations
+# instead of the exact signed variances approved for the reviewed source mix.
+def test_population_reconciliation_uses_exact_reviewed_signed_variances() -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    provenance = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=provenance,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    assert reconciliation["categories"] == {
+        "ELEMENTARY_SCHOOL": {
+            "expectedCount": 609,
+            "actualCount": 610,
+            "deltaCount": 1,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "HIGH_SCHOOL": {
+            "expectedCount": 319,
+            "actualCount": 319,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+        "KINDERGARTEN": {
+            "expectedCount": 724,
+            "actualCount": 706,
+            "deltaCount": -18,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "MIDDLE_SCHOOL": {
+            "expectedCount": 390,
+            "actualCount": 390,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+        "MISC_SCHOOL": {
+            "expectedCount": 18,
+            "actualCount": 22,
+            "deltaCount": 4,
+            "status": "REVIEWED_VARIANCE",
+        },
+        "SPECIAL_SCHOOL": {
+            "expectedCount": 32,
+            "actualCount": 32,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        },
+    }
+    assert reconciliation["sources"]["NEIS"]["roleCounts"] == {
+        "BENCHMARK": 1_373,
+        "NONSELECTABLE": 1,
+        "QUARANTINED": 18,
+        "SUPPLEMENTARY": 23,
+    }
+    assert reconciliation["sources"]["KINDERGARTEN_INFO"][
+        "roleCounts"
+    ] == {"BENCHMARK": 706}
+    assert set(reconciliation) == {
+        "profileStatus",
+        "profileSha256",
+        "benchmarkSha256",
+        "sources",
+        "categories",
+        "passed",
+    }
+    assert reconciliation["passed"] is True
+
+
+# Production break caught: the synthetic profile fixture carried raw NEIS kind
+# labels that the real parser discarded, making an exact live population look
+# like source drift before candidate creation.
+def test_parsed_neis_population_reconciles_the_exact_reviewed_aggregates() -> None:
+    profile, benchmark, fixture_records, provenance = reviewed_population_fixture()
+    raw_neis_labels = tuple(
+        row.source_category
+        for row in profile.rows
+        if row.source == "NEIS"
+        for _ in range(row.observed_count)
+    )
+    parsed_neis = parse_neis_rows(
+        neis_payload_rows(*raw_neis_labels),
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    kindergarten = tuple(
+        record
+        for record in fixture_records
+        if record.source == "KINDERGARTEN_INFO"
+    )
+    records = (*parsed_neis, *kindergarten)
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    assert len(raw_neis_labels) == 1_415
+    assert len(parsed_neis) == 1_414
+    assert len(kindergarten) == 706
+    assert Counter(record.institution_type for record in parsed_neis) == {
+        "ELEMENTARY_SCHOOL": 610,
+        "HIGH_SCHOOL": 324,
+        "MIDDLE_SCHOOL": 391,
+        "MISC_SCHOOL": 39,
+        "SPECIAL_SCHOOL": 32,
+        "UNCLASSIFIED_SCHOOL": 18,
+    }
+    assert validate_unclassified_school_counts(
+        parsed_neis,
+        REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    ) == dict(REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts)
+    assert reconciliation["passed"] is True
+    assert {
+        name: category["status"]
+        for name, category in reconciliation["categories"].items()
+    } == {
+        "ELEMENTARY_SCHOOL": "REVIEWED_VARIANCE",
+        "HIGH_SCHOOL": "MATCHED",
+        "KINDERGARTEN": "REVIEWED_VARIANCE",
+        "MIDDLE_SCHOOL": "MATCHED",
+        "MISC_SCHOOL": "REVIEWED_VARIANCE",
+        "SPECIAL_SCHOOL": "MATCHED",
+    }
+
+
+def test_population_profile_binding_preserves_unrelated_sen_provenance() -> None:
+    profile, _, _, provenance = reviewed_population_fixture()
+    sen = source_provenance_for(
+        (
+            replace(
+                source_record(institution_id="sen:office"),
+                source="SEN_REVIEWED_CSV",
+                source_region_code="SEOUL",
+                institution_type="HEADQUARTERS",
+            ),
+        )
+    )["SEN_REVIEWED_CSV"]
+    raw = {**provenance, "SEN_REVIEWED_CSV": sen}
+
+    bound = sync_module.bind_school_count_population_profile(raw, profile=profile)
+
+    assert bound["SEN_REVIEWED_CSV"] is sen
+    assert bound["NEIS"].source_population_profile_sha256 == profile.sha256
+    assert bound["NEIS"].source_population_role_counts == (
+        ("BENCHMARK", 1_373),
+        ("NONSELECTABLE", 1),
+        ("QUARANTINED", 18),
+        ("SUPPLEMENTARY", 23),
+    )
+    assert bound["KINDERGARTEN_INFO"].source_population_role_counts == (
+        ("BENCHMARK", 706),
+    )
+
+
 @pytest.mark.parametrize(
-    ("institution_type", "expected", "passing_actual", "failing_actual"),
+    "mutation",
     [
-        ("ELEMENTARY_SCHOOL", 609, 603, 602),
-        ("MIDDLE_SCHOOL", 390, 387, 386),
-        ("HIGH_SCHOOL", 318, 315, 314),
+        "raw_category_balance",
+        "unknown_raw_label",
+        "kindergarten_timing",
+        "kindergarten_date",
+        "kindergarten_total",
+        "neis_region",
+        "unrelated_population_fields",
     ],
 )
-def test_school_reconciliation_checks_one_percent_per_category(
-    institution_type: str,
-    expected: int,
-    passing_actual: int,
-    failing_actual: int,
+def test_population_profile_binding_rejects_source_drift_without_echoing_labels(
+    mutation: str,
 ) -> None:
-    benchmark = reviewed_counts_fixture({institution_type: expected})
-    passing = reconcile_selectable_school_counts(
-        records_for_type_counts({institution_type: passing_actual}),
+    profile, _, _, provenance = reviewed_population_fixture()
+    target = "KINDERGARTEN_INFO" if mutation.startswith("kindergarten") else "NEIS"
+    item = provenance[target]
+    if mutation == "raw_category_balance":
+        counts = dict(item.source_category_counts)
+        counts["초등학교"] += 1
+        counts["중학교"] -= 1
+        provenance[target] = replace(
+            item, source_category_counts=tuple(sorted(counts.items()))
+        )
+    elif mutation == "unknown_raw_label":
+        provenance[target] = replace(
+            item,
+            source_category_counts=(*item.source_category_counts, ("SECRET_LABEL", 1)),
+        )
+    elif mutation == "kindergarten_timing":
+        provenance[target] = replace(item, request_timing="20262")
+    elif mutation == "kindergarten_date":
+        provenance[target] = replace(
+            item,
+            source_as_of="2026-10-01",
+            source_observation_date_counts=(("2026-10-01", 706),),
+            normalized_observation_date_counts=(("2026-10-01", 706),),
+        )
+    elif mutation == "kindergarten_total":
+        provenance[target] = replace(
+            item,
+            row_count=705,
+            fetched_row_count=705,
+            source_category_counts=(("KINDERGARTEN_TOTAL", 705),),
+        )
+    elif mutation == "neis_region":
+        provenance[target] = replace(item, request_region_code="C10")
+    else:
+        sen = replace(
+            item,
+            source="SEN_REVIEWED_CSV",
+            source_population_role_counts=(("BENCHMARK", 1),),
+        )
+        provenance["SEN_REVIEWED_CSV"] = sen
+
+    with pytest.raises(
+        SnapshotQualityError,
+        match="^source population profile does not match fetched data$",
+    ) as error:
+        sync_module.bind_school_count_population_profile(provenance, profile=profile)
+
+    assert "SECRET_LABEL" not in str(error.value)
+
+
+def test_supplementary_population_remains_in_records_but_outside_benchmark() -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance, profile=profile
+    )
+
+    reconciliation = reconcile_selectable_school_counts(
+        records,
         benchmark=benchmark,
-    )
-    failing = reconcile_selectable_school_counts(
-        records_for_type_counts({institution_type: failing_actual}),
-        benchmark=benchmark,
-    )
-
-    assert passing["categories"][institution_type]["passed"] is True
-    assert passing["passed"] is True
-    assert failing["categories"][institution_type]["passed"] is False
-    assert failing["passed"] is False
-
-
-def test_school_reconciliation_cannot_hide_swapped_category_losses() -> None:
-    benchmark = reviewed_counts_fixture(
-        {"ELEMENTARY_SCHOOL": 609, "MIDDLE_SCHOOL": 390}
-    )
-    audit = reconcile_selectable_school_counts(
-        records_for_type_counts(
-            {"ELEMENTARY_SCHOOL": 599, "MIDDLE_SCHOOL": 400}
-        ),
-        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
 
-    assert audit["categories"]["ELEMENTARY_SCHOOL"]["passed"] is False
-    assert audit["categories"]["MIDDLE_SCHOOL"]["passed"] is False
-    assert audit["passed"] is False
-
-
-def test_school_reconciliation_passes_reviewed_real_count_fixture() -> None:
-    benchmark = load_reviewed_school_counts(
-        SOURCE_RESOURCES / "sen-annual-school-counts.csv"
-    )
-    audit = reconcile_selectable_school_counts(
-        records_for_type_counts(benchmark.counts),
-        benchmark=benchmark,
-    )
-
-    assert audit["passed"] is True
-    assert audit["reportedTotals"] == [
-        {
-            "expectedCount": 2_092,
-            "actualCount": 2_074,
-            "population": (
-                "KINDERGARTEN+ELEMENTARY_SCHOOL+MIDDLE_SCHOOL+"
-                "HIGH_SCHOOL+SPECIAL_SCHOOL+MISC_SCHOOL"
-            ),
-            "usedForGate": False,
-            "passed": None,
-            "sourceUrl": (
-                "https://enews.sen.go.kr/uploads/img_smart//"
-                "2026-06-08/20260608075519432.png"
-            ),
-            "sourceAsOf": "2026-03-10",
-            "sourceSha256": (
-                "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a170"
-                "5db508afeee15e70"
-            ),
-            "evidenceStatus": "PRELIMINARY_2026",
+    assert sum(
+        record.source_kind_label in {
+            "방송통신고등학교",
+            "방송통신중학교",
         }
+        for record in records
+    ) == 6
+    assert sum(record.source_kind_label == "외국인학교" for record in records) == 17
+    assert reconciliation["categories"]["HIGH_SCHOOL"]["actualCount"] == 319
+    assert reconciliation["categories"]["MIDDLE_SCHOOL"]["actualCount"] == 390
+    assert reconciliation["categories"]["MISC_SCHOOL"]["actualCount"] == 22
+    assert sum(
+        record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records
+    ) == 18
+    assert "UNCLASSIFIED_SCHOOL" not in reconciliation["categories"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_profile_hash",
+        "wrong_profile_hash",
+        "approved_delta_sign",
+        "broadcast_role",
+        "policy_profile",
+    ],
+)
+def test_signed_variance_reconciliation_rejects_reviewed_contract_drift(
+    mutation: str,
+) -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance, profile=profile
+    )
+    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
+    if mutation in {"missing_profile_hash", "wrong_profile_hash"}:
+        bound["NEIS"] = replace(
+            bound["NEIS"],
+            source_population_profile_sha256=(
+                None if mutation == "missing_profile_hash" else "0" * 64
+            ),
+        )
+    elif mutation == "approved_delta_sign":
+        object.__setattr__(
+            profile,
+            "approved_variances",
+            tuple(
+                (name, -delta if name == "ELEMENTARY_SCHOOL" else delta)
+                for name, delta in profile.approved_variances
+            ),
+        )
+    elif mutation == "broadcast_role":
+        object.__setattr__(
+            profile,
+            "rows",
+            tuple(
+                replace(
+                    row,
+                    reconciliation_role="BENCHMARK",
+                    benchmark_type="HIGH_SCHOOL",
+                )
+                if row.source_category == "방송통신고등학교"
+                else row
+                for row in profile.rows
+            ),
+        )
+    else:
+        object.__setattr__(policy, "sha256", "0" * 64)
+
+    try:
+        with pytest.raises(SnapshotQualityError):
+            reconcile_selectable_school_counts(
+                records,
+                benchmark=benchmark,
+                population_profile=profile,
+                source_provenance=bound,
+                unclassified_policy=policy,
+            )
+    finally:
+        if mutation == "policy_profile":
+            object.__setattr__(policy, "sha256", PINNED_POLICY_SHA256)
+
+
+# Production break caught: normalized source drift raising before the CLI can
+# emit its required fail-first aggregate reconciliation audit.
+def test_population_reconciliation_represents_record_drift_as_safe_failure() -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    records = drift_one_elementary_record(records)
+
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+
+    assert reconciliation["passed"] is False
+    assert set(reconciliation["categories"]) == {
+        "ELEMENTARY_SCHOOL",
+        "HIGH_SCHOOL",
+        "KINDERGARTEN",
+        "MIDDLE_SCHOOL",
+        "MISC_SCHOOL",
+        "SPECIAL_SCHOOL",
+    }
+    assert all(
+        category["status"] == "SOURCE_DRIFT"
+        for category in reconciliation["categories"].values()
+    )
+
+
+# Production break caught: treating reviewed lifelong-school labels as selectable
+# categories, or letting their valid coordinates bypass the pending-classification
+# quarantine.
+def test_unclassified_reconciliation_keeps_official_counts_and_forces_status(
+    tmp_path: Path,
+) -> None:
+    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
+    official_records = records_for_type_counts({"ELEMENTARY_SCHOOL": 1})
+    unclassified_records = tuple(
+        replace(
+            source_record(institution_id=f"neis:B10:lifelong-{index:02d}"),
+            official_name=f"검토 평생학교 {index}",
+            institution_type="UNCLASSIFIED_SCHOOL",
+            source_kind_label=label,
+            additional_sites=(
+                SourceInstitutionSiteRecord(
+                    site_code="branch",
+                    site_name="분교장",
+                    road_address="서울특별시 중구 검증로 2",
+                    district="중구",
+                    latitude=37.561,
+                    longitude=126.971,
+                    coordinate_quality="MANUALLY_VERIFIED",
+                ),
+            ),
+        )
+        for index, label in enumerate(
+            (
+                label
+                for label, count in policy.counts
+                for _ in range(count)
+            ),
+            start=1,
+        )
+    )
+    records = (*official_records, *unclassified_records)
+
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="unclassified-status",
+    )
+    audit = build_sync_preflight_audit(
+        records,
+        source_provenance=source_provenance_for(records),
+        reconciliation={"passed": True},
+    )
+    institutions = [
+        json.loads(line)
+        for line in (candidate.candidate_path / "institutions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
-    assert (
-        audit["categories"]["KINDERGARTEN"]["sourceAsOf"]
-        == "2026-04-01"
-    )
-    assert (
-        audit["categories"]["KINDERGARTEN"]["evidenceStatus"]
-        == "OFFICIAL_DISCLOSURE_2026_04"
-    )
-    assert (
-        audit["categories"]["ELEMENTARY_SCHOOL"]["sourceAsOf"]
-        == "2026-03-10"
-    )
-    assert audit["categories"]["MISC_SCHOOL"]["composition"] == (
-        "각종학교17+고등기술학교1"
+    sites = [
+        json.loads(line)
+        for line in (candidate.candidate_path / "sites.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert audit["statusCounts"] == {
+        "PRECHECK_READY_INSTITUTION": 1,
+        "PRECHECK_REVIEW_REQUIRED_INSTITUTION": 18,
+    }
+    assert all(
+        institution["status"] == InstitutionStatus.REVIEW_REQUIRED
+        and institution["statusSource"] == "OFFICIAL_CLASSIFICATION_PENDING"
+        for institution in institutions
+        if institution["institutionType"] == "UNCLASSIFIED_SCHOOL"
     )
     assert all(
-        category["deltaCount"] == 0
-        for category in audit["categories"].values()
+        site["status"] == InstitutionStatus.REVIEW_REQUIRED
+        for site in sites
+        if site["institutionId"].startswith("neis:B10:lifelong-")
     )
 
 
-# Production break caught: folding school-form lifelong-education facilities into
-# the ordinary elementary/middle/high or misc school count gates.
-def test_school_reconciliation_keeps_lifelong_facilities_outside_school_counts() -> None:
-    benchmark = reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 1})
-    records = records_for_type_counts(
-        {"ELEMENTARY_SCHOOL": 1, "LIFELONG_EDUCATION_FACILITY": 18}
+# Production break caught: treating an absent quarantine population as a valid
+# NEIS reconciliation or allowing candidate creation with empty policy fields.
+def test_neis_requires_the_complete_unclassified_quarantine_at_creation(
+    tmp_path: Path,
+) -> None:
+    records = (source_record(),)
+
+    with pytest.raises(SnapshotQualityError, match="population|unclassified"):
+        build_candidate_snapshot(
+            records=records,
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id="missing-unclassified-at-creation",
+            coverage=FAST_TEST_COVERAGE,
+            source_provenance=source_provenance_for(records),
+            school_count_reconciliation=reviewed_reconciliation_contract(),
+        )
+
+
+# Production break caught: a reattested candidate with every quarantined NEIS
+# row removed can otherwise be reviewed or approved as an ordinary school feed.
+@pytest.mark.parametrize("operation", ["review", "approve"])
+def test_zero_quarantine_neis_candidate_cannot_review_or_approve(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    baseline = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id=f"zero-quarantine-baseline-{operation}",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    original_pointer = (tmp_path / "current.json").read_bytes()
+    candidate = build_reviewed_population_candidate(
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id=f"zero-quarantine-candidate-{operation}",
+    )
+    remove_unclassified_rows(
+        candidate.candidate_path,
+        resign_root=tmp_path,
+        candidate=candidate,
     )
 
-    audit = reconcile_selectable_school_counts(records, benchmark=benchmark)
+    with pytest.raises(SnapshotQualityError, match="schema|unclassified"):
+        if operation == "review":
+            sync_module.build_candidate_review_packet(
+                snapshot_id=candidate.snapshot_id,
+                snapshot_root=tmp_path,
+                coverage=TEST_COVERAGE,
+            )
+        else:
+            sync_module.approve_candidate_snapshot(
+                snapshot_id=candidate.snapshot_id,
+                review_digest="a" * 64,
+                reviewer_role="data-steward",
+                snapshot_root=tmp_path,
+                coverage=TEST_COVERAGE,
+            )
+    assert (tmp_path / "current.json").read_bytes() == original_pointer
 
-    assert audit["categories"]["ELEMENTARY_SCHOOL"]["actualCount"] == 1
-    assert audit["reportedTotals"][0]["actualCount"] == 1
-    assert audit["passed"] is True
 
-
-def test_school_reconciliation_keeps_parallel_school_systems_outside_counts() -> None:
-    benchmark = reviewed_counts_fixture(
-        {"MIDDLE_SCHOOL": 1, "HIGH_SCHOOL": 1, "MISC_SCHOOL": 1}
+# Production break caught: a verified snapshot can otherwise lose all 18
+# quarantined institutions and replace the NEIS aggregate with empty values.
+def test_verified_snapshot_rejects_zero_quarantine_neis_source(tmp_path: Path) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="verified-zero-quarantine",
     )
-    records = records_for_type_counts(
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+    remove_unclassified_rows(tmp_path / candidate.snapshot_id)
+
+    with pytest.raises(SnapshotIntegrityError, match="manifest|unclassified"):
+        verify_snapshot(tmp_path)
+
+
+# Production break caught: dropping the reviewed raw-label aggregate from the
+# candidate source provenance or from the digest-bound review packet.
+def test_unclassified_provenance_is_manifested_and_bound_to_review_digest(
+    tmp_path: Path,
+) -> None:
+    policy = REVIEWED_NEIS_UNCLASSIFIED_POLICY
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="unclassified-provenance",
+    )
+    manifest = json.loads(
+        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
+    )
+    source = next(item for item in manifest["sources"] if item["source"] == "NEIS")
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+
+    assert source["unclassifiedSchoolKindCounts"] == dict(policy.counts)
+    assert source["unclassifiedSchoolPolicySha256"] == policy.sha256
+    assert packet["unclassifiedSchoolKindCounts"] == dict(policy.counts)
+    assert packet["unclassifiedSchoolPolicySha256"] == policy.sha256
+    assert "평생학교(고)-2년6학기" not in (
+        candidate.candidate_path / "institutions.jsonl"
+    ).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("unclassifiedSchoolKindCounts", {"평생학교(고)-2년6학기": 8}),
+        ("unclassifiedSchoolPolicySha256", "f" * 64),
+    ],
+)
+def test_unclassified_provenance_tampering_fails_before_pointer_mutation(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+) -> None:
+    baseline = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="unclassified-tamper-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    original_pointer = (tmp_path / "current.json").read_bytes()
+    candidate = build_reviewed_population_candidate(
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id=f"unclassified-tamper-{field_name}",
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source = next(
+        item for item in manifest["sources"] if item["source"] == "NEIS"
+    )
+    source[field_name] = value
+    sync_module._write_json(manifest_path, manifest)
+    resign_candidate(candidate, tmp_path)
+
+    with pytest.raises(SnapshotQualityError, match="unclassified"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert (tmp_path / "current.json").read_bytes() == original_pointer
+
+
+@pytest.mark.parametrize("tamper", ["missing", "extra", "unsorted"])
+def test_unclassified_manifest_fields_are_strict_before_review(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id=f"unclassified-fields-{tamper}",
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source = next(item for item in manifest["sources"] if item["source"] == "NEIS")
+    if tamper == "missing":
+        source.pop("unclassifiedSchoolPolicySha256")
+    elif tamper == "extra":
+        source["unclassifiedSchoolKindsRaw"] = ["must-not-persist"]
+    else:
+        source["unclassifiedSchoolKindCounts"] = dict(
+            reversed(list(source["unclassifiedSchoolKindCounts"].items()))
+        )
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SnapshotQualityError, match="manifest fields|schema"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert not (tmp_path / "current.json").exists()
+
+
+@pytest.mark.parametrize("target", ["institution", "site"])
+def test_unclassified_active_record_tampering_fails_before_pointer_mutation(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id=f"unclassified-active-{target}",
+    )
+    pointer = tmp_path / "current.json"
+    original_pointer = pointer.read_bytes() if pointer.exists() else None
+    filename = "institutions.jsonl" if target == "institution" else "sites.jsonl"
+    rows_path = candidate.candidate_path / filename
+    rows = [
+        json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines()
+    ]
+    unclassified_id = next(
+        json.loads(line)["institutionId"]
+        for line in (candidate.candidate_path / "institutions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["institutionType"] == "UNCLASSIFIED_SCHOOL"
+    )
+    row = next(
+        item
+        for item in rows
+        if item.get("institutionType") == "UNCLASSIFIED_SCHOOL"
+        or item.get("institutionId") == unclassified_id
+    )
+    row["status"] = "ACTIVE"
+    rows[rows.index(row)] = row
+    row_bytes = (
+        "\n".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in rows)
+        + "\n"
+    ).encode("utf-8")
+    rows_path.write_bytes(row_bytes)
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["institutionsSha256" if target == "institution" else "sitesSha256"] = (
+        hashlib.sha256(row_bytes).hexdigest()
+    )
+    if target == "institution":
+        manifest["quarantinedCount"] -= 1
+        manifest["countsByStatus"]["REVIEW_REQUIRED"] -= 1
+        manifest["countsByStatus"]["ACTIVE"] += 1
+    sync_module._write_json(manifest_path, manifest)
+    resign_candidate(candidate, tmp_path)
+
+    with pytest.raises(SnapshotQualityError, match="unclassified"):
+        sync_module.build_candidate_review_packet(
+            snapshot_id=candidate.snapshot_id,
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+    assert (pointer.read_bytes() if pointer.exists() else None) == original_pointer
+
+
+# Production break caught: collapsing a production-shaped mixed NEIS candidate's
+# row dates or publishing a source entry that omits their measured distribution.
+def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
+    tmp_path: Path,
+) -> None:
+    normalized_dates = (
+        ["2026-04-23"] * 1_412
+        + ["2026-05-17"]
+        + ["2026-06-07"]
+    )
+
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="mixed-vintage-neis",
+        neis_observation_dates=tuple(normalized_dates),
+        neis_raw_observation_date_counts=(
+            ("2026-04-23", 1_413),
+            ("2026-05-17", 1),
+            ("2026-06-07", 1),
+        ),
+    )
+    manifest = json.loads(
+        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
+    )
+    neis = next(item for item in manifest["sources"] if item["source"] == "NEIS")
+
+    assert neis["sourceAsOf"] is None
+    assert neis["sourceObservationDateCounts"] == {
+        "2026-04-23": 1_413,
+        "2026-05-17": 1,
+        "2026-06-07": 1,
+    }
+    assert neis["normalizedObservationDateCounts"] == {
+        "2026-04-23": 1_412,
+        "2026-05-17": 1,
+        "2026-06-07": 1,
+    }
+    assert neis["preservedObservationDateCounts"] == {}
+    persisted = [
+        json.loads(line)
+        for line in (candidate.candidate_path / "institutions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    persisted_dates = Counter(
+        row["sourceAsOf"] for row in persisted if row["source"] == "NEIS"
+    )
+    assert persisted_dates == Counter(
         {
-            "MIDDLE_SCHOOL": 1,
-            "HIGH_SCHOOL": 1,
-            "MISC_SCHOOL": 1,
-            "BROADCAST_SCHOOL": 6,
-            "FOREIGN_SCHOOL": 17,
+            "2026-04-23": 1_412,
+            "2026-05-17": 1,
+            "2026-06-07": 1,
         }
     )
 
-    audit = reconcile_selectable_school_counts(records, benchmark=benchmark)
 
-    assert audit["reportedTotals"][0]["actualCount"] == 3
-    assert audit["passed"] is True
-
-
-def test_school_reconciliation_rejects_actual_source_contamination() -> None:
-    benchmark = reviewed_counts_fixture({"KINDERGARTEN": 1})
-    contaminated = (
-        replace(
-            source_record(),
-            institution_type="KINDERGARTEN",
-            source="NEIS",
-            institution_id="neis:B10:7010001",
+# Production break caught: a human-review artifact that changes between reads or
+# exposes institution rows, source payload material, or the transaction secret.
+def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sync_module.secrets,
+        "token_bytes",
+        lambda size: b"test-secret".ljust(size, b"!")[:size],
+    )
+    normalized_dates = (
+        ["2026-04-23"] * 1_412
+        + ["2026-05-17"]
+        + ["2026-06-07"]
+    )
+    build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="mixed-vintage-review",
+        neis_observation_dates=tuple(normalized_dates),
+        neis_raw_observation_date_counts=(
+            ("2026-04-23", 1_413),
+            ("2026-05-17", 1),
+            ("2026-06-07", 1),
         ),
     )
 
-    audit = reconcile_selectable_school_counts(
-        contaminated,
-        benchmark=benchmark,
+    first = sync_module.build_candidate_review_packet(
+        snapshot_id="mixed-vintage-review",
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    second = sync_module.build_candidate_review_packet(
+        snapshot_id="mixed-vintage-review",
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
     )
 
-    assert audit["categories"]["KINDERGARTEN"]["sourceValidationPassed"] is False
-    assert audit["categories"]["KINDERGARTEN"]["passed"] is False
-    assert audit["passed"] is False
+    assert first == second
+    assert set(first) == {
+        "status",
+        "snapshotId",
+        "createdAt",
+        "snapshotAsOf",
+        "previousSnapshotId",
+        "sourceCounts",
+            "sourceObservationDateCounts",
+            "normalizedObservationDateCounts",
+            "preservedObservationDateCounts",
+            "unclassifiedSchoolKindCounts",
+            "unclassifiedSchoolPolicySha256",
+            "institutionTypeCounts",
+        "foundationCounts",
+        "districtCounts",
+        "statusCounts",
+        "coordinateQualityCounts",
+        "quarantinedInstitutionIds",
+        "quarantinedSiteIds",
+        "diff",
+        "institutionsSha256",
+        "sitesSha256",
+        "candidateManifestSha256",
+        "sourceProvenanceSha256",
+        "enrichmentProvenanceSha256",
+        "schoolCountReconciliation",
+        "schoolCountReconciliationSha256",
+        "reviewDigest",
+    }
+    assert first["status"] == "CANDIDATE_REVIEW_REQUIRED"
+    assert first["normalizedObservationDateCounts"] == {
+        "KINDERGARTEN_INFO": {"2026-04-01": 706},
+        "NEIS": {
+            "2026-04-23": 1_412,
+            "2026-05-17": 1,
+            "2026-06-07": 1,
+        },
+        "SEN_REVIEWED_CSV": {"2026-08-10": 41},
+    }
+    assert isinstance(first["reviewDigest"], str)
+    assert re.fullmatch(r"[0-9a-f]{64}", first["reviewDigest"])
+    digest_body = {key: value for key, value in first.items() if key != "reviewDigest"}
+    assert first["reviewDigest"] == hashlib.sha256(
+        json.dumps(
+            digest_body,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert len(first["districtCounts"]) == 25
+    assert not (tmp_path / ".promotion.lock").exists()
+    serialized = json.dumps(first, ensure_ascii=False, sort_keys=True)
+    for forbidden in (
+        "officialName",
+        "roadAddress",
+        "latitude",
+        "longitude",
+        "test-secret",
+        "signature",
+        "endpoint",
+        "attribution",
+        "rawSha256",
+        "fetchedAt",
+    ):
+        assert forbidden not in serialized
 
 
-def test_school_reconciliation_accepts_verified_mixed_record_vintages() -> None:
-    records = records_for_type_counts({"HIGH_SCHOOL": 2})
-    mixed = (
-        replace(records[0], source_as_of="2026-04-23"),
-        replace(records[1], source_as_of="2026-06-07"),
+# Production break caught: accepting a visually plausible but noncanonical review
+# digest and mutating the selected snapshot without exact human authorization.
+def test_approval_requires_exact_digest_role_and_unchanged_candidate(
+    tmp_path: Path,
+) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="approval-contract",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
     )
 
-    audit = reconcile_selectable_school_counts(
-        mixed,
-        benchmark=reviewed_counts_fixture({"HIGH_SCHOOL": 2}),
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest="A" * 64,
+                reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    assert isinstance(packet["reviewDigest"], str)
+    assert re.fullmatch(r"[0-9a-f]{64}", packet["reviewDigest"])
+    assert not (tmp_path / "current.json").exists()
+
+
+@pytest.mark.parametrize(
+    "review_digest",
+    ("a" * 63, "a" * 65, "g" * 64, "A" * 64, "a" * 63 + "\n"),
+)
+def test_approval_rejects_every_noncanonical_review_digest_without_mutation(
+    tmp_path: Path,
+    review_digest: str,
+) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="invalid-review-digest",
     )
 
-    assert audit["categories"]["HIGH_SCHOOL"]["actualSourceAsOf"] == [
-        "2026-04-23",
-        "2026-06-07",
-    ]
-    assert audit["categories"]["HIGH_SCHOOL"]["sourceValidationPassed"] is True
-    assert audit["passed"] is True
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=review_digest,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    assert not (tmp_path / "current.json").exists()
+    assert not (tmp_path / ".promotion.lock").exists()
 
 
-def test_school_reconciliation_rejects_record_vintage_span_over_90_days() -> None:
-    records = records_for_type_counts({"HIGH_SCHOOL": 2})
-    mixed = (
-        replace(records[0], source_as_of="2026-04-01"),
-        replace(records[1], source_as_of="2026-07-01"),
+def test_approval_rejects_wrong_role_without_mutation(tmp_path: Path) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="invalid-review-role",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
     )
 
-    audit = reconcile_selectable_school_counts(
-        mixed,
-        benchmark=reviewed_counts_fixture({"HIGH_SCHOOL": 2}),
+    with pytest.raises(SnapshotQualityError, match="reviewer role"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=packet["reviewDigest"],
+            reviewer_role="operator",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    assert not (tmp_path / "current.json").exists()
+    assert not (tmp_path / ".promotion.lock").exists()
+
+
+@pytest.mark.parametrize(
+    ("fixture", "reviewer_role"),
+    [(True, "data-steward"), (False, "TEST_FIXTURE_REVIEWER")],
+)
+def test_approval_reviewer_identity_cannot_cross_fixture_boundary(
+    tmp_path: Path,
+    fixture: bool,
+    reviewer_role: str,
+) -> None:
+    candidate = (
+        build_explicit_test_fixture_candidate(
+            records=(source_record(),),
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id="fixture-reviewer-boundary",
+        )
+        if fixture
+        else build_reviewed_population_candidate(
+            previous=None,
+            output_root=tmp_path,
+            snapshot_id="production-reviewer-boundary",
+        )
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=FAST_TEST_COVERAGE,
     )
 
-    assert audit["categories"]["HIGH_SCHOOL"]["sourceValidationPassed"] is False
-    assert audit["passed"] is False
+    with pytest.raises(SnapshotQualityError, match="reviewer role"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=cast(str, packet["reviewDigest"]),
+            reviewer_role=reviewer_role,
+            snapshot_root=tmp_path,
+            coverage=FAST_TEST_COVERAGE,
+        )
+
+    assert not (tmp_path / "current.json").exists()
+
+
+def test_approval_rejects_candidate_changed_after_review_without_pointer_change(
+    tmp_path: Path,
+) -> None:
+    baseline = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="review-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_reviewed_population_candidate(
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="changed-after-review",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["createdAt"] = "2026-08-13T12:00:00Z"
+    sync_module._write_json(manifest_path, manifest)
+    transaction_path = (
+        tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
+    )
+    transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    transaction["manifestSha256"] = sync_module._manifest_section_sha256(manifest)
+    transaction.pop("signature")
+    sync_module._write_signed_transaction(
+        tmp_path,
+        transaction,
+        replace_existing=True,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=packet["reviewDigest"],
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
+def test_same_digest_published_retry_is_idempotent(tmp_path: Path) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="same-digest-retry",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    review_digest = packet["reviewDigest"]
+    assert isinstance(review_digest, str)
+
+    assert sync_module.approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=review_digest,
+        reviewer_role="data-steward",
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    ) == review_digest
+    pointer_before = (tmp_path / "current.json").read_bytes()
+
+    assert sync_module.approve_candidate_snapshot(
+        snapshot_id=candidate.snapshot_id,
+        review_digest=review_digest,
+        reviewer_role="data-steward",
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    ) == review_digest
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
+# Production break caught: changing and reattesting a candidate after its digest
+# comparison can otherwise publish data the reviewer did not approve.
+def test_approval_rechecks_digest_after_post_comparison_candidate_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="digest-race-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_reviewed_population_candidate(
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="digest-race-candidate",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    review_digest = packet["reviewDigest"]
+    assert isinstance(review_digest, str)
+    real_compare_digest = sync_module.hmac.compare_digest
+    changed = False
+
+    def change_after_review_comparison(left: object, right: object) -> bool:
+        nonlocal changed
+        result = real_compare_digest(left, right)
+        if not changed and left == review_digest and right == review_digest:
+            manifest_path = candidate.candidate_path / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["createdAt"] = "2099-01-01T00:00:00Z"
+            sync_module._write_json(manifest_path, manifest)
+            transaction_path = (
+                tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
+            )
+            transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+            transaction["manifestSha256"] = sync_module._manifest_section_sha256(
+                manifest
+            )
+            transaction.pop("signature")
+            sync_module._write_signed_transaction(
+                tmp_path,
+                transaction,
+                replace_existing=True,
+            )
+            changed = True
+        return result
+
+    monkeypatch.setattr(
+        sync_module.hmac,
+        "compare_digest",
+        change_after_review_comparison,
+    )
+
+    with pytest.raises(SnapshotQualityError, match="review digest"):
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=review_digest,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+
+    rebuilt = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    assert changed is True
+    assert rebuilt["reviewDigest"] != review_digest
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+    assert verify_snapshot(tmp_path).manifest.snapshot_id == baseline.snapshot_id
+
+
+def test_automatic_promotion_symbol_is_not_public(
+    tmp_path: Path,
+) -> None:
+    build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="automatic-promotion-disabled",
+    )
+
+    assert not hasattr(sync_module, "promote_snapshot")
+    assert not (tmp_path / "current.json").exists()
 
 
 def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    records = records_for_type_counts({"ELEMENTARY_SCHOOL": 602})
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    provenance = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    records = drift_one_elementary_record(records)
     reconciliation = reconcile_selectable_school_counts(
         records,
-        benchmark=reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 609}),
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=provenance,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
-    provenance = source_provenance_for(records)["NEIS"]
     audit = build_sync_preflight_audit(
         records,
-        source_provenance={provenance.source: provenance},
+        source_provenance=provenance,
         reconciliation=reconciliation,
     )
 
@@ -1036,8 +2996,15 @@ def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     assert parsed["auditStage"] == "PRE_PROMOTION_RECONCILIATION"
     assert parsed["passed"] is False
     assert parsed["reconciliation"]["passed"] is False
-    assert parsed["typeCounts"] == {"ELEMENTARY_SCHOOL": 602}
-    assert parsed["sourceCounts"]["NEIS"]["normalized"] == 602
+    assert set(parsed["reconciliation"]["categories"]) == {
+        "ELEMENTARY_SCHOOL",
+        "HIGH_SCHOOL",
+        "KINDERGARTEN",
+        "MIDDLE_SCHOOL",
+        "MISC_SCHOOL",
+        "SPECIAL_SCHOOL",
+    }
+    assert parsed["sourceCounts"]["NEIS"]["normalized"] == 1_414
     assert len(parsed["districtCounts"]) == 25
     assert "statusCounts" in parsed
     assert "quarantinedInstitutionIds" in parsed
@@ -1045,11 +3012,65 @@ def test_failed_reconciliation_emits_privacy_safe_audit_before_error(
     assert output.err == ""
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["top_level", "source", "category", "status"],
+)
+def test_preflight_audit_boundary_rejects_unreviewed_shapes_without_echo(
+    mutation: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    provenance = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=provenance,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+    )
+    audit = build_sync_preflight_audit(
+        records,
+        source_provenance=provenance,
+        reconciliation=reconciliation,
+    )
+    if mutation == "top_level":
+        audit["SECRET_RAW_LABEL"] = True
+    elif mutation == "source":
+        reconciliation["sources"]["SECRET_RAW_LABEL"] = {  # type: ignore[index]
+            "roleCounts": {"BENCHMARK": 1}
+        }
+    elif mutation == "category":
+        reconciliation["categories"]["SECRET_RAW_LABEL"] = {  # type: ignore[index]
+            "expectedCount": 1,
+            "actualCount": 1,
+            "deltaCount": 0,
+            "status": "MATCHED",
+        }
+    else:
+        reconciliation["categories"]["ELEMENTARY_SCHOOL"][  # type: ignore[index]
+            "status"
+        ] = "SECRET_RAW_LABEL"
+    audit["reconciliation"] = reconciliation
+
+    with pytest.raises(
+        SnapshotQualityError,
+        match="^sync preflight audit is invalid$",
+    ):
+        emit_sync_preflight_audit(audit)
+
+    output = capsys.readouterr()
+    assert "SECRET_RAW_LABEL" not in output.out
+    assert "SECRET_RAW_LABEL" not in output.err
+
+
 @pytest.mark.asyncio
-async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
+async def test_population_profile_cli_reconciliation_failure_flushes_before_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     script_path = Path("apps/travel-map/scripts/sync-institutions.py")
     spec = importlib.util.spec_from_file_location("sync_institutions_cli", script_path)
@@ -1057,23 +3078,24 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    neis_records = records_for_type_counts({"ELEMENTARY_SCHOOL": 602})
-    neis_provenance = source_provenance_for(neis_records)["NEIS"]
-    empty_kindergarten_provenance = SourceProvenance(
-        source="KINDERGARTEN_INFO",
-        endpoint="https://e-childschoolinfo.moe.go.kr/api/notice/basicInfo2.do",
-        license_name="PUBLIC_DATA_PORTAL_TERMS",
-        attribution="Ministry of Education Kindergarten Info",
-        fetched_at="2026-08-10T09:00:00Z",
-        source_as_of="2026-03-10",
-        raw_sha256="b" * 64,
-        page_count=25,
-        row_count=0,
-        fetched_row_count=0,
-        request_region_code="11",
-        request_timing="20261",
-        normalized_sha256=normalized_records_sha256(()),
+    _, _, records, provenance = reviewed_population_fixture()
+    drifted_records = drift_one_elementary_record(records)
+    neis_records = tuple(
+        record for record in drifted_records if record.source == "NEIS"
     )
+    kindergarten_records = tuple(
+        record
+        for record in drifted_records
+        if record.source == "KINDERGARTEN_INFO"
+    )
+    cleared_holders: list[str] = []
+
+    class FlushTrackingBuffer(io.StringIO):
+        flush_count = 0
+
+        def flush(self) -> None:
+            self.flush_count += 1
+            super().flush()
 
     class FakeAsyncClient:
         def __init__(self, **_kwargs: object) -> None:
@@ -1086,18 +3108,29 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
             return None
 
     class FakeNeisSource:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
+        def __init__(self, *, api_key: str, **_kwargs: object) -> None:
+            self.api_key = api_key
 
         async def fetch(self) -> SourceFetchResult:
-            return SourceFetchResult(neis_records, neis_provenance)
+            return SourceFetchResult(neis_records, provenance["NEIS"])
+
+        def clear_credentials(self) -> None:
+            self.api_key = ""
+            cleared_holders.append("NEIS")
 
     class FakeKindergartenSource:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
+        def __init__(self, *, api_key: str, **_kwargs: object) -> None:
+            self.api_key = api_key
 
         async def fetch(self) -> SourceFetchResult:
-            return SourceFetchResult((), empty_kindergarten_provenance)
+            return SourceFetchResult(
+                kindergarten_records,
+                provenance["KINDERGARTEN_INFO"],
+            )
+
+        def clear_credentials(self) -> None:
+            self.api_key = ""
+            cleared_holders.append("KINDERGARTEN_INFO")
 
     class FakeStandardSource:
         def __init__(self, **_kwargs: object) -> None:
@@ -1113,121 +3146,369 @@ async def test_cli_reconciliation_failure_precedes_kakao_and_candidate(
         def __init__(self, **_kwargs: object) -> None:
             raise AssertionError("Kakao must not be created before reconciliation")
 
+    def forbidden_candidate(**_kwargs: object) -> None:
+        raise AssertionError("candidate must not be built before reconciliation")
+
     monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setattr(module, "NeisSource", FakeNeisSource)
     monkeypatch.setattr(module, "KindergartenSource", FakeKindergartenSource)
     monkeypatch.setattr(module, "StandardSchoolLocationSource", FakeStandardSource)
     monkeypatch.setattr(module, "KakaoLocalClient", ForbiddenKakaoClient)
-    monkeypatch.setattr(
-        module,
-        "load_reviewed_school_counts",
-        lambda _path: reviewed_counts_fixture({"ELEMENTARY_SCHOOL": 609}),
-    )
+    monkeypatch.setattr(module, "build_candidate_snapshot", forbidden_candidate)
     snapshot_root = tmp_path / "snapshots"
+    keys = {
+        "NEIS_API_KEY": "NEIS_CREDENTIAL_SENTINEL",
+        "KINDERGARTEN_API_KEY": "KINDERGARTEN_CREDENTIAL_SENTINEL",
+        "KAKAO_REST_API_KEY": "KAKAO_CREDENTIAL_SENTINEL",
+    }
     args = argparse.Namespace(
         sen_csv=SOURCE_RESOURCES / "sen-institutions.csv",
         region_codes=SOURCE_RESOURCES / "kindergarten-region-codes.csv",
         school_counts=SOURCE_RESOURCES / "sen-annual-school-counts.csv",
+        school_count_population_profile=(
+            SOURCE_RESOURCES / "school-count-population-profile.csv"
+        ),
+        neis_unclassified_policy=(
+            SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+        ),
         snapshot_root=snapshot_root,
         geodata_root=Path("apps/travel-map/resources/geodata"),
         timing="20261",
         snapshot_id="must-not-build",
     )
 
-    with pytest.raises(
-        SnapshotQualityError,
-        match="official school count reconciliation failed",
-    ):
-        await module._run_with_keys(
-            args,
-            {
-                "NEIS_API_KEY": "neis-test",
-                "KINDERGARTEN_API_KEY": "kindergarten-test",
-                "KAKAO_REST_API_KEY": "kakao-test",
-            },
-            [],
-        )
+    audit_output = FlushTrackingBuffer()
+    with monkeypatch.context() as stdout_patch:
+        stdout_patch.setattr(sys, "stdout", audit_output)
+        with pytest.raises(
+            SnapshotQualityError,
+            match="official school count reconciliation failed",
+        ):
+            await module.run(args, keys)
 
-    audit = json.loads(capsys.readouterr().out)
+    output = audit_output.getvalue()
+    assert audit_output.flush_count >= 1
+    assert len(output.splitlines()) == 1
+    audit = json.loads(output)
+    assert audit["auditStage"] == "PRE_PROMOTION_RECONCILIATION"
     assert audit["reconciliation"]["passed"] is False
     assert audit["passed"] is False
+    assert set(audit["reconciliation"]["categories"]) == {
+        "ELEMENTARY_SCHOOL",
+        "HIGH_SCHOOL",
+        "KINDERGARTEN",
+        "MIDDLE_SCHOOL",
+        "MISC_SCHOOL",
+        "SPECIAL_SCHOOL",
+    }
+    assert "SECRET_RAW_LABEL" not in output
+    assert "CREDENTIAL_SENTINEL" not in output
+    assert cleared_holders == ["NEIS", "KINDERGARTEN_INFO"]
+    assert keys == {
+        "NEIS_API_KEY": "",
+        "KINDERGARTEN_API_KEY": "",
+        "KAKAO_REST_API_KEY": "",
+    }
     assert not snapshot_root.exists()
 
 
-@pytest.mark.asyncio
-async def test_sync_cli_stops_at_candidate_review_without_promotion(
-    tmp_path: Path,
+def test_sync_cli_defaults_to_reviewed_population_profile_and_neis_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     script_path = Path("apps/travel-map/scripts/sync-institutions.py")
-    spec = importlib.util.spec_from_file_location(
-        "candidate_only_sync_cli", script_path
-    )
+    spec = importlib.util.spec_from_file_location("sync_institutions_cli_args", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setattr(sys, "argv", [str(script_path)])
 
-    async def fake_run_with_keys(
-        _args: argparse.Namespace,
-        _keys: dict[str, str],
-        _holders: list[object],
-    ) -> str:
-        return "cli-candidate"
+    args = module.parse_args()
 
-    monkeypatch.setattr(module, "_run_with_keys", fake_run_with_keys)
-    keys = {
-        "NEIS_API_KEY": "neis-test",
-        "KINDERGARTEN_API_KEY": "kindergarten-test",
-        "KAKAO_REST_API_KEY": "kakao-test",
-    }
-    result = await module.run(argparse.Namespace(), keys)
-
-    assert result == "cli-candidate"
-    assert set(keys.values()) == {""}
-    assert not hasattr(module, "promote_snapshot")
-    assert not (tmp_path / "current.json").exists()
+    assert args.neis_unclassified_policy == (
+        SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+    )
+    assert args.school_count_population_profile == (
+        SOURCE_RESOURCES / "school-count-population-profile.csv"
+    )
 
 
-def test_no_production_script_has_automatic_snapshot_promotion() -> None:
-    assert not hasattr(sync_module, "promote_snapshot")
-    for path in Path("apps/travel-map/scripts").glob("*.py"):
-        source = path.read_text(encoding="utf-8")
-        assert "promote_snapshot" not in source
-
-
-def test_sync_cli_main_prints_compact_candidate_review_status(
+@pytest.mark.asyncio
+async def test_population_profile_cli_stops_at_candidate_review_without_promotion(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     script_path = Path("apps/travel-map/scripts/sync-institutions.py")
     spec = importlib.util.spec_from_file_location(
-        "candidate_status_sync_cli", script_path
+        "sync_institutions_candidate_cli",
+        script_path,
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    assert not hasattr(module, "promote_snapshot")
+    assert not hasattr(module, "approve_candidate_snapshot")
 
-    async def fake_run(
-        _args: argparse.Namespace,
-        _keys: dict[str, str],
-    ) -> str:
-        return "cli-candidate"
+    neis_records = (source_record(),)
+    neis_provenance = source_provenance_for(neis_records)["NEIS"]
+    observed_order: list[str] = []
+    population_calls: list[str] = []
+    bound_sources: set[str] = set()
+    bound_provenance: Mapping[str, SourceProvenance] | None = None
+    candidate_kwargs: dict[str, object] = {}
+    reconciliation = {
+        "passed": True,
+        "unclassifiedSchoolKindCounts": dict(
+            REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+        ),
+    }
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs: object) -> None:
+            observed_order.append("open-http-client")
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class FakeNeisSource:
+        def __init__(
+            self,
+            *,
+            unclassified_policy: NeisUnclassifiedPolicy,
+            **_kwargs: object,
+        ) -> None:
+            assert unclassified_policy is REVIEWED_NEIS_UNCLASSIFIED_POLICY
+
+        async def fetch(self) -> SourceFetchResult:
+            return SourceFetchResult(neis_records, neis_provenance)
+
+    class FakeKindergartenSource:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def fetch(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                records=(),
+                provenance=SimpleNamespace(source="KINDERGARTEN_INFO"),
+            )
+
+    class FakeStandardSource:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def fetch(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                locations=(),
+                provenance=standard_enrichment_provenance(matched_row_count=0),
+            )
+
+    class FakeSenSource:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def load(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                records=(),
+                provenance=SimpleNamespace(source="SEN_REVIEWED_CSV"),
+            )
+
+    class FakeKakaoClient:
+        def __init__(self, **_kwargs: object) -> None:
+            assert population_calls == ["bind", "reconcile"]
+
+        def clear_credentials(self) -> None:
+            pass
+
+        def provenance(self) -> EnrichmentProvenance:
+            return EnrichmentProvenance(
+                source="KAKAO_LOCAL_GEOCODING",
+                endpoint="https://dapi.kakao.com/v2/local/search/address.json",
+                license_name="KAKAO_LOCAL_API_TERMS",
+                attribution="Kakao Local API",
+                fetched_at="2026-08-13T09:00:00Z",
+                source_as_of="2026-08-13",
+                raw_sha256="c" * 64,
+                normalized_sha256=hashlib.sha256(b"").hexdigest(),
+                request_region_code="SEOUL_ADDRESS_BATCH",
+                request_timing=None,
+                page_count=0,
+                fetched_row_count=0,
+                matched_row_count=0,
+                matched_normalized_sha256=hashlib.sha256(b"").hexdigest(),
+            )
+
+    snapshot_root = tmp_path / "snapshots"
+    snapshot_id = "candidate-only-cli"
+
+    def fake_build_candidate_snapshot(**_kwargs: object) -> SnapshotBuildResult:
+        candidate_kwargs.update(_kwargs)
+        snapshot_root.mkdir()
+        candidate_path = snapshot_root / f".{snapshot_id}.candidate"
+        candidate_path.mkdir()
+        return SnapshotBuildResult(
+            snapshot_id=snapshot_id,
+            candidate_path=candidate_path,
+            approved=False,
+            issues=(),
+        )
+
+    def forbidden_promotion(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("synchronizer must not auto-promote a candidate")
+
+    async def identity_records(
+        records: tuple[SourceInstitutionRecord, ...],
+        _client: object,
+    ) -> tuple[SourceInstitutionRecord, ...]:
+        return records
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(module, "NeisSource", FakeNeisSource)
+    monkeypatch.setattr(module, "KindergartenSource", FakeKindergartenSource)
+    monkeypatch.setattr(module, "StandardSchoolLocationSource", FakeStandardSource)
+    monkeypatch.setattr(module, "SenCsvSource", FakeSenSource)
+    monkeypatch.setattr(module, "KakaoLocalClient", FakeKakaoClient)
+    monkeypatch.setattr(module, "geocode_missing_records", identity_records)
+    def load_policy(path: Path) -> NeisUnclassifiedPolicy:
+        assert path == (
+            SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+        )
+        observed_order.append("load-unclassified-policy")
+        return REVIEWED_NEIS_UNCLASSIFIED_POLICY
 
     monkeypatch.setattr(
         module,
-        "parse_args",
-        lambda: argparse.Namespace(env_file=None),
+        "load_neis_unclassified_policy",
+        load_policy,
+        raising=False,
     )
-    monkeypatch.setattr(module, "load_environment_file", lambda _path: None)
-    monkeypatch.setattr(module, "run", fake_run)
-    for name in module._REQUIRED_KEYS:
-        monkeypatch.setenv(name, f"{name}-test")
+    benchmark = object()
 
-    assert module.main() == 0
-    assert capsys.readouterr().out == (
-        '{"snapshotId":"cli-candidate",'
-        '"status":"CANDIDATE_REVIEW_REQUIRED"}\n'
+    def load_benchmark(path: Path) -> object:
+        assert path == tmp_path / "counts.csv"
+        observed_order.append("load-school-count-benchmark")
+        return benchmark
+
+    monkeypatch.setattr(module, "load_reviewed_school_counts", load_benchmark)
+    real_profile_loader = module.load_school_count_population_profile
+
+    def load_profile(
+        path: Path,
+        *,
+        unclassified_policy: NeisUnclassifiedPolicy,
+    ) -> SchoolCountPopulationProfile:
+        assert path == SOURCE_RESOURCES / "school-count-population-profile.csv"
+        assert unclassified_policy is REVIEWED_NEIS_UNCLASSIFIED_POLICY
+        observed_order.append("load-population-profile")
+        return real_profile_loader(path, unclassified_policy=unclassified_policy)
+
+    def bind_population(
+        provenance: Mapping[str, SourceProvenance],
+        *,
+        profile: SchoolCountPopulationProfile,
+    ) -> Mapping[str, SourceProvenance]:
+        nonlocal bound_provenance
+        assert profile.sha256 == PINNED_POPULATION_PROFILE_SHA256
+        bound_sources.update(provenance)
+        population_calls.append("bind")
+        bound_provenance = dict(provenance)
+        return bound_provenance
+
+    monkeypatch.setattr(module, "load_school_count_population_profile", load_profile)
+    monkeypatch.setattr(
+        module,
+        "bind_school_count_population_profile",
+        bind_population,
     )
+    monkeypatch.setattr(
+        module,
+        "build_candidate_snapshot",
+        fake_build_candidate_snapshot,
+    )
+    monkeypatch.setattr(module, "promote_snapshot", forbidden_promotion, raising=False)
+    def reconcile(
+        *_args: object,
+        unclassified_policy: NeisUnclassifiedPolicy,
+        population_profile: SchoolCountPopulationProfile,
+        source_provenance: Mapping[str, SourceProvenance],
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        assert unclassified_policy is REVIEWED_NEIS_UNCLASSIFIED_POLICY
+        assert population_profile.sha256 == PINNED_POPULATION_PROFILE_SHA256
+        assert source_provenance is bound_provenance
+        assert set(source_provenance) == {
+            "NEIS",
+            "KINDERGARTEN_INFO",
+            "SEN_REVIEWED_CSV",
+        }
+        assert population_calls == ["bind"]
+        assert _kwargs["benchmark"] is benchmark
+        population_calls.append("reconcile")
+        return reconciliation
+
+    monkeypatch.setattr(module, "reconcile_selectable_school_counts", reconcile)
+    monkeypatch.setattr(
+        module,
+        "build_sync_preflight_audit",
+        lambda *_args, reconciliation, **_kwargs: {
+            "passed": True,
+            "reconciliation": reconciliation,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "emit_sync_preflight_audit",
+        lambda audit: print(json.dumps(audit, sort_keys=True)),
+    )
+    args = argparse.Namespace(
+        sen_csv=tmp_path / "sen.csv",
+        region_codes=tmp_path / "regions.csv",
+        school_counts=tmp_path / "counts.csv",
+        school_count_population_profile=(
+            SOURCE_RESOURCES / "school-count-population-profile.csv"
+        ),
+        neis_unclassified_policy=(
+            SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
+        ),
+        snapshot_root=snapshot_root,
+        geodata_root=Path("apps/travel-map/resources/geodata"),
+        timing="20261",
+        snapshot_id=snapshot_id,
+    )
+
+    await module._run_with_keys(
+        args,
+        {
+            "NEIS_API_KEY": "neis-test",
+            "KINDERGARTEN_API_KEY": "kindergarten-test",
+            "KAKAO_REST_API_KEY": "kakao-test",
+        },
+        [],
+    )
+
+    lines = capsys.readouterr().out.splitlines()
+    preflight = json.loads(lines[0])
+    assert preflight["reconciliation"]["unclassifiedSchoolKindCounts"] == dict(
+        REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+    )
+    assert lines[-1] == (
+        '{"snapshotId":"candidate-only-cli",'
+        '"status":"CANDIDATE_REVIEW_REQUIRED"}'
+    )
+    assert (snapshot_root / ".candidate-only-cli.candidate").is_dir()
+    assert not (snapshot_root / "current.json").exists()
+    assert population_calls == ["bind", "reconcile"]
+    assert observed_order[:3] == [
+        "load-unclassified-policy",
+        "load-population-profile",
+        "load-school-count-benchmark",
+    ]
+    assert observed_order[3] == "open-http-client"
+    assert {"NEIS", "KINDERGARTEN_INFO"}.issubset(bound_sources)
+    assert candidate_kwargs["source_provenance"] is bound_provenance
+    assert candidate_kwargs["school_count_reconciliation"] is reconciliation
 
 
 @pytest.mark.parametrize(
@@ -1310,31 +3591,46 @@ def test_keyless_official_school_csv_only_enriches_matching_neis_identity() -> N
 @pytest.mark.asyncio
 async def test_neis_source_requires_real_key_and_paginates_to_declared_total() -> None:
     requests: list[httpx.Request] = []
+    source_types = (
+        "\ucd08\ub4f1\ud559\uad50",
+        "\ucd08\ub4f1\ud559\uad50",
+        *reviewed_neis_source_types(),
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
         page = int(request.url.params["pIndex"])
-        section = payload["schoolInfo"]
-        assert type(section) is list
-        section[0]["head"][0]["list_total_count"] = 2
-        row = section[1]["row"][0]
-        row["SD_SCHUL_CODE"] = f"701000{page}"
-        return httpx.Response(200, json=payload)
+        return httpx.Response(
+            200,
+            json=neis_page_payload(
+                source_types,
+                page=page,
+                page_size=10,
+            ),
+        )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler)
     ) as client:
-        source = NeisSource(api_key="test-key", client=client, page_size=1)
+        source = NeisSource(
+            api_key="test-key",
+            client=client,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=10,
+        )
         result = await source.fetch()
 
-    assert len(result.records) == 2
+    assert len(result.records) == 20
     assert result.provenance.page_count == 2
     assert [request.url.params["pIndex"] for request in requests] == ["1", "2"]
     assert all(request.url.params["ATPT_OFCDC_SC_CODE"] == "B10" for request in requests)
 
     with pytest.raises(SourceDataError, match="NEIS_API_KEY"):
-        NeisSource(api_key="", client=httpx.AsyncClient())
+        NeisSource(
+            api_key="",
+            client=httpx.AsyncClient(),
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
 
 
 @pytest.mark.asyncio
@@ -1352,7 +3648,11 @@ async def test_neis_source_rejects_keyless_sample_and_redacts_invalid_key() -> N
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError) as raised:
-            await NeisSource(api_key=secret, client=client).fetch()
+            await NeisSource(
+                api_key=secret,
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     assert secret not in str(raised.value)
 
@@ -1368,7 +3668,11 @@ async def test_source_http_failure_traceback_does_not_retain_api_key() -> None:
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError) as raised:
-            await NeisSource(api_key=secret, client=client).fetch()
+            await NeisSource(
+                api_key=secret,
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     formatted = "".join(
         traceback.format_exception(raised.type, raised.value, raised.tb)
@@ -1390,7 +3694,11 @@ async def test_unexpected_transport_failure_does_not_retain_api_key() -> None:
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="NEIS request failed") as raised:
-            await NeisSource(api_key=secret, client=client).fetch()
+            await NeisSource(
+                api_key=secret,
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     assert_secret_absent_from_app_traceback(raised.value, raised.tb, secret)
 
@@ -1464,7 +3772,13 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
     kindergarten_secret = "successful-kindergarten-secret"
 
     def neis_handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=neis_payload(source_type="초등학교"))
+        return httpx.Response(
+            200,
+            json=neis_payload_rows(
+                "\ucd08\ub4f1\ud559\uad50",
+                *reviewed_neis_source_types(),
+            ),
+        )
 
     def kindergarten_handler(request: httpx.Request) -> httpx.Response:
         payload = kindergarten_payload()
@@ -1476,7 +3790,11 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(neis_handler)
     ) as client:
-        neis = NeisSource(api_key=neis_secret, client=client)
+        neis = NeisSource(
+            api_key=neis_secret,
+            client=client,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+        )
         await neis.fetch()
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(kindergarten_handler)
@@ -1494,7 +3812,7 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_kindergarten_fetch_reports_all_raw_rows_at_pinned_timing(
+async def test_kindergarten_source_category_counts_reports_total_raw_category(
     tmp_path: Path,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1514,47 +3832,27 @@ async def test_kindergarten_fetch_reports_all_raw_rows_at_pinned_timing(
             timing="20261",
         ).fetch()
 
-    assert result.provenance.source_observation_date_counts == (
-        ("2026-04-01", 25),
+    assert result.provenance.source_category_counts == (
+        ("KINDERGARTEN_TOTAL", len(result.records)),
     )
-
-
-# Production break caught: publishing a zero-count source observation histogram
-# after every requested kindergarten region returned a valid but empty response.
-@pytest.mark.asyncio
-async def test_kindergarten_fetch_rejects_no_raw_source_rows(
-    tmp_path: Path,
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        payload = kindergarten_payload()
-        payload["sggList"] = request.url.params["sggCode"]
-        payload["kinderInfo"] = []
-        return httpx.Response(200, json=payload)
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
-        with pytest.raises(SourceDataError, match="no source rows"):
-            await KindergartenSource(
-                api_key="test-key",
-                client=client,
-                region_codes_path=write_region_fixture(tmp_path),
-                timing="20261",
-            ).fetch()
+    assert type(result.provenance.source_category_counts) is tuple
+    assert type(result.provenance.source_category_counts[0][0]) is str
+    assert type(result.provenance.source_category_counts[0][1]) is int
 
 
 @pytest.mark.asyncio
 async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
-        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
+        payload = neis_payload_rows(
+            "\ucd08\ub4f1\ud559\uad50",
+            *reviewed_neis_source_types(),
+            "\uacf5\ub3d9\uc2e4\uc2b5\uc18c",
+        )
         sections = payload["schoolInfo"]
         assert type(sections) is list
-        first = sections[1]["row"][0]
-        excluded = dict(first)
-        excluded["SD_SCHUL_CODE"] = "7010999"
-        excluded["SCHUL_KND_SC_NM"] = "\uacf5\ub3d9\uc2e4\uc2b5\uc18c"
-        sections[0]["head"][0]["list_total_count"] = 2
-        sections[1]["row"] = [first, excluded]
+        for row in sections[1]["row"][:-1]:
+            row["LOAD_DTM"] = "20260423"
+        sections[1]["row"][-1]["LOAD_DTM"] = "20260607"
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(
@@ -1563,60 +3861,136 @@ async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
         result = await NeisSource(
             api_key="test-key",
             client=client,
-            page_size=2,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=20,
         ).fetch()
 
-    assert len(result.records) == 1
+    assert len(result.records) == 19
     assert result.provenance.page_count == 1
-    assert result.provenance.fetched_row_count == 2
-    assert result.provenance.row_count == 1
+    assert result.provenance.fetched_row_count == 20
+    assert result.provenance.row_count == 19
+    assert result.provenance.source_as_of is None
+    assert result.provenance.source_observation_date_counts == (
+        ("2026-04-23", 19),
+        ("2026-06-07", 1),
+    )
+    assert result.provenance.normalized_observation_date_counts == (
+        ("2026-04-23", 19),
+    )
 
 
 @pytest.mark.asyncio
-async def test_neis_fetch_preserves_mixed_raw_load_dates() -> None:
-    dates = ("20260423", "20260607")
+async def test_neis_collects_raw_school_kind_histogram_before_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_types = ("고등학교", "공동실습소", "방송통신고등학교")
+    monkeypatch.setattr(
+        neis_module,
+        "validate_unclassified_school_counts",
+        lambda _records, _policy: {},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=neis_page_payload(
+                source_types,
+                page=int(request.url.params["pIndex"]),
+                page_size=2,
+            ),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await NeisSource(
+            api_key="test-key",
+            client=client,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=2,
+        ).fetch()
+
+    assert result.provenance.source_category_counts == (
+        ("고등학교", 1),
+        ("공동실습소", 1),
+        ("방송통신고등학교", 1),
+    )
+    assert type(result.provenance.source_category_counts) is tuple
+    assert tuple(label for label, _ in result.provenance.source_category_counts) == (
+        "고등학교",
+        "공동실습소",
+        "방송통신고등학교",
+    )
+    assert all(
+        type(label) is str and type(count) is int
+        for label, count in result.provenance.source_category_counts
+    )
+    assert len(result.records) == 2
+    assert result.provenance.fetched_row_count == 3
+    assert result.provenance.row_count == 2
+
+
+@pytest.mark.asyncio
+async def test_neis_fetch_records_raw_and_normalized_mixed_vintage_histograms() -> None:
+    source_types = (*reviewed_neis_source_types(), *("\ucd08\ub4f1\ud559\uad50",) * 4)
 
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["pIndex"])
-        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
+        payload = neis_page_payload(source_types, page=page, page_size=11)
         sections = payload["schoolInfo"]
         assert type(sections) is list
-        sections[0]["head"][0]["list_total_count"] = 2
-        row = sections[1]["row"][0]
-        row["SD_SCHUL_CODE"] = f"701000{page}"
-        row["LOAD_DTM"] = dates[page - 1]
+        rows = sections[1]["row"]
+        for index, row in enumerate(rows):
+            source_index = (page - 1) * 11 + index
+            row["LOAD_DTM"] = (
+                "20260517"
+                if source_index == 1
+                else "20260607" if source_index == 21 else "20260423"
+            )
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler)
     ) as client:
-        source = NeisSource(api_key="test-key", client=client, page_size=1)
-        result = await source.fetch()
+        result = await NeisSource(
+            api_key="test-key",
+            client=client,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=11,
+        ).fetch()
 
-    assert {record.source_as_of for record in result.records} == {
-        "2026-04-23",
-        "2026-06-07",
-    }
-    assert result.provenance.source_as_of == "2026-06-07"
+    assert result.provenance.source_as_of is None
     assert result.provenance.source_observation_date_counts == (
-        ("2026-04-23", 1),
+        ("2026-04-23", 20),
+        ("2026-05-17", 1),
+        ("2026-06-07", 1),
+    )
+    assert result.provenance.normalized_observation_date_counts == (
+        ("2026-04-23", 20),
+        ("2026-05-17", 1),
         ("2026-06-07", 1),
     )
 
 
 @pytest.mark.asyncio
-async def test_neis_fetch_accepts_raw_observation_span_of_90_days() -> None:
-    dates = ("20260401", "20260630")
+async def test_neis_source_preserves_different_date_on_excluded_only_page() -> None:
+    source_types = (
+        "\ucd08\ub4f1\ud559\uad50",
+        *reviewed_neis_source_types(),
+        "\uacf5\ub3d9\uc2e4\uc2b5\uc18c",
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["pIndex"])
-        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
-        sections = payload["schoolInfo"]
-        assert type(sections) is list
-        sections[0]["head"][0]["list_total_count"] = 2
-        row = sections[1]["row"][0]
-        row["SD_SCHUL_CODE"] = f"701000{page}"
-        row["LOAD_DTM"] = dates[page - 1]
+        payload = neis_page_payload(source_types, page=page, page_size=10)
+        section = payload["schoolInfo"]
+        rows = section[1]["row"]  # type: ignore[index]
+        for index, row in enumerate(rows):
+            row["LOAD_DTM"] = (
+                "20260809"
+                if (page - 1) * 10 + index == len(source_types) - 1
+                else "20260810"
+            )
         return httpx.Response(200, json=payload)
 
     async with httpx.AsyncClient(
@@ -1625,62 +3999,17 @@ async def test_neis_fetch_accepts_raw_observation_span_of_90_days() -> None:
         result = await NeisSource(
             api_key="test-key",
             client=client,
-            page_size=1,
+            unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            page_size=10,
         ).fetch()
 
-    assert result.provenance.source_observation_date_counts == (
-        ("2026-04-01", 1),
-        ("2026-06-30", 1),
-    )
-
-
-@pytest.mark.asyncio
-async def test_neis_fetch_rejects_raw_observation_span_over_90_days() -> None:
-    dates = ("20260401", "20260701")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        page = int(request.url.params["pIndex"])
-        payload = neis_payload(source_type="\ucd08\ub4f1\ud559\uad50")
-        sections = payload["schoolInfo"]
-        assert type(sections) is list
-        sections[0]["head"][0]["list_total_count"] = 2
-        row = sections[1]["row"][0]
-        row["SD_SCHUL_CODE"] = f"701000{page}"
-        row["LOAD_DTM"] = dates[page - 1]
-        return httpx.Response(200, json=payload)
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
-        source = NeisSource(api_key="test-key", client=client, page_size=1)
-        with pytest.raises(SourceDataError, match="observation date span"):
-            await source.fetch()
-
-
-@pytest.mark.asyncio
-async def test_neis_fetch_counts_excluded_rows_in_raw_observation_dates() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        page = int(request.url.params["pIndex"])
-        payload = neis_payload(
-            source_type=("초등학교" if page == 1 else "공동실습소")
-        )
-        section = payload["schoolInfo"]
-        section[0]["head"][0]["list_total_count"] = 2  # type: ignore[index]
-        row = section[1]["row"][0]  # type: ignore[index]
-        row["SD_SCHUL_CODE"] = f"701000{page}"
-        row["LOAD_DTM"] = "20260810" if page == 1 else "20260809"
-        return httpx.Response(200, json=payload)
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
-        source = NeisSource(api_key="test-key", client=client, page_size=1)
-        result = await source.fetch()
-
-    assert [record.source_as_of for record in result.records] == ["2026-08-10"]
+    assert result.provenance.source_as_of is None
     assert result.provenance.source_observation_date_counts == (
         ("2026-08-09", 1),
-        ("2026-08-10", 1),
+        ("2026-08-10", 19),
+    )
+    assert result.provenance.normalized_observation_date_counts == (
+        ("2026-08-10", 19),
     )
 
 
@@ -1705,7 +4034,11 @@ async def test_neis_source_rejects_five_row_sample_success_shape() -> None:
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="sample"):
-            await NeisSource(api_key="test-key", client=client).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     assert len(requests) == 1
 
@@ -1736,7 +4069,12 @@ async def test_neis_source_bounds_declared_total_before_second_request(
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match=message):
-            await NeisSource(api_key="test-key", client=client, page_size=1).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+                page_size=1,
+            ).fetch()
 
     assert len(requests) == 1
 
@@ -1756,7 +4094,11 @@ async def test_neis_source_rejects_oversized_response_before_retention(
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="response size"):
-            await NeisSource(api_key="test-key", client=client).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
 
 @pytest.mark.asyncio
@@ -1780,7 +4122,11 @@ async def test_neis_response_stream_stops_after_byte_limit(
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="response size"):
-            await NeisSource(api_key="test-key", client=client).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+            ).fetch()
 
     assert yielded_chunks < 10
 
@@ -1803,7 +4149,12 @@ async def test_neis_source_rejects_more_rows_than_requested_page_size() -> None:
         transport=httpx.MockTransport(handler)
     ) as client:
         with pytest.raises(SourceDataError, match="page size"):
-            await NeisSource(api_key="test-key", client=client, page_size=1).fetch()
+            await NeisSource(
+                api_key="test-key",
+                client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
+                page_size=1,
+            ).fetch()
 
 
 @pytest.mark.asyncio
@@ -1830,6 +4181,7 @@ async def test_neis_source_bounds_actual_page_counter(
             await NeisSource(
                 api_key="test-key",
                 client=client,
+                unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
                 page_size=1_000,
             ).fetch()
 
@@ -2020,6 +4372,76 @@ async def test_kakao_geocoder_does_not_retain_unbounded_raw_bodies(
     assert not hasattr(kakao, "_raw_responses")
 
 
+@pytest.mark.parametrize(
+    ("left", "right", "matches"),
+    (
+        ("서울특별시 종로구 송월길 48", "서울 종로구 송월길 48", True),
+        ("서울시  종로구  송월길 48", "서울 종로구 송월길 48", True),
+        ("서울 종로구 송월길 48", "서울특별시 종로구 송월길 48", True),
+        ("서울특별시 종로구 송월길 48", "서울 종로구 송월길 49", False),
+        ("서울특별시 종로구 송월길 48", "서울 중구 송월길 48", False),
+        ("경기도 가평군 교육원로 1", "서울 가평군 교육원로 1", False),
+        (
+            "기관 서울특별시 종로구 송월길 48",
+            "기관 서울 종로구 송월길 48",
+            False,
+        ),
+    ),
+)
+def test_kakao_road_address_canonicalization_is_limited_to_seoul_prefix(
+    left: str,
+    right: str,
+    matches: bool,
+) -> None:
+    assert (
+        kakao_module._canonicalize_road_address(left)
+        == kakao_module._canonicalize_road_address(right)
+    ) is matches
+
+
+@pytest.mark.asyncio
+async def test_kakao_geocoder_accepts_one_seoul_prefix_alias_without_fallback() -> (
+    None
+):
+    requested = "서울특별시  종로구 송월길 48"
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.url.params["query"] == requested
+        return httpx.Response(
+            200,
+            json={
+                "documents": [
+                    {
+                        "x": "126.9680",
+                        "y": "37.5710",
+                        "road_address": {
+                            "address_name": "서울 종로구 송월길 48"
+                        },
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as http:
+        client = KakaoLocalClient(api_key="test-key", client=http)
+        result = await client.geocode(requested)
+        provenance = client.provenance()
+
+    assert result == GeocodeResult(
+        road_address="서울특별시 종로구 송월길 48",
+        latitude=37.571,
+        longitude=126.968,
+        confidence="EXACT_ROAD_ADDRESS",
+    )
+    assert len(seen) == 1
+    assert provenance.fetched_row_count == 1
+    assert provenance.matched_row_count == 1
+
+
 @pytest.mark.asyncio
 async def test_kakao_geocode_accepts_one_exact_road_address_and_redacts_key() -> None:
     secret = "never-show-kakao-key"
@@ -2058,59 +4480,6 @@ async def test_kakao_geocode_accepts_one_exact_road_address_and_redacts_key() ->
 
     with pytest.raises(SourceDataError, match="KAKAO_REST_API_KEY"):
         KakaoLocalClient(api_key="", client=httpx.AsyncClient())
-
-
-# Production break caught: Kakao canonicalizes the official Seoul prefix from
-# "서울특별시" to "서울" for otherwise identical road addresses. Treating this
-# public administrative alias as a mismatch left almost every missing coordinate
-# unresolved and kept the production snapshot below its 98 percent quality gate.
-@pytest.mark.asyncio
-async def test_kakao_geocode_accepts_canonical_seoul_region_alias() -> None:
-    requested = "서울특별시 중구 검증로 1"
-    returned = "서울 중구 검증로 1"
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "documents": [
-                    {
-                        "x": "126.97",
-                        "y": "37.56",
-                        "road_address": {"address_name": returned},
-                    }
-                ]
-            },
-        )
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
-        kakao = KakaoLocalClient(api_key="test-key", client=client)
-        result = await kakao.geocode(requested)
-
-    assert result is not None
-    assert result.road_address == requested
-    assert result.confidence == "EXACT_ROAD_ADDRESS"
-
-
-def test_candidate_accepts_kakao_canonical_seoul_region_alias(
-    tmp_path: Path,
-) -> None:
-    record = source_record(road_address="서울 중구 검증로 1")
-
-    candidate = build_test_candidate(
-        records=(record,),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="seoul-region-alias",
-    )
-    site = json.loads(
-        (candidate.candidate_path / "sites.jsonl").read_text(encoding="utf-8")
-    )
-
-    assert site["status"] == "ACTIVE"
-    assert candidate.issues == ()
 
 
 @pytest.mark.asyncio
@@ -2156,6 +4525,7 @@ def test_candidate_requires_seoul_coverage_service(tmp_path: Path) -> None:
             previous=None,
             output_root=tmp_path,
             snapshot_id="missing-coverage",
+            school_count_reconciliation={},
         )
 
 
@@ -2167,6 +4537,7 @@ def test_candidate_requires_explicit_source_provenance(tmp_path: Path) -> None:
             output_root=tmp_path,
             snapshot_id="missing-provenance",
             coverage=TEST_COVERAGE,
+            school_count_reconciliation={},
         )
 
 
@@ -2189,12 +4560,14 @@ def test_candidate_rejects_cross_source_ids_and_unknown_enums(
     invalid = SourceInstitutionRecord(**{**original.__dict__, **updates})
 
     with pytest.raises(SnapshotQualityError, match=message):
-        build_test_candidate(
+        build_candidate_snapshot(
             records=(invalid,),
             previous=None,
             output_root=tmp_path,
             snapshot_id="invalid-source-contract",
             coverage=TEST_COVERAGE,
+            source_provenance=source_provenance_for((invalid,)),
+            school_count_reconciliation=reviewed_reconciliation_contract(),
         )
 
 
@@ -2213,22 +4586,33 @@ def test_source_record_persists_official_branch_as_second_site(
     record = SourceInstitutionRecord(
         **{**source_record().__dict__, "additional_sites": (branch,)}
     )
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
         snapshot_id="official-branch",
         coverage=TEST_COVERAGE,
     )
-    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
-    assert len(verified.institutions) == 1
-    assert {site.site_id for site in verified.sites} == {
+    official_institutions = tuple(
+        institution
+        for institution in verified.institutions
+        if institution.institution_type != "UNCLASSIFIED_SCHOOL"
+    )
+    official_sites = tuple(
+        site
+        for site in verified.sites
+        if site.institution_id == "neis:B10:7010001"
+    )
+
+    assert len(official_institutions) == 1
+    assert {site.site_id for site in official_sites} == {
         "neis:B10:7010001:main",
         "neis:B10:7010001:gayang",
     }
-    assert sum(site.is_default for site in verified.sites) == 1
+    assert sum(site.is_default for site in official_sites) == 1
 
 
 def test_missing_coordinate_branch_is_persisted_for_review(
@@ -2246,14 +4630,14 @@ def test_missing_coordinate_branch_is_persisted_for_review(
     record = SourceInstitutionRecord(
         **{**source_record().__dict__, "additional_sites": (branch,)}
     )
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
         snapshot_id="missing-branch",
         coverage=TEST_COVERAGE,
     )
-    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
     branch_site = next(
@@ -2267,41 +4651,32 @@ def test_missing_coordinate_branch_is_persisted_for_review(
 def test_manifest_persists_cross_source_possible_match_pairs(
     tmp_path: Path,
 ) -> None:
-    neis = source_record()
-    kindergarten = SourceInstitutionRecord(
-        **{
-            **neis.__dict__,
-            "institution_id": "kinder:K12345678",
-            "institution_type": "KINDERGARTEN",
-            "source": "KINDERGARTEN_INFO",
-            "source_region_code": "11",
-            "source_as_of": "2026-04-01",
-        }
-    )
-    candidate = build_test_candidate(
-        records=(neis, kindergarten),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="possible-pair",
-        coverage=TEST_COVERAGE,
+        include_reviewed_sen=True,
+        cross_source_match=True,
     )
-    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
-    assert {item.institution_id for item in verified.institutions} == {
-        "neis:B10:7010001",
-        "kinder:K12345678",
+    assert {
+        item.institution_id
+        for item in verified.institutions
+    } >= {
+        "neis:B10:0000707",
+        "sen:headquarters",
     }
-    assert verified.manifest.possible_match_count == 1
-    assert verified.manifest.possible_matches[0].institution_ids == (
-        "kinder:K12345678",
-        "neis:B10:7010001",
-    )
+    assert (
+        "neis:B10:0000707",
+        "sen:headquarters",
+    ) in {match.institution_ids for match in verified.manifest.possible_matches}
 
 
-# Production break caught: rejecting record-level source vintages that are all bound
-# by the raw-source observation histogram.
-def test_candidate_persists_mixed_source_observation_dates(tmp_path: Path) -> None:
+def test_candidate_rejects_mixed_row_dates_with_single_date_provenance_before_writing(
+    tmp_path: Path,
+) -> None:
     first = source_record(institution_id="neis:B10:7010001")
     second = SourceInstitutionRecord(
         **{
@@ -2309,140 +4684,26 @@ def test_candidate_persists_mixed_source_observation_dates(tmp_path: Path) -> No
             "source_as_of": "2026-08-09",
         }
     )
-    records = (first, second)
 
-    candidate = build_test_candidate(
-        records=records,
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="mixed-source-dates",
-        coverage=TEST_COVERAGE,
-    )
-    manifest = json.loads(
-        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
+    records = with_neis_quarantine((first, second))
+    provenance = replace(
+        source_provenance_for(records)["NEIS"],
+        source_as_of="2026-08-10",
+        source_observation_date_counts=(("2026-08-10", 20),),
+        normalized_observation_date_counts=(("2026-08-10", 20),),
     )
 
-    assert manifest["sources"][0]["sourceObservationDateCounts"] == {
-        "2026-08-09": 1,
-        "2026-08-10": 1,
-    }
-    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
-    assert {row.source_as_of for row in verify_snapshot(tmp_path).institutions} == {
-        "2026-08-09",
-        "2026-08-10",
-    }
-
-
-# Production break caught: writing a candidate whose institution vintage does not
-# occur in the supplied raw-source observation histogram.
-def test_candidate_rejects_unobserved_source_date_before_writing(
-    tmp_path: Path,
-) -> None:
-    records = (
-        source_record(institution_id="neis:B10:7010001"),
-        replace(
-            source_record(institution_id="neis:B10:7010002"),
-            source_as_of="2026-08-09",
-        ),
-    )
-    valid = source_provenance_for(records)["NEIS"]
-    invalid = replace(
-        valid,
-        source_observation_date_counts=(
-            ("2026-08-08", 1),
-            ("2026-08-10", 1),
-        ),
-    )
-
-    with pytest.raises(SnapshotQualityError, match="source provenance"):
-        build_test_candidate(
+    with pytest.raises(SnapshotQualityError, match="attestation|observation dates"):
+        build_candidate_snapshot(
             records=records,
             previous=None,
             output_root=tmp_path,
-            snapshot_id="unobserved-source-date",
+            snapshot_id="mixed-source-dates",
             coverage=TEST_COVERAGE,
-            source_provenance={"NEIS": invalid},
+            source_provenance={"NEIS": provenance},
+            school_count_reconciliation=reviewed_reconciliation_contract(),
         )
-    assert not (tmp_path / ".unobserved-source-date.candidate").exists()
-
-
-# Production break caught: deriving snapshotAsOf only from selectable institutions
-# when a later reviewed source observation belongs to a filtered raw row.
-def test_candidate_snapshot_as_of_includes_latest_raw_observation(
-    tmp_path: Path,
-) -> None:
-    record = replace(source_record(), source_as_of="2026-04-23")
-    provenance = replace(
-        source_provenance_for((record,))["NEIS"],
-        fetched_row_count=2,
-        source_as_of="2026-06-07",
-        source_observation_date_counts=(
-            ("2026-04-23", 1),
-            ("2026-06-07", 1),
-        ),
-    )
-
-    candidate = build_test_candidate(
-        records=(record,),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="latest-raw-observation",
-        coverage=TEST_COVERAGE,
-        source_provenance={"NEIS": provenance},
-    )
-    manifest = json.loads(
-        (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
-    )
-
-    assert manifest["snapshotAsOf"] == "2026-06-07"
-    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
-
-
-# Production break caught: retaining an older preserved institution date instead of
-# advancing it to the latest observation in the current raw-source histogram.
-def test_missing_institution_uses_current_observation_histogram_maximum(
-    tmp_path: Path,
-) -> None:
-    initial_records = (
-        source_record(institution_id="neis:B10:7010001"),
-        source_record(institution_id="neis:B10:7010002"),
-    )
-    initial = build_test_candidate(
-        records=initial_records,
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="histogram-before-missing",
-        coverage=TEST_COVERAGE,
-    )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
-    current = replace(initial_records[0], source_as_of="2026-04-23")
-    provenance = replace(
-        source_provenance_for((current,))["NEIS"],
-        fetched_row_count=2,
-        source_as_of="2026-06-07",
-        source_observation_date_counts=(
-            ("2026-04-23", 1),
-            ("2026-06-07", 1),
-        ),
-    )
-
-    candidate = build_test_candidate(
-        records=(current,),
-        previous=verify_snapshot(tmp_path),
-        output_root=tmp_path,
-        snapshot_id="histogram-after-missing",
-        coverage=TEST_COVERAGE,
-        source_provenance={"NEIS": provenance},
-    )
-    rows = [
-        json.loads(line)
-        for line in (candidate.candidate_path / "institutions.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-    ]
-
-    preserved = next(row for row in rows if row["status"] == "MISSING_FROM_SOURCE")
-    assert preserved["sourceAsOf"] == "2026-06-07"
+    assert not (tmp_path / ".mixed-source-dates.candidate").exists()
 
 
 # Production break caught: replacing an approved pointer after a source loses 40%
@@ -2467,16 +4728,16 @@ def test_failed_candidate_does_not_replace_current_snapshot(tmp_path: Path) -> N
         )
         for index in range(10)
     )
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=records,
         previous=None,
         output_root=root,
         snapshot_id="initial",
         coverage=TEST_COVERAGE,
     )
-    approve_test_candidate(initial, root, coverage=TEST_COVERAGE)
+    promote_snapshot(initial, root, coverage=TEST_COVERAGE)
     before = (root / "current.json").read_bytes()
-    result = build_test_candidate(
+    result = build_explicit_test_fixture_candidate(
         records=records[:6],
         previous=verify_snapshot(root),
         output_root=root,
@@ -2487,7 +4748,7 @@ def test_failed_candidate_does_not_replace_current_snapshot(tmp_path: Path) -> N
     assert result.approved is False
     forged_result = replace(result, issues=())
     with pytest.raises(SnapshotQualityError, match="record count drop"):
-        approve_test_candidate(forged_result, root, coverage=TEST_COVERAGE)
+        promote_snapshot(forged_result, root, coverage=TEST_COVERAGE)
     assert (root / "current.json").read_bytes() == before
 
 
@@ -2509,16 +4770,16 @@ def test_existing_current_cannot_be_replaced_when_previous_is_omitted(
         )
         for index in range(10)
     )
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=records,
         previous=None,
         output_root=tmp_path,
         snapshot_id="existing-current",
         coverage=TEST_COVERAGE,
     )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
     before = (tmp_path / "current.json").read_bytes()
-    omitted = build_test_candidate(
+    omitted = build_explicit_test_fixture_candidate(
         records=records[:1],
         previous=None,
         output_root=tmp_path,
@@ -2527,7 +4788,7 @@ def test_existing_current_cannot_be_replaced_when_previous_is_omitted(
     )
 
     with pytest.raises(SnapshotQualityError, match="previous snapshot"):
-        approve_test_candidate(omitted, tmp_path, coverage=TEST_COVERAGE)
+        promote_snapshot(omitted, tmp_path, coverage=TEST_COVERAGE)
     assert (tmp_path / "current.json").read_bytes() == before
 
 
@@ -2550,14 +4811,14 @@ def test_coordinate_gate_uses_only_current_rows_and_stale_sites_are_inactive(
         )
         for index in range(100)
     )
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=records,
         previous=None,
         output_root=root,
         snapshot_id="full",
         coverage=TEST_COVERAGE,
     )
-    approve_test_candidate(initial, root, coverage=TEST_COVERAGE)
+    promote_snapshot(initial, root, coverage=TEST_COVERAGE)
     current = list(records[:90])
     for index in (88, 89):
         current[index] = SourceInstitutionRecord(
@@ -2569,7 +4830,7 @@ def test_coordinate_gate_uses_only_current_rows_and_stale_sites_are_inactive(
             }
         )
 
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=tuple(current),
         previous=verify_snapshot(root),
         output_root=root,
@@ -2587,7 +4848,8 @@ def test_coordinate_gate_uses_only_current_rows_and_stale_sites_are_inactive(
     stale_sites = [
         row
         for row in site_rows
-        if int(row["institutionId"].rsplit(":", 1)[-1]) >= 90
+        if row["institutionId"].rsplit(":", 1)[-1].isdigit()
+        and int(row["institutionId"].rsplit(":", 1)[-1]) >= 90
     ]
     assert stale_sites
     assert {row["status"] for row in stale_sites} == {"MISSING_FROM_SOURCE"}
@@ -2600,7 +4862,7 @@ def test_preserved_enriched_site_does_not_require_current_enrichment_match(
         source_record(),
         coordinate_quality="OFFICIAL_STANDARD_COORDINATE",
     )
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=(enriched,),
         previous=None,
         output_root=tmp_path,
@@ -2610,9 +4872,9 @@ def test_preserved_enriched_site_does_not_require_current_enrichment_match(
             standard_enrichment_provenance(matched_row_count=1),
         ),
     )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
     replacement = source_record(institution_id="neis:B10:7010002")
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(replacement,),
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
@@ -2620,7 +4882,7 @@ def test_preserved_enriched_site_does_not_require_current_enrichment_match(
         coverage=TEST_COVERAGE,
     )
 
-    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
     old = next(
@@ -2646,15 +4908,15 @@ def test_missing_official_branch_is_preserved_when_parent_remains(
         coordinate_quality="MANUALLY_VERIFIED",
     )
     with_branch = replace(source_record(), additional_sites=(branch,))
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=(with_branch,),
         previous=None,
         output_root=tmp_path,
         snapshot_id="branch-before-missing",
         coverage=TEST_COVERAGE,
     )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
-    candidate = build_test_candidate(
+    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
@@ -2662,7 +4924,7 @@ def test_missing_official_branch_is_preserved_when_parent_remains(
         coverage=TEST_COVERAGE,
     )
 
-    approve_test_candidate(candidate, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
     old_branch = next(
@@ -2675,70 +4937,74 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="concurrent-base",
         coverage=TEST_COVERAGE,
     )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
     previous = verify_snapshot(tmp_path)
-    first = build_test_candidate(
+    first = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=previous,
         output_root=tmp_path,
         snapshot_id="concurrent-first",
         coverage=TEST_COVERAGE,
     )
-    second = build_test_candidate(
+    second = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=previous,
         output_root=tmp_path,
         snapshot_id="concurrent-second",
         coverage=TEST_COVERAGE,
     )
-    first_digest = review_test_candidate(first, tmp_path)
-    second_digest = review_test_candidate(second, tmp_path)
-    real_quality = sync_module._recheck_promotion_quality
+    first_packet = sync_module.build_candidate_review_packet(
+        snapshot_id=first.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    second_packet = sync_module.build_candidate_review_packet(
+        snapshot_id=second.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    real_packet_builder = sync_module.build_candidate_review_packet
     first_entered = threading.Event()
     release_first = threading.Event()
     second_entered = threading.Event()
-    call_lock = threading.Lock()
-    call_count = 0
 
-    def controlled_quality(*args, **kwargs):  # type: ignore[no-untyped-def]
-        nonlocal call_count
-        with call_lock:
-            call_count += 1
-            call_number = call_count
-        if call_number == 1:
+    def controlled_packet_builder(*args, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs["snapshot_id"] == first.snapshot_id:
             first_entered.set()
             assert release_first.wait(timeout=2)
         else:
             second_entered.set()
-        return real_quality(*args, **kwargs)
+        return real_packet_builder(*args, **kwargs)
 
     monkeypatch.setattr(
         sync_module,
-        "_recheck_promotion_quality",
-        controlled_quality,
+        "build_candidate_review_packet",
+        controlled_packet_builder,
     )
     with ThreadPoolExecutor(max_workers=2) as executor:
         first_future = executor.submit(
-            approve_test_candidate,
-            first,
-            tmp_path,
+            sync_module.approve_candidate_snapshot,
+            snapshot_id=first.snapshot_id,
+            review_digest=first_packet["reviewDigest"],
+            reviewer_role="TEST_FIXTURE_REVIEWER",
+            snapshot_root=tmp_path,
             coverage=TEST_COVERAGE,
-            review_digest=first_digest,
         )
         assert first_entered.wait(timeout=2)
         second_future = executor.submit(
-            approve_test_candidate,
-            second,
-            tmp_path,
+            sync_module.approve_candidate_snapshot,
+            snapshot_id=second.snapshot_id,
+            review_digest=second_packet["reviewDigest"],
+            reviewer_role="TEST_FIXTURE_REVIEWER",
+            snapshot_root=tmp_path,
             coverage=TEST_COVERAGE,
-            review_digest=second_digest,
         )
         assert not second_entered.wait(timeout=0.2)
         release_first.set()
@@ -2754,20 +5020,20 @@ def test_concurrent_promotions_from_same_previous_are_serialized(
 
 
 def test_manifest_counts_changed_institution_records(tmp_path: Path) -> None:
-    initial = build_test_candidate(
+    initial = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="before-change",
         coverage=TEST_COVERAGE,
     )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
+    promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
     original = source_record()
     changed = SourceInstitutionRecord(
         **{**original.__dict__, "official_name": "Changed Official Name"}
     )
 
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(changed,),
         previous=verify_snapshot(tmp_path),
         output_root=tmp_path,
@@ -2787,7 +5053,7 @@ def test_address_region_mismatch_is_quarantined(tmp_path: Path) -> None:
         road_address="\ubd80\uc0b0\uad11\uc5ed\uc2dc \uc911\uad6c \uac80\uc99d\ub85c 1",
     )
 
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -2816,7 +5082,7 @@ def test_coordinate_outside_seoul_is_quarantined(tmp_path: Path) -> None:
         }
     )
 
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -2831,28 +5097,16 @@ def test_coordinate_outside_seoul_is_quarantined(tmp_path: Path) -> None:
     assert any("coordinate validation" in issue for issue in candidate.issues)
     forged_candidate = replace(candidate, issues=())
     with pytest.raises(SnapshotQualityError, match="coordinate validation"):
-        approve_test_candidate(forged_candidate, tmp_path, coverage=TEST_COVERAGE)
+        promote_snapshot(forged_candidate, tmp_path, coverage=TEST_COVERAGE)
 
 
 def test_namesake_across_sources_is_not_merged(tmp_path: Path) -> None:
-    first = source_record(institution_id="neis:B10:7010001")
-    second = SourceInstitutionRecord(
-        **{
-            **first.__dict__,
-            "institution_id": "kinder:verified-kindergarten",
-            "institution_type": "KINDERGARTEN",
-            "source": "KINDERGARTEN_INFO",
-            "source_region_code": "11",
-            "source_as_of": "2026-04-01",
-        }
-    )
-
-    candidate = build_test_candidate(
-        records=(first, second),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="possible-match",
-        coverage=TEST_COVERAGE,
+        include_reviewed_sen=True,
+        cross_source_match=True,
     )
     rows = (candidate.candidate_path / "institutions.jsonl").read_text(
         encoding="utf-8"
@@ -2861,787 +5115,74 @@ def test_namesake_across_sources_is_not_merged(tmp_path: Path) -> None:
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
 
-    assert len(rows) == 2
-    assert manifest["possibleMatchCount"] == 1
+    institution_ids = {json.loads(row)["institutionId"] for row in rows}
+    assert {"neis:B10:0000707", "sen:headquarters"} <= institution_ids
+    assert (
+        "neis:B10:0000707",
+        "sen:headquarters",
+    ) in {
+        tuple(match["institutionIds"])
+        for match in manifest["possibleMatches"]
+    }
 
 
 def test_promotion_rechecks_hash_before_pointer_change(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="tampered",
-        coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     (candidate.candidate_path / "institutions.jsonl").write_text(
         "tampered\n", encoding="utf-8"
     )
 
     with pytest.raises(SnapshotQualityError, match="hash mismatch"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
-
-
-@pytest.mark.parametrize(
-    "review_digest",
-    ["", "A" * 64, "0" * 63, "0" * 65, True, 1],
-)
-def test_approval_requires_exact_lowercase_review_digest(
-    tmp_path: Path,
-    review_digest: object,
-) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="digest-contract",
-        coverage=TEST_COVERAGE,
-    )
-    with pytest.raises(SnapshotQualityError, match="review digest"):
-        approve_candidate_snapshot(
-            snapshot_id=candidate.snapshot_id,
-            review_digest=cast(str, review_digest),
-            reviewer_role="data-steward",
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-    assert not (tmp_path / "current.json").exists()
-
-
-def test_approval_requires_data_steward_role(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="role-contract",
-        coverage=TEST_COVERAGE,
-    )
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-    with pytest.raises(SnapshotQualityError, match="reviewer role"):
-        approve_candidate_snapshot(
-            snapshot_id=candidate.snapshot_id,
-            review_digest=cast(str, packet["reviewDigest"]),
-            reviewer_role="developer",
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-
-
-def test_approval_rechecks_review_digest_before_pointer_mutation(
-    tmp_path: Path,
-) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="digest-recheck",
-        coverage=TEST_COVERAGE,
-    )
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-    manifest_path = candidate.candidate_path / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["countsByType"] = {"ELEMENTARY_SCHOOL": 2}
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-
-    with pytest.raises(SnapshotQualityError, match="attestation|manifest|digest"):
-        approve_candidate_snapshot(
-            snapshot_id=candidate.snapshot_id,
-            review_digest=cast(str, packet["reviewDigest"]),
-            reviewer_role="data-steward",
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-    assert not (tmp_path / "current.json").exists()
-
-
-def test_reviewed_approval_writes_verified_current_snapshot(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="reviewed-approval",
-        coverage=TEST_COVERAGE,
-    )
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-    digest = approve_candidate_snapshot(
-        snapshot_id=candidate.snapshot_id,
-        review_digest=cast(str, packet["reviewDigest"]),
-        reviewer_role="data-steward",
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-
-    verified = verify_snapshot(tmp_path)
-    assert digest == packet["reviewDigest"]
-    assert verified.manifest.snapshot_id == candidate.snapshot_id
-    assert verified.manifest.approved is True
-    assert verified.manifest.approved_by_role == "data-steward"
-
-
-def test_candidate_review_leaves_existing_current_pointer_unchanged(
-    tmp_path: Path,
-) -> None:
-    initial = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="initial-current",
-        coverage=TEST_COVERAGE,
-    )
-    approve_test_candidate(initial, tmp_path)
-    before = (tmp_path / "current.json").read_bytes()
-    second = build_test_candidate(
-        records=(source_record(),),
-        previous=verify_snapshot(tmp_path),
-        output_root=tmp_path,
-        snapshot_id="next-candidate",
-        coverage=TEST_COVERAGE,
-    )
-
-    packet = build_candidate_review_packet(
-        snapshot_id=second.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-
-    assert packet["previousSnapshotId"] == "initial-current"
-    assert (tmp_path / "current.json").read_bytes() == before
-
-
-def test_reviewed_approval_retry_is_idempotent(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="reviewed-retry",
-        coverage=TEST_COVERAGE,
-    )
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-    kwargs = {
-        "snapshot_id": candidate.snapshot_id,
-        "review_digest": packet["reviewDigest"],
-        "reviewer_role": "data-steward",
-        "snapshot_root": tmp_path,
-        "coverage": TEST_COVERAGE,
-    }
-    approve_candidate_snapshot(**kwargs)
-    first_pointer = (tmp_path / "current.json").read_bytes()
-    approve_candidate_snapshot(**kwargs)
-    assert (tmp_path / "current.json").read_bytes() == first_pointer
-
-
-def test_review_packet_is_deterministic_and_contains_audit_categories(
-    tmp_path: Path,
-) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="review-packet",
-        coverage=TEST_COVERAGE,
-    )
-
-    first = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-    second = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-
-    assert first == second
-    assert set(first) == {
-        "status",
-        "snapshotId",
-        "createdAt",
-        "snapshotAsOf",
-        "previousSnapshotId",
-        "sourceCounts",
-        "sourceObservationDateRanges",
-        "institutionTypeCounts",
-        "foundationCounts",
-        "districtCounts",
-        "statusCounts",
-        "coordinateQualityCounts",
-        "quarantinedInstitutionIds",
-        "quarantinedSiteIds",
-        "diff",
-        "siteOnlyDiff",
-        "institutionsSha256",
-        "sitesSha256",
-        "candidateManifestSha256",
-        "sourceProvenanceSha256",
-        "enrichmentProvenanceSha256",
-        "reviewDigest",
-    }
-    assert first["status"] == "CANDIDATE_REVIEW_REQUIRED"
-    assert first["snapshotId"] == candidate.snapshot_id
-    assert first["districtCounts"] == {
-        "강남구": 0,
-        "강동구": 0,
-        "강북구": 0,
-        "강서구": 0,
-        "관악구": 0,
-        "광진구": 0,
-        "구로구": 0,
-        "금천구": 0,
-        "노원구": 0,
-        "도봉구": 0,
-        "동대문구": 0,
-        "동작구": 0,
-        "마포구": 0,
-        "서대문구": 0,
-        "서초구": 0,
-        "성동구": 0,
-        "성북구": 0,
-        "송파구": 0,
-        "양천구": 0,
-        "영등포구": 0,
-        "용산구": 0,
-        "은평구": 0,
-        "종로구": 0,
-        "중구": 1,
-        "중랑구": 0,
-    }
-    assert re.fullmatch(r"[0-9a-f]{64}", cast(str, first["reviewDigest"]))
-    without_digest = {
-        key: value for key, value in first.items() if key != "reviewDigest"
-    }
-    assert (
-        first["reviewDigest"]
-        == hashlib.sha256(
-            json.dumps(
-                without_digest,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-    )
-    assert not (tmp_path / "current.json").exists()
-
-
-# Production break caught: omitting or misrepresenting the bounded raw-source
-# observation dates that a data steward must review before approving a snapshot.
-def test_review_packet_binds_sorted_source_observation_date_ranges(
-    tmp_path: Path,
-) -> None:
-    records = (
-        replace(
-            source_record(),
-            official_name="비공개검토학교",
-            source_as_of="2026-04-23",
-        ),
-        replace(
-            source_record(institution_id="neis:B10:7010002"),
-            source_as_of="2026-06-07",
-        ),
-    )
-    provenance = replace(
-        source_provenance_for(records)["NEIS"],
-        fetched_row_count=3,
-        source_as_of="2026-06-07",
-        source_observation_date_counts=(
-            ("2026-04-23", 1),
-            ("2026-06-07", 2),
-        ),
-    )
-    candidate = build_test_candidate(
-        records=records,
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="review-date-ranges",
-        coverage=TEST_COVERAGE,
-        source_provenance={"NEIS": provenance},
-    )
-
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-
-    assert packet["sourceObservationDateRanges"]["NEIS"] == {
-        "earliest": "2026-04-23",
-        "latest": "2026-06-07",
-        "spanDays": 45,
-        "rawRowCounts": {"2026-04-23": 1, "2026-06-07": 2},
-    }
-    assert "비공개검토학교" not in json.dumps(packet, ensure_ascii=False)
-
-
-# Production break caught: approving a candidate with a digest reviewed against
-# a different but otherwise valid raw-source observation-date histogram.
-def test_approval_rejects_digest_for_changed_source_observation_histogram(
-    tmp_path: Path,
-) -> None:
-    records = (
-        replace(source_record(), source_as_of="2026-04-23"),
-        replace(
-            source_record(institution_id="neis:B10:7010002"),
-            source_as_of="2026-06-07",
-        ),
-    )
-    original_provenance = replace(
-        source_provenance_for(records)["NEIS"],
-        fetched_row_count=3,
-        source_as_of="2026-06-07",
-        source_observation_date_counts=(
-            ("2026-04-23", 1),
-            ("2026-06-07", 2),
-        ),
-    )
-    changed_provenance = replace(
-        original_provenance,
-        source_observation_date_counts=(
-            ("2026-04-23", 2),
-            ("2026-06-07", 1),
-        ),
-    )
-    original_root = tmp_path / "original"
-    changed_root = tmp_path / "changed"
-    original = build_test_candidate(
-        records=records,
-        previous=None,
-        output_root=original_root,
-        snapshot_id="date-histogram-digest",
-        coverage=TEST_COVERAGE,
-        source_provenance={"NEIS": original_provenance},
-    )
-    changed = build_test_candidate(
-        records=records,
-        previous=None,
-        output_root=changed_root,
-        snapshot_id="date-histogram-digest",
-        coverage=TEST_COVERAGE,
-        source_provenance={"NEIS": changed_provenance},
-    )
-    original_packet = build_candidate_review_packet(
-        snapshot_id=original.snapshot_id,
-        snapshot_root=original_root,
-        coverage=TEST_COVERAGE,
-    )
-    changed_packet = build_candidate_review_packet(
-        snapshot_id=changed.snapshot_id,
-        snapshot_root=changed_root,
-        coverage=TEST_COVERAGE,
-    )
-
-    assert changed_packet["sourceObservationDateRanges"]["NEIS"]["rawRowCounts"] == {
-        "2026-04-23": 2,
-        "2026-06-07": 1,
-    }
-    assert original_packet["reviewDigest"] != changed_packet["reviewDigest"]
-    with pytest.raises(SnapshotQualityError, match="review digest"):
-        approve_candidate_snapshot(
-            snapshot_id=changed.snapshot_id,
-            review_digest=cast(str, original_packet["reviewDigest"]),
-            reviewer_role="data-steward",
-            snapshot_root=changed_root,
-            coverage=TEST_COVERAGE,
-        )
-    assert not (changed_root / "current.json").exists()
-
-
-def test_administrator_snapshot_guidance_names_source_date_range_review() -> None:
-    guide = Path("apps/travel-map/README.md").read_text(encoding="utf-8")
-
-    assert (
-        "each source's earliest/latest date, span, and raw-row counts"
-        in " ".join(guide.split())
-    )
-
-
-def test_review_packet_excludes_sensitive_source_values(tmp_path: Path) -> None:
-    sensitive = replace(
-        source_record(road_address="서울특별시 중구 비공개로 987"),
-        official_name="비공개검토학교",
-    )
-    candidate = build_test_candidate(
-        records=(sensitive,),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="private-review",
-        coverage=TEST_COVERAGE,
-    )
-
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-    serialized = json.dumps(packet, ensure_ascii=False, sort_keys=True)
-
-    for forbidden in (
-        sensitive.official_name,
-        sensitive.road_address,
-        str(sensitive.latitude),
-        str(sensitive.longitude),
-        "Authorization",
-        "rawResponse",
-        "KAKAO_REST_API_KEY",
-    ):
-        assert forbidden not in serialized
-
-
-@pytest.mark.parametrize("invalid_site", ["main", "branch"])
-def test_candidate_rejects_non_seoul_district_before_writing_review_data(
-    tmp_path: Path,
-    invalid_site: str,
-) -> None:
-    sensitive_name = "비공개검토학교"
-    record = replace(
-        source_record(
-            road_address=f"서울특별시 {sensitive_name} 검증로 1",
-        ),
-        official_name=sensitive_name,
-        district=sensitive_name if invalid_site == "main" else "중구",
-        additional_sites=(
-            SourceInstitutionSiteRecord(
-                site_code="private-branch",
-                site_name="Private branch",
-                road_address="서울특별시 강서구 양천로 61",
-                district=(
-                    sensitive_name if invalid_site == "branch" else "강서구"
-                ),
-                latitude=37.5701,
-                longitude=126.8412,
-                coordinate_quality="MANUALLY_VERIFIED",
-            ),
-        ),
-    )
-
-    with pytest.raises(SnapshotQualityError, match="district"):
-        build_test_candidate(
-            records=(record,),
-            previous=None,
-            output_root=tmp_path,
-            snapshot_id=f"invalid-{invalid_site}-district",
-            coverage=TEST_COVERAGE,
-        )
-
-    assert not (tmp_path / f".invalid-{invalid_site}-district.candidate").exists()
-    assert not (tmp_path / "current.json").exists()
-
-
-def test_review_rejects_signed_legacy_candidate_with_non_seoul_district(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    initial = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="legacy-district-current",
-        coverage=TEST_COVERAGE,
-    )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
-    previous = verify_snapshot(tmp_path)
-    pointer_before = (tmp_path / "current.json").read_bytes()
-    sensitive_name = "비공개검토학교"
-    legacy_record = replace(
-        source_record(
-            road_address=f"서울특별시 {sensitive_name} 검증로 1",
-        ),
-        official_name=sensitive_name,
-        district=sensitive_name,
-    )
-    with monkeypatch.context() as legacy_context:
-        legacy_context.setattr(
-            sync_module,
-            "_validate_source_districts",
-            lambda _records, _provenance: None,
-        )
-        candidate = build_test_candidate(
-            records=(legacy_record,),
-            previous=previous,
-            output_root=tmp_path,
-            snapshot_id="legacy-private-district",
-            coverage=TEST_COVERAGE,
-        )
-
-    with pytest.raises(SnapshotQualityError, match="district"):
-        build_candidate_review_packet(
-            snapshot_id=candidate.snapshot_id,
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-
-    with pytest.raises(SnapshotQualityError, match="district"):
-        approve_candidate_snapshot(
-            snapshot_id=candidate.snapshot_id,
-            review_digest="0" * 64,
-            reviewer_role="data-steward",
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-
-    assert (tmp_path / "current.json").read_bytes() == pointer_before
-
-
-def test_review_packet_reports_disjoint_site_only_changes(tmp_path: Path) -> None:
-    changed = SourceInstitutionSiteRecord(
-        site_code="changed",
-        site_name="Changed branch",
-        road_address="서울특별시 강서구 양천로 61",
-        district="강서구",
-        latitude=37.5701,
-        longitude=126.8412,
-        coordinate_quality="MANUALLY_VERIFIED",
-    )
-    removed = replace(
-        changed,
-        site_code="removed",
-        site_name="Removed branch",
-    )
-    initial = build_test_candidate(
-        records=(replace(source_record(), additional_sites=(changed, removed)),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="site-only-before",
-        coverage=TEST_COVERAGE,
-    )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
-    added = replace(changed, site_code="added", site_name="Added branch")
-    candidate = build_test_candidate(
-        records=(
-            replace(
-                source_record(),
-                additional_sites=(
-                    replace(changed, road_address="서울특별시 강서구 양천로 62"),
-                    added,
-                ),
-            ),
-        ),
-        previous=verify_snapshot(tmp_path),
-        output_root=tmp_path,
-        snapshot_id="site-only-after",
-        coverage=TEST_COVERAGE,
-    )
-
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-
-    assert cast(dict[str, object], packet["diff"])["changedCount"] == 0
-    assert packet["siteOnlyDiff"] == {
-        "addedSiteIds": ["neis:B10:7010001:added"],
-        "changedSiteIds": ["neis:B10:7010001:changed"],
-        "missingSiteIds": ["neis:B10:7010001:removed"],
-    }
-
-
-def test_review_packet_counts_institution_only_change_once(tmp_path: Path) -> None:
-    initial = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="institution-only-before",
-        coverage=TEST_COVERAGE,
-    )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
-    candidate = build_test_candidate(
-        records=(replace(source_record(), official_name="Changed Official Name"),),
-        previous=verify_snapshot(tmp_path),
-        output_root=tmp_path,
-        snapshot_id="institution-only-after",
-        coverage=TEST_COVERAGE,
-    )
-
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-
-    assert cast(dict[str, object], packet["diff"])["changedCount"] == 1
-    assert packet["siteOnlyDiff"] == {
-        "addedSiteIds": [],
-        "changedSiteIds": [],
-        "missingSiteIds": [],
-    }
-
-
-def test_review_packet_does_not_report_site_change_for_changed_institution(
-    tmp_path: Path,
-) -> None:
-    initial = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="institution-and-site-before",
-        coverage=TEST_COVERAGE,
-    )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
-    candidate = build_test_candidate(
-        records=(
-            replace(
-                source_record(
-                    road_address="서울특별시 중구 검증로 2",
-                ),
-                official_name="Changed Official Name",
-            ),
-        ),
-        previous=verify_snapshot(tmp_path),
-        output_root=tmp_path,
-        snapshot_id="institution-and-site-after",
-        coverage=TEST_COVERAGE,
-    )
-
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    )
-
-    assert cast(dict[str, object], packet["diff"])["changedCount"] == 1
-    assert packet["siteOnlyDiff"] == {
-        "addedSiteIds": [],
-        "changedSiteIds": [],
-        "missingSiteIds": [],
-    }
-
-
-def test_review_rejects_tampered_candidate_before_emitting_packet(
-    tmp_path: Path,
-) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="tampered-review",
-        coverage=TEST_COVERAGE,
-    )
-    (candidate.candidate_path / "sites.jsonl").write_text("{}\n", encoding="utf-8")
-
-    with pytest.raises(SnapshotQualityError, match="hash|candidate"):
-        build_candidate_review_packet(
-            snapshot_id=candidate.snapshot_id,
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-    assert not (tmp_path / "current.json").exists()
-
-
-def test_review_rejects_unsafe_id_symlink_and_quality_issues(tmp_path: Path) -> None:
-    with pytest.raises(SnapshotQualityError, match="snapshot ID"):
-        build_candidate_review_packet(
-            snapshot_id="../unsafe",
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-
-    external = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path / "external",
-        snapshot_id="symlink-review",
-        coverage=TEST_COVERAGE,
-    )
-    target = tmp_path / "target"
-    target.mkdir()
-    (target / ".symlink-review.candidate").symlink_to(
-        external.candidate_path,
-        target_is_directory=True,
-    )
-    with pytest.raises(SnapshotQualityError, match="symlink"):
-        build_candidate_review_packet(
-            snapshot_id="symlink-review",
-            snapshot_root=target,
-            coverage=TEST_COVERAGE,
-        )
-
-    invalid = replace(source_record(), latitude=35.1796, longitude=129.0756)
-    rejected = build_test_candidate(
-        records=(invalid,),
-        previous=None,
-        output_root=tmp_path / "quality",
-        snapshot_id="quality-review",
-        coverage=TEST_COVERAGE,
-    )
-    assert rejected.issues
-    with pytest.raises(SnapshotQualityError, match="coordinate|quality"):
-        build_candidate_review_packet(
-            snapshot_id=rejected.snapshot_id,
-            snapshot_root=tmp_path / "quality",
-            coverage=TEST_COVERAGE,
-        )
 
 
 def test_promotion_replays_coverage_for_persisted_active_site(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="tampered-coverage",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     sites_path = candidate.candidate_path / "sites.jsonl"
-    site = json.loads(sites_path.read_text(encoding="utf-8"))
-    site.update(
-        {
+    _, site_bytes = replace_jsonl_record(
+        sites_path,
+        field="siteId",
+        value="neis:B10:7010001:main",
+        updates={
             "latitude": 35.1796,
             "longitude": 129.0756,
             "routingAnchorLatitude": 35.1796,
             "routingAnchorLongitude": 129.0756,
-        }
+        },
     )
-    site_bytes = (json.dumps(site, ensure_ascii=False) + "\n").encode()
     sites_path.write_bytes(site_bytes)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    resign_candidate(candidate, tmp_path)
 
     with pytest.raises(SnapshotQualityError, match="Seoul coverage"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
 def test_candidate_cannot_self_approve_before_promotion(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="self-approved",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["approved"] = True
@@ -3650,12 +5191,7 @@ def test_candidate_cannot_self_approve_before_promotion(tmp_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="approved=false"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3665,35 +5201,28 @@ def test_promotion_rejects_candidate_from_another_snapshot_root(
     target_root = tmp_path / "target"
     target_root.mkdir()
     external_root = tmp_path / "external"
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=external_root,
         snapshot_id="external-candidate",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, external_root)
 
-    with pytest.raises(SnapshotQualityError, match="candidate path"):
-        approve_test_candidate(
-            candidate,
-            target_root,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+    with pytest.raises(SnapshotQualityError, match="transaction|candidate"):
+        promote_snapshot(candidate, target_root, coverage=TEST_COVERAGE)
     assert candidate.candidate_path.is_dir()
     assert not (target_root / "current.json").exists()
 
 
 def test_promotion_rejects_candidate_symlink(tmp_path: Path) -> None:
-    external = build_test_candidate(
+    external = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path / "external",
         snapshot_id="symlinked",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(external, tmp_path / "external")
     target_root = tmp_path / "target"
     target_root.mkdir()
     candidate_path = target_root / ".symlinked.candidate"
@@ -3706,12 +5235,7 @@ def test_promotion_rejects_candidate_symlink(tmp_path: Path) -> None:
     )
 
     with pytest.raises(SnapshotQualityError, match="symlink"):
-        approve_test_candidate(
-            forged,
-            target_root,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(forged, target_root, coverage=TEST_COVERAGE)
     assert not (target_root / "current.json").exists()
 
 
@@ -3723,38 +5247,31 @@ def test_promotion_rejects_symlinked_candidate_file(
     tmp_path: Path,
     file_name: str,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id=f"symlink-{file_name.split('.')[0]}",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     candidate_file = candidate.candidate_path / file_name
     external_file = tmp_path / f"external-{file_name}"
     candidate_file.rename(external_file)
     candidate_file.symlink_to(external_file)
 
     with pytest.raises(SnapshotQualityError, match="symlink"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
 def test_promotion_revalidates_safe_snapshot_slug(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="safe-slug",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     forged = replace(
         candidate,
         snapshot_id="../escaped-final",
@@ -3762,92 +5279,196 @@ def test_promotion_revalidates_safe_snapshot_slug(tmp_path: Path) -> None:
     )
 
     with pytest.raises(SnapshotQualityError, match="unsafe"):
-        approve_test_candidate(
-            forged,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(forged, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path.parent / "escaped-final").exists()
 
 
 def test_promotion_recounts_candidate_manifest_before_pointer_change(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="bad-count",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["institutionCount"] = 99
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="institutionCount"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        (
+            "sourceObservationDateCounts",
+            {"2026-04-23": 3, "2026-05-17": 1, "2026-06-07": 1},
+        ),
+        (
+            "normalizedObservationDateCounts",
+            {"2026-04-23": 1, "2026-05-17": 1, "2026-06-07": 1},
+        ),
+        ("preservedObservationDateCounts", {"2026-04-23": 1}),
+    ],
+)
+def test_promotion_rejects_tampered_observation_date_count_before_pointer_change(
+    tmp_path: Path,
+    field_name: str,
+    value: dict[str, int],
+) -> None:
+    baseline = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="histogram-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    records = mixed_neis_records()
+    candidate = build_explicit_test_fixture_candidate(
+        records=records,
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id=f"tampered-{field_name}",
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sources"][0][field_name] = value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
+# Production break caught: accepting a persisted row date that differs from the
+# signed normalized histogram during the final promotion recheck.
+def test_promotion_rejects_tampered_observation_date_before_pointer_change(
+    tmp_path: Path,
+) -> None:
+    baseline = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="date-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_explicit_test_fixture_candidate(
+        records=mixed_neis_records(),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="tampered-row-date",
+    )
+    institutions_path = candidate.candidate_path / "institutions.jsonl"
+    lines = institutions_path.read_text(encoding="utf-8").splitlines()
+    first = json.loads(lines[0])
+    first["sourceAsOf"] = "2026-04-24"
+    lines[0] = json.dumps(first, ensure_ascii=False, separators=(",", ":"))
+    institution_bytes = ("\n".join(lines) + "\n").encode("utf-8")
+    institutions_path.write_bytes(institution_bytes)
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(SnapshotQualityError, match="attestation|observation dates"):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
+
+
+# Production break caught: accepting equivalent histogram keys in a noncanonical
+# order after raw JSON tampering.
+def test_promotion_rejects_unsorted_observation_date_keys_before_pointer_change(
+    tmp_path: Path,
+) -> None:
+    baseline = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="order-baseline",
+    )
+    promote_snapshot(baseline, tmp_path, coverage=TEST_COVERAGE)
+    pointer_before = (tmp_path / "current.json").read_bytes()
+    candidate = build_explicit_test_fixture_candidate(
+        records=mixed_neis_records(),
+        previous=verify_snapshot(tmp_path),
+        output_root=tmp_path,
+        snapshot_id="tampered-key-order",
+    )
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    canonical = (
+        '"sourceObservationDateCounts":{"2026-04-23":2,'
+        '"2026-05-17":1,"2026-06-07":1}'
+    )
+    unsorted = (
+        '"sourceObservationDateCounts":{"2026-06-07":1,'
+        '"2026-04-23":2,"2026-05-17":1}'
+    )
+    assert canonical in manifest_text
+    manifest_path.write_text(
+        manifest_text.replace(canonical, unsorted, 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SnapshotQualityError):
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
+
+    assert (tmp_path / "current.json").read_bytes() == pointer_before
 
 
 def test_promotion_binds_source_digest_to_persisted_site_content(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="site-provenance-binding",
-        coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     sites_path = candidate.candidate_path / "sites.jsonl"
-    site = json.loads(sites_path.read_text(encoding="utf-8"))
-    site.update(
-        {
+    _, site_bytes = replace_jsonl_record(
+        sites_path,
+        field="siteId",
+        value="neis:B10:0000707:main",
+        updates={
             "roadAddress": "서울특별시 송파구 변조로 10",
             "district": "송파구",
             "latitude": 37.51,
             "longitude": 127.10,
             "routingAnchorLatitude": 37.51,
             "routingAnchorLongitude": 127.10,
-        }
+        },
     )
-    site_bytes = (json.dumps(site, ensure_ascii=False) + "\n").encode()
-    sites_path.write_bytes(site_bytes)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    resign_candidate(candidate, tmp_path)
 
     with pytest.raises(SnapshotQualityError, match="source provenance"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
 def test_promotion_rejects_replacement_acquisition_provenance(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="replacement-acquisition",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sources"][0].update(
@@ -3860,26 +5481,20 @@ def test_promotion_rejects_replacement_acquisition_provenance(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="source provenance"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
 def test_public_result_cannot_authorize_replaced_raw_provenance(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="forged-public-attestations",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sources"][0]["rawSha256"] = "f" * 64
@@ -3887,12 +5502,7 @@ def test_public_result_cannot_authorize_replaced_raw_provenance(
     forged = replace(candidate, issues=())
 
     with pytest.raises(SnapshotQualityError, match="transaction attestation"):
-        approve_test_candidate(
-            forged,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(forged, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
@@ -3900,7 +5510,7 @@ def test_builder_writes_private_root_transaction_without_source_pii(
     tmp_path: Path,
 ) -> None:
     record = source_record()
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -3923,7 +5533,7 @@ def test_builder_fsyncs_existing_root_before_durable_transaction_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    build_test_candidate(
+    build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
@@ -3946,7 +5556,7 @@ def test_builder_fsyncs_existing_root_before_durable_transaction_receipt(
 
     monkeypatch.setattr(sync_module, "_fsync_directory", record_fsync)
     monkeypatch.setattr(os, "replace", record_replace)
-    second = build_test_candidate(
+    second = build_explicit_test_fixture_candidate(
         records=(source_record(institution_id="neis:B10:7010002"),),
         previous=None,
         output_root=tmp_path,
@@ -3971,14 +5581,13 @@ def test_promotion_rejects_missing_or_tampered_build_transaction(
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id=f"{mutation}-transaction",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     receipt_path = (
         tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
     )
@@ -3990,12 +5599,7 @@ def test_promotion_rejects_missing_or_tampered_build_transaction(
         receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="transaction"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
@@ -4004,21 +5608,20 @@ def test_build_transaction_cannot_be_copied_between_output_roots(
 ) -> None:
     first_root = tmp_path / "first"
     second_root = tmp_path / "second"
-    first = build_test_candidate(
+    first = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=first_root,
         snapshot_id="copied-transaction",
         coverage=TEST_COVERAGE,
     )
-    second = build_test_candidate(
+    second = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=second_root,
         snapshot_id="copied-transaction",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(second, second_root)
     first_receipt = (
         first_root / ".sync-transactions" / "copied-transaction.json"
     )
@@ -4028,12 +5631,7 @@ def test_build_transaction_cannot_be_copied_between_output_roots(
     second_receipt.write_bytes(first_receipt.read_bytes())
 
     with pytest.raises(SnapshotQualityError, match="transaction attestation"):
-        approve_test_candidate(
-            second,
-            second_root,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(second, second_root, coverage=TEST_COVERAGE)
     assert not (second_root / "current.json").exists()
     assert first.candidate_path.is_dir()
 
@@ -4047,7 +5645,7 @@ def test_standard_enrichment_binds_selected_site_mapping(
             "coordinate_quality": "OFFICIAL_STANDARD_COORDINATE",
         }
     )
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -4057,19 +5655,18 @@ def test_standard_enrichment_binds_selected_site_mapping(
             standard_enrichment_provenance(matched_row_count=1),
         ),
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     sites_path = candidate.candidate_path / "sites.jsonl"
-    site = json.loads(sites_path.read_text(encoding="utf-8"))
-    site.update(
-        {
+    _, site_bytes = replace_jsonl_record(
+        sites_path,
+        field="siteId",
+        value="neis:B10:7010001:main",
+        updates={
             "latitude": 37.51,
             "longitude": 127.10,
             "routingAnchorLatitude": 37.51,
             "routingAnchorLongitude": 127.10,
-        }
+        },
     )
-    site_bytes = (json.dumps(site, ensure_ascii=False) + "\n").encode()
-    sites_path.write_bytes(site_bytes)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     tampered_record = replace(record, latitude=37.51, longitude=127.10)
@@ -4080,149 +5677,35 @@ def test_standard_enrichment_binds_selected_site_mapping(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="provenance"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
 def test_promotion_runs_task3_strict_checks_before_pointer(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="strict-before-pointer",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     institutions_path = candidate.candidate_path / "institutions.jsonl"
-    institution = json.loads(institutions_path.read_text(encoding="utf-8"))
-    institution["lastSeenSnapshot"] = "other-snapshot"
-    institution_bytes = (
-        json.dumps(institution, ensure_ascii=False) + "\n"
-    ).encode()
-    institutions_path.write_bytes(institution_bytes)
+    _, institution_bytes = replace_jsonl_record(
+        institutions_path,
+        field="institutionId",
+        value="neis:B10:7010001",
+        updates={"lastSeenSnapshot": "other-snapshot"},
+    )
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="transaction attestation"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
-
-
-# Production break caught: trusting a correctly signed candidate whose reviewed
-# histogram does not contain the persisted institution's source vintage.
-def test_review_and_approval_reject_signed_unobserved_institution_date(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    real_candidate_manifest = sync_module._candidate_manifest
-
-    def forged_candidate_manifest(
-        *args: object,
-        **kwargs: object,
-    ) -> dict[str, object]:
-        manifest = cast(Any, real_candidate_manifest)(*args, **kwargs)
-        source = cast(list[dict[str, object]], manifest["sources"])[0]
-        source["sourceAsOf"] = "2026-08-09"
-        source["sourceObservationDateCounts"] = {"2026-08-09": 1}
-        return manifest
-
-    with monkeypatch.context() as legacy_context:
-        legacy_context.setattr(
-            sync_module,
-            "_candidate_manifest",
-            forged_candidate_manifest,
-        )
-        candidate = build_test_candidate(
-            records=(source_record(),),
-            previous=None,
-            output_root=tmp_path,
-            snapshot_id="signed-unobserved-date",
-            coverage=TEST_COVERAGE,
-        )
-
-    with pytest.raises(SnapshotQualityError, match="source provenance"):
-        build_candidate_review_packet(
-            snapshot_id=candidate.snapshot_id,
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-    with pytest.raises(SnapshotQualityError, match="source provenance"):
-        approve_candidate_snapshot(
-            snapshot_id=candidate.snapshot_id,
-            review_digest="0" * 64,
-            reviewer_role="data-steward",
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-    assert not (tmp_path / "current.json").exists()
-
-
-# Production break caught: accepting descending serialized observation-date keys
-# after the canonical transaction and review digests conceal their ordering change.
-def test_review_and_approval_reject_signed_unsorted_observation_histogram(
-    tmp_path: Path,
-) -> None:
-    initial = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="histogram-order-current",
-        coverage=TEST_COVERAGE,
-    )
-    approve_test_candidate(initial, tmp_path, coverage=TEST_COVERAGE)
-    pointer_before = (tmp_path / "current.json").read_bytes()
-    records = (
-        source_record(institution_id="neis:B10:7010001"),
-        replace(
-            source_record(institution_id="neis:B10:7010002"),
-            source_as_of="2026-08-09",
-        ),
-    )
-    candidate = build_test_candidate(
-        records=records,
-        previous=verify_snapshot(tmp_path),
-        output_root=tmp_path,
-        snapshot_id="histogram-order-tampered",
-        coverage=TEST_COVERAGE,
-    )
-    review_digest = review_test_candidate(candidate, tmp_path)
-    manifest_path = candidate.candidate_path / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["sources"][0]["sourceObservationDateCounts"] = {
-        "2026-08-10": 1,
-        "2026-08-09": 1,
-    }
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-
-    with pytest.raises(SnapshotQualityError, match="manifest|provenance"):
-        build_candidate_review_packet(
-            snapshot_id=candidate.snapshot_id,
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-    with pytest.raises(SnapshotQualityError, match="manifest|provenance"):
-        approve_candidate_snapshot(
-            snapshot_id=candidate.snapshot_id,
-            review_digest=review_digest,
-            reviewer_role="data-steward",
-            snapshot_root=tmp_path,
-            coverage=TEST_COVERAGE,
-        )
-    assert (tmp_path / "current.json").read_bytes() == pointer_before
 
 
 @pytest.mark.parametrize(
@@ -4240,26 +5723,20 @@ def test_promotion_replays_source_provenance_from_persisted_rows(
     field_name: str,
     value: object,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id=f"promotion-source-{field_name}",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["sources"][0][field_name] = value
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="source provenance"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
@@ -4272,7 +5749,7 @@ def test_promotion_replays_enrichment_provenance_from_persisted_rows(
             "coordinate_quality": "OFFICIAL_STANDARD_COORDINATE",
         }
     )
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(record,),
         previous=None,
         output_root=tmp_path,
@@ -4282,95 +5759,35 @@ def test_promotion_replays_enrichment_provenance_from_persisted_rows(
             standard_enrichment_provenance(matched_row_count=1),
         ),
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["enrichments"][0]["normalizedSha256"] = "f" * 64
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="enrichment provenance"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
 def test_manifest_replays_live_source_provenance(tmp_path: Path) -> None:
-    official_record = SourceInstitutionRecord(
-        **{
-            **source_record().__dict__,
-            "coordinate_quality": "OFFICIAL_STANDARD_COORDINATE",
-        }
-    )
-    provenance = SourceProvenance(
-        source="NEIS",
-        endpoint="https://open.neis.go.kr/hub/schoolInfo",
-        license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
-        attribution="Ministry of Education NEIS education data",
-        fetched_at="2026-08-10T09:00:00Z",
-        source_as_of="2026-08-10",
-        raw_sha256="b" * 64,
-        page_count=2,
-        row_count=1,
-        fetched_row_count=2,
-        request_region_code="B10",
-        request_timing=None,
-        normalized_sha256=normalized_records_sha256(
-            [_before_enrichment(official_record)]
-        ),
-        source_observation_date_counts=(("2026-08-10", 2),),
-    )
-    enrichment = EnrichmentProvenance(
-        source="OFFICIAL_STANDARD_SCHOOL_LOCATION",
-        endpoint=standard_school_module.DOWNLOAD_URL,
-        license_name="PUBLIC_DATA_NO_USE_RESTRICTION",
-        attribution="Korea Education Facilities Safety Authority",
-        fetched_at="2026-08-10T09:00:00Z",
-        source_as_of="2026-03-20",
-        raw_sha256=standard_school_module.PINNED_SHA256,
-        normalized_sha256="ebb2643be10bda983ca9cb81a7ce2820474a53c2f65fc3ac6a7bcc179527cb4a",
-        request_region_code="7010000",
-        request_timing=None,
-        page_count=1,
-        fetched_row_count=12_011,
-        matched_row_count=1,
-        matched_normalized_sha256=enrichment_records_sha256(
-            (official_record,),
-            "OFFICIAL_STANDARD_COORDINATE",
-        ),
-    )
-
-    candidate = build_test_candidate(
-        records=(official_record,),
+    candidate = build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
         snapshot_id="provenance",
-        coverage=TEST_COVERAGE,
-        source_provenance={"NEIS": provenance},
-        enrichment_provenance=(enrichment,),
     )
     manifest = json.loads(
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
 
-    assert manifest["sources"][0]["rawSha256"] == "b" * 64
-    assert manifest["sources"][0]["pageCount"] == 2
-    assert manifest["sources"][0]["fetchedAt"] == "2026-08-10T09:00:00Z"
-    assert manifest["sources"][0]["fetchedRowCount"] == 2
-    assert manifest["sources"][0]["sourceObservationDateCounts"] == {
-        "2026-08-10": 2
-    }
-    assert manifest["sources"][0]["normalizedRowCount"] == 1
-    assert manifest["sources"][0]["preservedRowCount"] == 0
-    assert manifest["sources"][0]["requestRegionCode"] == "B10"
-    assert (
-        manifest["enrichments"][0]["rawSha256"]
-        == standard_school_module.PINNED_SHA256
-    )
-    assert manifest["enrichments"][0]["matchedRowCount"] == 1
+    neis = next(item for item in manifest["sources"] if item["source"] == "NEIS")
+    assert neis["rawSha256"] == "a" * 64
+    assert neis["pageCount"] == 2
+    assert neis["fetchedAt"] == "2026-08-10T09:00:00Z"
+    assert neis["fetchedRowCount"] == 1_415
+    assert neis["normalizedRowCount"] == 1_414
+    assert neis["preservedRowCount"] == 0
+    assert neis["requestRegionCode"] == "B10"
+    assert manifest["enrichments"] == []
 
 
 def test_candidate_requires_matching_coordinate_enrichment(
@@ -4384,7 +5801,7 @@ def test_candidate_requires_matching_coordinate_enrichment(
             **{**source_record().__dict__, "coordinate_quality": quality}
         )
         with pytest.raises(SnapshotQualityError, match=message):
-            build_test_candidate(
+            build_explicit_test_fixture_candidate(
                 records=(record,),
                 previous=None,
                 output_root=tmp_path / quality,
@@ -4422,7 +5839,7 @@ def test_candidate_rejects_untrusted_standard_enrichment(
     )
 
     with pytest.raises(SnapshotQualityError, match="enrichment"):
-        build_test_candidate(
+        build_explicit_test_fixture_candidate(
             records=(record,),
             previous=None,
             output_root=tmp_path,
@@ -4445,6 +5862,17 @@ def test_candidate_rejects_untrusted_standard_enrichment(
         ("fetched_row_count", 0),
         ("row_count", 2),
         ("source_as_of", "2026-08-09"),
+        ("source_observation_date_counts", ()),
+        ("source_observation_date_counts", (("2026-08-10", 0),)),
+        (
+            "source_observation_date_counts",
+            (("2026-08-10", 1), ("2026-08-09", 1)),
+        ),
+        (
+            "source_observation_date_counts",
+            (("2026-08-10", 1), ("2026-08-10", 1)),
+        ),
+        ("normalized_observation_date_counts", (("2026-08-09", 1),)),
         ("normalized_sha256", "b" * 64),
         ("raw_sha256", "not-a-sha256"),
     ],
@@ -4458,14 +5886,15 @@ def test_candidate_rejects_untrusted_source_provenance(
     valid = source_provenance_for(records)["NEIS"]
     invalid = SourceProvenance(**{**valid.__dict__, field_name: value})
 
-    with pytest.raises(SnapshotQualityError, match="source provenance"):
-        build_test_candidate(
+    with pytest.raises(SnapshotQualityError, match=r"source (?:\w+ )*provenance"):
+        build_candidate_snapshot(
             records=records,
             previous=None,
             output_root=tmp_path,
             snapshot_id=f"invalid-provenance-{field_name}",
             coverage=TEST_COVERAGE,
             source_provenance={"NEIS": invalid},
+            school_count_reconciliation=reviewed_reconciliation_contract(),
         )
 
 
@@ -4473,14 +5902,13 @@ def test_pointer_replace_failure_is_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="recoverable",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer_once(source: str | Path, destination: str | Path) -> None:
@@ -4490,22 +5918,12 @@ def test_pointer_replace_failure_is_recoverable(
 
     monkeypatch.setattr(os, "replace", fail_pointer_once)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
     assert (tmp_path / "recoverable").is_dir()
 
     monkeypatch.setattr(os, "replace", real_replace)
-    approve_test_candidate(
-        candidate,
-        tmp_path,
-        coverage=TEST_COVERAGE,
-        review_digest=review_digest,
-    )
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert verify_snapshot(tmp_path).manifest.snapshot_id == "recoverable"
 
 
@@ -4513,14 +5931,13 @@ def test_pointer_failure_restart_uses_durable_transaction_not_result_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="restart-from-transaction",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer(source: str | Path, destination: str | Path) -> None:
@@ -4530,12 +5947,7 @@ def test_pointer_failure_restart_uses_durable_transaction_not_result_fields(
 
     monkeypatch.setattr(os, "replace", fail_pointer)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     monkeypatch.setattr(os, "replace", real_replace)
     snapshot_id = candidate.snapshot_id
     candidate_path = candidate.candidate_path
@@ -4547,12 +5959,7 @@ def test_pointer_failure_restart_uses_durable_transaction_not_result_fields(
         issues=(),
     )
 
-    approve_test_candidate(
-        restarted,
-        tmp_path,
-        coverage=TEST_COVERAGE,
-        review_digest=review_digest,
-    )
+    promote_snapshot(restarted, tmp_path, coverage=TEST_COVERAGE)
     assert verify_snapshot(tmp_path).manifest.snapshot_id == snapshot_id
 
 
@@ -4560,14 +5967,13 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="pointer-written-before-phase",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     real_advance = sync_module._advance_build_transaction
 
     def fail_published_phase(
@@ -4592,12 +5998,7 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
         fail_published_phase,
     )
     with pytest.raises(OSError, match="before published receipt"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     pointer_before = (tmp_path / "current.json").read_bytes()
     receipt_path = (
         tmp_path
@@ -4619,12 +6020,7 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
         issues=(),
     )
 
-    approve_test_candidate(
-        restarted,
-        tmp_path,
-        coverage=TEST_COVERAGE,
-        review_digest=review_digest,
-    )
+    promote_snapshot(restarted, tmp_path, coverage=TEST_COVERAGE)
 
     assert (tmp_path / "current.json").read_bytes() == pointer_before
     assert json.loads(receipt_path.read_text(encoding="utf-8"))["phase"] == (
@@ -4636,32 +6032,21 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
 def test_published_transaction_cannot_authorize_a_different_current_pointer(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="published-pointer-binding",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
-    approve_test_candidate(
-        candidate,
-        tmp_path,
-        coverage=TEST_COVERAGE,
-        review_digest=review_digest,
-    )
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     (tmp_path / "current.json").write_text(
         json.dumps({"snapshotId": "different-snapshot"}),
         encoding="utf-8",
     )
 
     with pytest.raises(SnapshotQualityError, match="pointer|current snapshot"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
 
     assert json.loads((tmp_path / "current.json").read_text(encoding="utf-8")) == {
         "snapshotId": "different-snapshot"
@@ -4672,14 +6057,13 @@ def test_pointer_failure_rejects_changed_attested_approval_timestamp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="changed-approved-at",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer(source: str | Path, destination: str | Path) -> None:
@@ -4689,12 +6073,7 @@ def test_pointer_failure_rejects_changed_attested_approval_timestamp(
 
     monkeypatch.setattr(os, "replace", fail_pointer)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     monkeypatch.setattr(os, "replace", real_replace)
     manifest_path = tmp_path / candidate.snapshot_id / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -4702,26 +6081,20 @@ def test_pointer_failure_rejects_changed_attested_approval_timestamp(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="approval phase"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
 def test_forged_approved_final_without_attested_phase_is_rejected(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="forged-approved-final",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     final_path = tmp_path / candidate.snapshot_id
     os.replace(candidate.candidate_path, final_path)
     manifest_path = final_path / "manifest.json"
@@ -4736,12 +6109,7 @@ def test_forged_approved_final_without_attested_phase_is_rejected(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="approval phase"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
@@ -4749,14 +6117,13 @@ def test_manifest_replace_failure_is_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="manifest-recovery",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_manifest_once(source: str | Path, destination: str | Path) -> None:
@@ -4766,22 +6133,12 @@ def test_manifest_replace_failure_is_recoverable(
 
     monkeypatch.setattr(os, "replace", fail_manifest_once)
     with pytest.raises(OSError, match="manifest replacement failure"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
     assert (tmp_path / "manifest-recovery").is_dir()
 
     monkeypatch.setattr(os, "replace", real_replace)
-    approve_test_candidate(
-        candidate,
-        tmp_path,
-        coverage=TEST_COVERAGE,
-        review_digest=review_digest,
-    )
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert verify_snapshot(tmp_path).manifest.snapshot_id == "manifest-recovery"
 
 
@@ -4795,14 +6152,13 @@ def test_pointer_retry_validates_real_approved_manifest(
     field_name: str,
     value: object,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id=f"retry-{field_name}",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer(source: str | Path, destination: str | Path) -> None:
@@ -4812,12 +6168,7 @@ def test_pointer_retry_validates_real_approved_manifest(
 
     monkeypatch.setattr(os, "replace", fail_pointer)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     monkeypatch.setattr(os, "replace", real_replace)
     manifest_path = tmp_path / candidate.snapshot_id / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -4825,12 +6176,7 @@ def test_pointer_retry_validates_real_approved_manifest(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="approved manifest"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
@@ -4838,14 +6184,13 @@ def test_pointer_retry_rejects_duplicate_approval_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="retry-duplicate-key",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_pointer(source: str | Path, destination: str | Path) -> None:
@@ -4855,12 +6200,7 @@ def test_pointer_retry_rejects_duplicate_approval_key(
 
     monkeypatch.setattr(os, "replace", fail_pointer)
     with pytest.raises(OSError, match="simulated pointer failure"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     monkeypatch.setattr(os, "replace", real_replace)
     manifest_path = tmp_path / candidate.snapshot_id / "manifest.json"
     manifest_text = manifest_path.read_text(encoding="utf-8")
@@ -4874,38 +6214,22 @@ def test_pointer_retry_rejects_duplicate_approval_key(
     )
 
     with pytest.raises(SnapshotQualityError, match="duplicate JSON key"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
 def test_successful_promotion_retry_is_idempotent(tmp_path: Path) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="already-current-retry",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
-    approve_test_candidate(
-        candidate,
-        tmp_path,
-        coverage=TEST_COVERAGE,
-        review_digest=review_digest,
-    )
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     first_pointer = (tmp_path / "current.json").read_bytes()
 
-    approve_test_candidate(
-        candidate,
-        tmp_path,
-        coverage=TEST_COVERAGE,
-        review_digest=review_digest,
-    )
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
 
     assert (tmp_path / "current.json").read_bytes() == first_pointer
     assert verify_snapshot(tmp_path).manifest.snapshot_id == candidate.snapshot_id
@@ -4914,14 +6238,13 @@ def test_successful_promotion_retry_is_idempotent(tmp_path: Path) -> None:
 def test_promotion_rejects_duplicate_jsonl_key_before_pointer(
     tmp_path: Path,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="duplicate-jsonl-key",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     institutions_path = candidate.candidate_path / "institutions.jsonl"
     line = institutions_path.read_text(encoding="utf-8")
     tampered = line.replace(
@@ -4936,12 +6259,7 @@ def test_promotion_rejects_duplicate_jsonl_key_before_pointer(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(SnapshotQualityError, match="duplicate JSON key"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert not (tmp_path / "current.json").exists()
 
 
@@ -4949,14 +6267,13 @@ def test_candidate_directory_replace_failure_is_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    candidate = build_test_candidate(
+    candidate = build_explicit_test_fixture_candidate(
         records=(source_record(),),
         previous=None,
         output_root=tmp_path,
         snapshot_id="rename-recovery",
         coverage=TEST_COVERAGE,
     )
-    review_digest = review_test_candidate(candidate, tmp_path)
     real_replace = os.replace
 
     def fail_directory_once(source: str | Path, destination: str | Path) -> None:
@@ -4966,12 +6283,7 @@ def test_candidate_directory_replace_failure_is_recoverable(
 
     monkeypatch.setattr(os, "replace", fail_directory_once)
     with pytest.raises(OSError, match="directory replacement failure"):
-        approve_test_candidate(
-            candidate,
-            tmp_path,
-            coverage=TEST_COVERAGE,
-            review_digest=review_digest,
-        )
+        promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     manifest = json.loads(
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
@@ -4979,136 +6291,8 @@ def test_candidate_directory_replace_failure_is_recoverable(
     assert not (tmp_path / "current.json").exists()
 
     monkeypatch.setattr(os, "replace", real_replace)
-    approve_test_candidate(
-        candidate,
-        tmp_path,
-        coverage=TEST_COVERAGE,
-        review_digest=review_digest,
-    )
+    promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     assert verify_snapshot(tmp_path).manifest.snapshot_id == "rename-recovery"
-
-
-def test_review_cli_is_offline_and_emits_only_review_packet(
-    tmp_path: Path,
-) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="review-cli",
-        coverage=TEST_COVERAGE,
-    )
-    command = [
-        sys.executable,
-        "apps/travel-map/scripts/review-institution-snapshot.py",
-        "--snapshot-id",
-        candidate.snapshot_id,
-        "--snapshot-root",
-        str(tmp_path),
-        "--geodata-root",
-        "apps/travel-map/resources/geodata",
-    ]
-    environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "PYTHONPATH": "apps/travel-map",
-    }
-
-    completed = subprocess.run(
-        command,
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    packet = json.loads(completed.stdout)
-
-    assert completed.returncode == 0
-    assert packet["status"] == "CANDIDATE_REVIEW_REQUIRED"
-    assert completed.stderr == ""
-
-    rejected = subprocess.run(
-        [*command, "--env-file", "ignored"],
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert rejected.returncode == 2
-    assert "unrecognized arguments: --env-file ignored" in rejected.stderr
-
-
-def test_approval_cli_is_offline_and_emits_exact_success_object(
-    tmp_path: Path,
-) -> None:
-    candidate = build_test_candidate(
-        records=(source_record(),),
-        previous=None,
-        output_root=tmp_path,
-        snapshot_id="approval-cli",
-        coverage=TEST_COVERAGE,
-    )
-    review_digest = review_test_candidate(candidate, tmp_path)
-    command = [
-        sys.executable,
-        "apps/travel-map/scripts/approve-institution-snapshot.py",
-        "--snapshot-id",
-        candidate.snapshot_id,
-        "--review-digest",
-        review_digest,
-        "--reviewer-role",
-        "data-steward",
-        "--snapshot-root",
-        str(tmp_path),
-        "--geodata-root",
-        "apps/travel-map/resources/geodata",
-    ]
-    environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "PYTHONPATH": "apps/travel-map",
-    }
-
-    completed = subprocess.run(
-        command,
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    expected = {
-        "reviewDigest": review_digest,
-        "snapshotId": candidate.snapshot_id,
-        "status": "SNAPSHOT_APPROVED",
-    }
-
-    assert completed.returncode == 0
-    assert completed.stdout == (
-        json.dumps(
-            expected,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
-    assert completed.stderr == ""
-    assert verify_snapshot(tmp_path).manifest.snapshot_id == candidate.snapshot_id
-    for credential_name in (
-        "NEIS_API_KEY",
-        "KINDERGARTEN_API_KEY",
-        "KAKAO_REST_API_KEY",
-        "Authorization",
-    ):
-        assert credential_name not in completed.stdout + completed.stderr
-
-    rejected = subprocess.run(
-        [*command, "--env-file", "ignored"],
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert rejected.returncode == 2
-    assert "unrecognized arguments: --env-file ignored" in rejected.stderr
 
 
 def test_sync_cli_fails_closed_without_credentials(tmp_path: Path) -> None:
@@ -5148,6 +6332,221 @@ def test_sync_cli_fails_closed_without_credentials(tmp_path: Path) -> None:
     assert not (snapshot_root / "current.json").exists()
 
 
+def _run_snapshot_admin_script(
+    script_name: str,
+    *arguments: str,
+    secret: str = "administrator-key-fixture-must-not-appear",
+) -> subprocess.CompletedProcess[str]:
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": "apps/travel-map",
+        "NEIS_API_KEY": secret,
+        "KINDERGARTEN_API_KEY": secret,
+        "KAKAO_REST_API_KEY": secret,
+    }
+    return subprocess.run(
+        [
+            sys.executable,
+            f"apps/travel-map/scripts/{script_name}",
+            *arguments,
+        ],
+        cwd=Path.cwd(),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+# Production break caught: review accidentally initializes a credential/network
+# dependency or emits anything other than the one deterministic review packet.
+def test_review_cli_uses_no_credentials_and_prints_one_compact_packet(
+    tmp_path: Path,
+) -> None:
+    candidate = build_explicit_test_fixture_candidate(
+        records=(source_record(),),
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="review-cli-contract",
+    )
+
+    completed = _run_snapshot_admin_script(
+        "review-institution-snapshot.py",
+        "--snapshot-id",
+        candidate.snapshot_id,
+        "--snapshot-root",
+        str(tmp_path),
+        "--geodata-root",
+        "apps/travel-map/resources/geodata",
+    )
+
+    assert completed.returncode == 0
+    packet = json.loads(completed.stdout)
+    assert packet["snapshotId"] == candidate.snapshot_id
+    assert packet["status"] == "CANDIDATE_REVIEW_REQUIRED"
+    assert re.fullmatch(r"[0-9a-f]{64}", packet["reviewDigest"])
+    assert completed.stdout == (
+        json.dumps(
+            packet,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    assert completed.stderr == ""
+    assert "administrator-key-fixture-must-not-appear" not in (
+        completed.stdout + completed.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    (
+        "review-institution-snapshot.py",
+        "approve-institution-snapshot.py",
+    ),
+)
+def test_review_and_approval_clis_redact_rejected_argument_values(
+    script_name: str,
+) -> None:
+    required_arguments = ["--snapshot-id", "credential-argument-check"]
+    if script_name.startswith("approve-"):
+        required_arguments.extend(
+            [
+                "--review-digest",
+                "a" * 64,
+                "--reviewer-role",
+                "data-steward",
+            ]
+        )
+    completed = _run_snapshot_admin_script(
+        script_name,
+        *required_arguments,
+        "--env-file",
+        "administrator-key-fixture-must-not-appear",
+    )
+
+    assert completed.returncode == 2
+    assert "invalid command arguments" in completed.stderr
+    assert "administrator-key-fixture-must-not-appear" not in (
+        completed.stdout + completed.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    (
+        "review-institution-snapshot.py",
+        "approve-institution-snapshot.py",
+    ),
+)
+@pytest.mark.parametrize(
+    "rejected_arguments",
+    (
+        ("--env-file", "rejected-unknown-option-secret-must-not-appear"),
+        ("rejected-positional-secret-must-not-appear",),
+    ),
+)
+def test_snapshot_admin_cli_parse_errors_do_not_retain_rejected_values_in_app_or_script_frames(
+    script_name: str,
+    rejected_arguments: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = rejected_arguments[-1]
+    required_arguments = ["--snapshot-id", "redacted-argument-check"]
+    if script_name.startswith("approve-"):
+        required_arguments.extend(
+            [
+                "--review-digest",
+                "a" * 64,
+                "--reviewer-role",
+                "data-steward",
+            ]
+        )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            f"apps/travel-map/scripts/{script_name}",
+            *required_arguments,
+            *rejected_arguments,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(
+            f"apps/travel-map/scripts/{script_name}",
+            run_name="__main__",
+        )
+
+    assert raised.value.code == 2
+    output = capsys.readouterr()
+    assert secret not in output.out + output.err
+    assert_secret_absent_from_app_traceback(
+        raised.value,
+        raised.value.__traceback__,
+        secret,
+    )
+
+
+# Production break caught: approval prints the wrong status/digest or publishes
+# without routing the reviewed digest through approve_candidate_snapshot().
+def test_approval_cli_prints_exact_safe_success_record(
+    tmp_path: Path,
+) -> None:
+    candidate = build_reviewed_population_candidate(
+        previous=None,
+        output_root=tmp_path,
+        snapshot_id="approval-cli-contract",
+    )
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=tmp_path,
+        coverage=TEST_COVERAGE,
+    )
+    review_digest = packet["reviewDigest"]
+    assert isinstance(review_digest, str)
+
+    completed = _run_snapshot_admin_script(
+        "approve-institution-snapshot.py",
+        "--snapshot-id",
+        candidate.snapshot_id,
+        "--review-digest",
+        review_digest,
+        "--reviewer-role",
+        "data-steward",
+        "--snapshot-root",
+        str(tmp_path),
+        "--geodata-root",
+        "apps/travel-map/resources/geodata",
+    )
+
+    expected = {
+        "reviewDigest": review_digest,
+        "snapshotId": candidate.snapshot_id,
+        "status": "SNAPSHOT_APPROVED",
+    }
+    assert completed.returncode == 0
+    assert completed.stdout == (
+        json.dumps(
+            expected,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    assert completed.stderr == ""
+    assert "administrator-key-fixture-must-not-appear" not in (
+        completed.stdout + completed.stderr
+    )
+    assert json.loads((tmp_path / "current.json").read_text(encoding="utf-8")) == {
+        "snapshotId": candidate.snapshot_id
+    }
+
+
 def neis_payload(*, source_type: str) -> dict[str, object]:
     payload = copy.deepcopy(load_json("neis-school-info.json"))
     section = payload["schoolInfo"]
@@ -5168,6 +6567,49 @@ def neis_payload(*, source_type: str) -> dict[str, object]:
             "LOAD_DTM": "20260810",
         }
     )
+    return payload
+
+
+def neis_payload_rows(*source_types: str) -> dict[str, object]:
+    payload = neis_payload(source_type="초등학교")
+    section = payload["schoolInfo"]
+    assert type(section) is list
+    template = section[1]["row"][0]
+    assert type(template) is dict
+    section[0]["head"][0]["list_total_count"] = len(source_types)
+    section[1]["row"] = [
+        {
+            **template,
+            "SD_SCHUL_CODE": f"{7010000 + index}",
+            "SCHUL_KND_SC_NM": source_type,
+        }
+        for index, source_type in enumerate(source_types, start=1)
+    ]
+    return payload
+
+
+def reviewed_neis_source_types() -> tuple[str, ...]:
+    return tuple(
+        label
+        for label, count in REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+        for _ in range(count)
+    )
+
+
+def neis_page_payload(
+    source_types: tuple[str, ...],
+    *,
+    page: int,
+    page_size: int,
+) -> dict[str, object]:
+    offset = (page - 1) * page_size
+    payload = neis_payload_rows(*source_types[offset : offset + page_size])
+    section = payload["schoolInfo"]
+    assert type(section) is list
+    section[0]["head"][0]["list_total_count"] = len(source_types)
+    rows = section[1]["row"]
+    for index, row in enumerate(rows, start=offset + 1):
+        row["SD_SCHUL_CODE"] = f"{7010000 + index}"
     return payload
 
 
@@ -5197,20 +6639,79 @@ def write_region_fixture(tmp_path: Path) -> Path:
     return path
 
 
-def build_test_candidate(
+def build_reviewed_population_candidate(
     *,
-    records: tuple[SourceInstitutionRecord, ...],
     previous: VerifiedSnapshot | None,
     output_root: Path,
     snapshot_id: str,
-    coverage: CoverageService | None = TEST_COVERAGE,
-    source_provenance: Mapping[str, SourceProvenance] | None = None,
-    enrichment_provenance: tuple[EnrichmentProvenance, ...] = (),
+    coverage: CoverageService = FAST_TEST_COVERAGE,
+    neis_observation_dates: tuple[str, ...] | None = None,
+    neis_raw_observation_date_counts: tuple[tuple[str, int], ...] | None = None,
+    include_reviewed_sen: bool = True,
+    cross_source_match: bool = False,
 ) -> SnapshotBuildResult:
-    selected_provenance = (
-        source_provenance
-        if source_provenance is not None
-        else source_provenance_for(records)
+    profile, benchmark, records, provenance = reviewed_population_fixture()
+    if include_reviewed_sen:
+        sen_records = parse_sen_csv(SOURCE_RESOURCES / "sen-institutions.csv")
+        if cross_source_match:
+            mutable = list(records)
+            neis_index = next(
+                index for index, record in enumerate(mutable) if record.source == "NEIS"
+            )
+            mutable[neis_index] = replace(
+                mutable[neis_index],
+                official_name=sen_records[0].official_name,
+                road_address=sen_records[0].road_address,
+            )
+            records = tuple(mutable)
+            provenance["NEIS"] = replace(
+                provenance["NEIS"],
+                normalized_sha256=normalized_records_sha256(
+                    record for record in records if record.source == "NEIS"
+                ),
+            )
+        records = (*records, *sen_records)
+        provenance.update(source_provenance_for(sen_records))
+    if neis_observation_dates is not None:
+        neis_indexes = [
+            index for index, record in enumerate(records) if record.source == "NEIS"
+        ]
+        assert len(neis_indexes) == len(neis_observation_dates)
+        mutable = list(records)
+        for index, source_date in zip(
+            neis_indexes,
+            neis_observation_dates,
+            strict=True,
+        ):
+            mutable[index] = replace(mutable[index], source_as_of=source_date)
+        records = tuple(mutable)
+        normalized_counts = observation_date_counts(neis_observation_dates)
+        raw_counts = neis_raw_observation_date_counts
+        assert raw_counts is not None and sum(count for _, count in raw_counts) == 1_415
+        provenance["NEIS"] = replace(
+            provenance["NEIS"],
+            source_as_of=source_as_of_for(raw_counts),
+            source_observation_date_counts=raw_counts,
+            normalized_observation_date_counts=normalized_counts,
+            normalized_sha256=normalized_records_sha256(
+                record for record in records if record.source == "NEIS"
+            ),
+        )
+    population_records = tuple(
+        record
+        for record in records
+        if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+    )
+    bound = sync_module.bind_school_count_population_profile(
+        provenance,
+        profile=profile,
+    )
+    reconciliation = reconcile_selectable_school_counts(
+        population_records,
+        benchmark=benchmark,
+        population_profile=profile,
+        source_provenance=bound,
+        unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
     return build_candidate_snapshot(
         records=records,
@@ -5218,44 +6719,479 @@ def build_test_candidate(
         output_root=output_root,
         snapshot_id=snapshot_id,
         coverage=coverage,
-        source_provenance=selected_provenance,
-        enrichment_provenance=enrichment_provenance,
+        source_provenance=bound,
+        school_count_reconciliation=reconciliation,
     )
 
 
-def approve_test_candidate(
+def build_explicit_test_fixture_candidate(
+    *,
+    records: tuple[SourceInstitutionRecord, ...],
+    previous: VerifiedSnapshot | None,
+    output_root: Path,
+    snapshot_id: str,
+    coverage: CoverageService = TEST_COVERAGE,
+    enrichment_provenance: tuple[EnrichmentProvenance, ...] = (),
+) -> SnapshotBuildResult:
+    """Build the narrow TEST_NEIS/null-reconciliation fixture contract.
+
+    This deliberately does not call the production builder or rewrite a production
+    source implicitly. Callers select this helper only for source-agnostic snapshot,
+    transaction, recovery, and path-integrity tests.
+    """
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    root = sync_module._validated_snapshot_root(root)
+    candidate_path = root / f".{snapshot_id}.candidate"
+    final_path = root / snapshot_id
+    if candidate_path.exists() or final_path.exists():
+        raise SnapshotQualityError("snapshot ID already exists")
+
+    fixture_records = tuple(
+        replace(record, source="TEST_NEIS")
+        for record in records
+    )
+    sync_module._validate_enrichment_provenance(
+        fixture_records,
+        enrichment_provenance,
+    )
+    institutions, sites = sync_module._build_current_records(
+        fixture_records,
+        snapshot_id,
+        coverage,
+    )
+    issues: list[str] = []
+    selectable = [
+        institution
+        for institution in institutions
+        if institution.institution_type != "UNCLASSIFIED_SCHOOL"
+    ]
+    coordinate_rate = (
+        sum(
+            institution.status is InstitutionStatus.ACTIVE
+            for institution in selectable
+        )
+        / len(selectable)
+        if selectable
+        else 1.0
+    )
+    if previous is not None:
+        institutions, sites = sync_module._preserve_missing_records(
+            institutions,
+            sites,
+            previous,
+            snapshot_id,
+        )
+        previous_active = sum(
+            item.status is InstitutionStatus.ACTIVE
+            for item in previous.institutions
+        )
+        current_active = sum(
+            item.status is InstitutionStatus.ACTIVE
+            for item in institutions
+        )
+        if previous_active and current_active < previous_active * 0.9:
+            issues.append("record count drop exceeds 10 percent")
+    if coordinate_rate < 0.98:
+        issues.append("coordinate validation success rate is below 98 percent")
+
+    candidate_path.mkdir()
+    institution_bytes = sync_module._jsonl_bytes(institutions)
+    site_bytes = sync_module._jsonl_bytes(sites)
+    (candidate_path / "institutions.jsonl").write_bytes(institution_bytes)
+    (candidate_path / "sites.jsonl").write_bytes(site_bytes)
+    now = sync_module._utc_now()
+    observation_counts = observation_date_counts(
+        record.source_as_of for record in fixture_records
+    )
+    effective_enrichment = {
+        item.source: item for item in enrichment_provenance
+    }
+    if previous is not None:
+        required_enrichments = {
+            {
+                "OFFICIAL_STANDARD_COORDINATE": "OFFICIAL_STANDARD_SCHOOL_LOCATION",
+                "GEOCODED": "KAKAO_LOCAL_GEOCODING",
+            }[site.coordinate_quality]
+            for site in sites
+            if site.coordinate_quality
+            in {"OFFICIAL_STANDARD_COORDINATE", "GEOCODED"}
+        }
+        previous_enrichments = {
+            item.source: item for item in previous.manifest.enrichments
+        }
+        for source in required_enrichments - set(effective_enrichment):
+            prior = previous_enrichments[source]
+            effective_enrichment[source] = EnrichmentProvenance(
+                source=prior.source,
+                endpoint=prior.endpoint,
+                license_name=prior.license_name,
+                attribution=prior.attribution,
+                fetched_at=prior.fetched_at,
+                source_as_of=prior.source_as_of,
+                raw_sha256=prior.raw_sha256,
+                normalized_sha256=prior.source_normalized_sha256,
+                request_region_code=prior.request_region_code,
+                request_timing=prior.request_timing,
+                page_count=prior.page_count,
+                fetched_row_count=prior.fetched_row_count,
+                matched_row_count=0,
+                matched_normalized_sha256=None,
+            )
+    provenance = SourceProvenance(
+        source="TEST_NEIS",
+        endpoint="https://example.invalid/test-only-neis-fixture",
+        license_name="TEST_ONLY_SYNTHETIC_DATA",
+        attribution="Synthetic TEST_NEIS fixture; not for release",
+        fetched_at="2026-08-13T00:00:00Z",
+        source_as_of=source_as_of_for(observation_counts),
+        source_observation_date_counts=observation_counts,
+        normalized_observation_date_counts=observation_counts,
+        raw_sha256=hashlib.sha256(b"explicit-test-neis-fixture").hexdigest(),
+        page_count=1,
+        row_count=len(fixture_records),
+        fetched_row_count=len(fixture_records),
+        request_region_code="TEST_ONLY",
+        request_timing=None,
+        normalized_sha256=normalized_records_sha256(
+            [_before_enrichment(record) for record in fixture_records]
+        ),
+    )
+    snapshot_as_of = max(
+        [item.source_as_of for item in institutions],
+        default=now[:10],
+    )
+    manifest = sync_module._candidate_manifest(
+        snapshot_id=snapshot_id,
+        created_at=now,
+        snapshot_as_of=snapshot_as_of,
+        institutions=institutions,
+        sites=sites,
+        institution_bytes=institution_bytes,
+        site_bytes=site_bytes,
+        possible_matches=sync_module._persisted_possible_matches(
+            institutions,
+            sites,
+        ),
+        previous=previous,
+        source_provenance={"TEST_NEIS": provenance},
+        source_records=fixture_records,
+        enrichment_provenance=tuple(
+            effective_enrichment[source]
+            for source in sorted(effective_enrichment)
+        ),
+        school_count_reconciliation={},
+    )
+    manifest["schoolCountReconciliation"] = None
+    sync_module._write_json(candidate_path / "manifest.json", manifest)
+    for file_name in ("manifest.json", "institutions.jsonl", "sites.jsonl"):
+        sync_module._fsync_file(candidate_path / file_name)
+    sync_module._fsync_directory(candidate_path)
+    sync_module._fsync_directory(root)
+    sync_module._create_build_transaction(
+        root,
+        snapshot_id=snapshot_id,
+        manifest=manifest,
+        issues=tuple(issues),
+    )
+    return SnapshotBuildResult(
+        snapshot_id=snapshot_id,
+        candidate_path=candidate_path,
+        approved=False,
+        issues=tuple(issues),
+    )
+
+
+def reviewed_reconciliation_contract() -> dict[str, object]:
+    return {
+        "profileStatus": "TEMPORARY_PRELIMINARY_VARIANCE",
+        "profileSha256": PINNED_POPULATION_PROFILE_SHA256,
+        "benchmarkSha256": (
+            "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332"
+        ),
+        "sources": {
+            "KINDERGARTEN_INFO": {
+                "fetchedCount": 706,
+                "normalizedCount": 706,
+                "roleCounts": {"BENCHMARK": 706},
+            },
+            "NEIS": {
+                "fetchedCount": 1_415,
+                "normalizedCount": 1_414,
+                "roleCounts": {
+                    "BENCHMARK": 1_373,
+                    "NONSELECTABLE": 1,
+                    "QUARANTINED": 18,
+                    "SUPPLEMENTARY": 23,
+                },
+            },
+        },
+        "categories": {
+            name: {
+                "expectedCount": expected,
+                "actualCount": actual,
+                "deltaCount": delta,
+                "status": "MATCHED" if delta == 0 else "REVIEWED_VARIANCE",
+            }
+            for name, (expected, actual, delta) in {
+                "ELEMENTARY_SCHOOL": (609, 610, 1),
+                "HIGH_SCHOOL": (319, 319, 0),
+                "KINDERGARTEN": (724, 706, -18),
+                "MIDDLE_SCHOOL": (390, 390, 0),
+                "MISC_SCHOOL": (18, 22, 4),
+                "SPECIAL_SCHOOL": (32, 32, 0),
+            }.items()
+        },
+        "passed": True,
+    }
+
+
+def promote_snapshot(
     candidate: SnapshotBuildResult,
     output_root: Path,
     *,
-    coverage: CoverageService = TEST_COVERAGE,
-    review_digest: str | None = None,
+    coverage: CoverageService,
 ) -> str:
-    digest = review_digest or review_test_candidate(
-        candidate,
-        output_root,
+    packet = sync_module.build_candidate_review_packet(
+        snapshot_id=candidate.snapshot_id,
+        snapshot_root=output_root,
         coverage=coverage,
     )
-    return approve_candidate_snapshot(
+    review_digest = packet["reviewDigest"]
+    assert isinstance(review_digest, str)
+    snapshot_path = (
+        candidate.candidate_path
+        if candidate.candidate_path.exists()
+        else output_root / candidate.snapshot_id
+    )
+    manifest = json.loads(
+        (snapshot_path / "manifest.json").read_text(encoding="utf-8")
+    )
+    reviewer_role = (
+        "TEST_FIXTURE_REVIEWER"
+        if manifest["schoolCountReconciliation"] is None
+        else "data-steward"
+    )
+    return sync_module.approve_candidate_snapshot(
         snapshot_id=candidate.snapshot_id,
-        review_digest=digest,
-        reviewer_role="data-steward",
+        review_digest=review_digest,
+        reviewer_role=reviewer_role,
         snapshot_root=output_root,
         coverage=coverage,
     )
 
 
-def review_test_candidate(
-    candidate: SnapshotBuildResult,
-    output_root: Path,
-    *,
-    coverage: CoverageService = TEST_COVERAGE,
-) -> str:
-    packet = build_candidate_review_packet(
-        snapshot_id=candidate.snapshot_id,
-        snapshot_root=output_root,
-        coverage=coverage,
+def resign_candidate(candidate: SnapshotBuildResult, snapshot_root: Path) -> None:
+    manifest_path = candidate.candidate_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    transaction_path = (
+        snapshot_root / ".sync-transactions" / f"{candidate.snapshot_id}.json"
     )
-    return cast(str, packet["reviewDigest"])
+    transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    unapproved = dict(manifest)
+    unapproved["approved"] = False
+    unapproved["approvedAt"] = None
+    unapproved["approvedByRole"] = None
+    transaction["manifestSha256"] = sync_module._manifest_section_sha256(unapproved)
+    transaction["sourcesSha256"] = sync_module._manifest_section_sha256(
+        manifest["sources"]
+    )
+    transaction["enrichmentsSha256"] = sync_module._manifest_section_sha256(
+        manifest["enrichments"]
+    )
+    transaction["institutionsSha256"] = manifest["institutionsSha256"]
+    transaction["sitesSha256"] = manifest["sitesSha256"]
+    transaction["previousSnapshotId"] = manifest["diff"]["previousSnapshotId"]
+    transaction.pop("signature")
+    sync_module._write_signed_transaction(
+        snapshot_root,
+        transaction,
+        replace_existing=True,
+    )
+
+
+def remove_candidate_source(
+    candidate: SnapshotBuildResult,
+    snapshot_root: Path,
+    *,
+    source: str,
+) -> None:
+    remove_snapshot_source(candidate.candidate_path, source=source)
+    resign_candidate(candidate, snapshot_root)
+
+
+def remove_snapshot_source(snapshot_path: Path, *, source: str) -> None:
+    institution_path = snapshot_path / "institutions.jsonl"
+    site_path = snapshot_path / "sites.jsonl"
+    manifest_path = snapshot_path / "manifest.json"
+    institutions = [
+        Institution.model_validate_json(line)
+        for line in institution_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["source"] != source
+    ]
+    kept_ids = {institution.institution_id for institution in institutions}
+    sites = [
+        InstitutionSite.model_validate_json(line)
+        for line in site_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["institutionId"] in kept_ids
+    ]
+    institution_bytes = sync_module._jsonl_bytes(institutions)
+    site_bytes = sync_module._jsonl_bytes(sites)
+    institution_path.write_bytes(institution_bytes)
+    site_path.write_bytes(site_bytes)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sources"] = [
+        entry for entry in manifest["sources"] if entry["source"] != source
+    ]
+    manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
+    manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
+    manifest["institutionCount"] = len(institutions)
+    manifest["siteCount"] = len(sites)
+    manifest["quarantinedCount"] = sum(
+        institution.status is InstitutionStatus.REVIEW_REQUIRED
+        for institution in institutions
+    )
+    manifest["countsByType"] = dict(
+        Counter(institution.institution_type for institution in institutions)
+    )
+    manifest["countsByFoundation"] = dict(
+        Counter(institution.foundation_type for institution in institutions)
+    )
+    manifest["countsByStatus"] = dict(
+        Counter(institution.status.value for institution in institutions)
+    )
+    manifest["coordinateQualityCounts"] = dict(
+        Counter(site.coordinate_quality for site in sites)
+    )
+    possible_matches = sync_module._persisted_possible_matches(institutions, sites)
+    manifest["possibleMatchCount"] = len(possible_matches)
+    manifest["possibleMatches"] = possible_matches
+    sync_module._write_json(manifest_path, manifest)
+
+
+def quarantined_neis_records(prefix: str) -> tuple[SourceInstitutionRecord, ...]:
+    return tuple(
+        replace(
+            source_record(institution_id=f"{prefix}-{index:02d}"),
+            institution_type="UNCLASSIFIED_SCHOOL",
+            source_kind_label=label,
+        )
+        for index, label in enumerate(
+            (
+                label
+                for label, count in REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
+                for _ in range(count)
+            ),
+            start=1,
+        )
+    )
+
+
+def with_neis_quarantine(
+    records: tuple[SourceInstitutionRecord, ...],
+) -> tuple[SourceInstitutionRecord, ...]:
+    if not any(record.source == "NEIS" for record in records) or any(
+        record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records
+    ):
+        return records
+    return (*records, *quarantined_neis_records("neis:B10:reconciliation-quarantine"))
+
+
+def replace_jsonl_record(
+    path: Path,
+    *,
+    field: str,
+    value: str,
+    updates: Mapping[str, object],
+) -> tuple[dict[str, object], bytes]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    record = next(row for row in rows if row[field] == value)
+    record.update(updates)
+    contents = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    result = contents.encode()
+    path.write_bytes(result)
+    return record, result
+
+
+def remove_unclassified_rows(
+    snapshot_path: Path,
+    *,
+    resign_root: Path | None = None,
+    candidate: SnapshotBuildResult | None = None,
+) -> None:
+    institution_path = snapshot_path / "institutions.jsonl"
+    site_path = snapshot_path / "sites.jsonl"
+    institutions = [
+        Institution.model_validate_json(line)
+        for line in institution_path.read_text(encoding="utf-8").splitlines()
+    ]
+    quarantined_ids = {
+        institution.institution_id
+        for institution in institutions
+        if institution.institution_type == "UNCLASSIFIED_SCHOOL"
+    }
+    institutions = [
+        institution
+        for institution in institutions
+        if institution.institution_id not in quarantined_ids
+    ]
+    sites = [
+        InstitutionSite.model_validate_json(line)
+        for line in site_path.read_text(encoding="utf-8").splitlines()
+    ]
+    sites = [site for site in sites if site.institution_id not in quarantined_ids]
+    institution_path.write_bytes(sync_module._jsonl_bytes(institutions))
+    site_path.write_bytes(sync_module._jsonl_bytes(sites))
+    sites_by_parent = {institution.institution_id: [] for institution in institutions}
+    for site in sites:
+        sites_by_parent[site.institution_id].append(site)
+    manifest_path = snapshot_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["institutionsSha256"] = hashlib.sha256(
+        institution_path.read_bytes()
+    ).hexdigest()
+    manifest["sitesSha256"] = hashlib.sha256(site_path.read_bytes()).hexdigest()
+    manifest["institutionCount"] = len(institutions)
+    manifest["siteCount"] = len(sites)
+    manifest["quarantinedCount"] = sum(
+        institution.status is InstitutionStatus.REVIEW_REQUIRED
+        for institution in institutions
+    )
+    manifest["countsByType"] = dict(
+        Counter(institution.institution_type for institution in institutions)
+    )
+    manifest["countsByFoundation"] = dict(
+        Counter(institution.foundation_type for institution in institutions)
+    )
+    manifest["countsByStatus"] = dict(
+        Counter(institution.status.value for institution in institutions)
+    )
+    manifest["coordinateQualityCounts"] = dict(
+        Counter(site.coordinate_quality for site in sites)
+    )
+    source = manifest["sources"][0]
+    source["normalizedObservationDateCounts"] = dict(
+        observation_date_counts(institution.source_as_of for institution in institutions)
+    )
+    source["normalizedRowCount"] = len(institutions)
+    source["preservedRowCount"] = 0
+    source["rowCount"] = len(institutions)
+    source["sourceNormalizedSha256"] = (
+        sync_module._normalized_persisted_source_sha256(
+            institutions,
+            sites_by_parent,
+            before_enrichment=True,
+        )
+    )
+    source["normalizedSha256"] = sync_module._normalized_persisted_source_sha256(
+        institutions,
+        sites_by_parent,
+    )
+    source["unclassifiedSchoolKindCounts"] = {}
+    source["unclassifiedSchoolPolicySha256"] = None
+    sync_module._write_json(manifest_path, manifest)
+    if resign_root is not None and candidate is not None:
+        resign_candidate(candidate, resign_root)
 
 
 def source_provenance_for(
@@ -5296,7 +7232,24 @@ def source_provenance_for(
             license_name=licenses[source],
             attribution=attributions[source],
             fetched_at="2026-08-10T09:00:00Z",
-            source_as_of=max(record.source_as_of for record in source_records),
+            source_as_of=source_as_of_for(
+                observation_date_counts(
+                    record.source_as_of for record in source_records
+                )
+            ),
+            source_observation_date_counts=(
+                (
+                    source_records[0].source_as_of,
+                    len(source_records) + 1,
+                ),
+            )
+            if source == "SEN_REVIEWED_CSV"
+            else observation_date_counts(
+                record.source_as_of for record in source_records
+            ),
+            normalized_observation_date_counts=observation_date_counts(
+                record.source_as_of for record in source_records
+            ),
             raw_sha256=(
                 "69863ac78689fb4b6e9941aabea03c3c1d618ccb26568e844079afd9092eb2c2"
                 if source == "SEN_REVIEWED_CSV"
@@ -5316,23 +7269,31 @@ def source_provenance_for(
             normalized_sha256=normalized_records_sha256(
                 [_before_enrichment(record) for record in source_records]
             ),
-            source_observation_date_counts=source_observation_date_counts_for(
-                source,
-                source_records,
+            unclassified_school_kind_counts=(
+                tuple(
+                    sorted(
+                        Counter(
+                            record.source_kind_label
+                            for record in source_records
+                            if record.source_kind_label is not None
+                        ).items()
+                    )
+                )
+                if source == "NEIS"
+                else ()
+            ),
+            unclassified_school_policy_sha256=(
+                PINNED_POLICY_SHA256
+                if source == "NEIS"
+                and any(
+                    record.source_kind_label is not None
+                    for record in source_records
+                )
+                else None
             ),
         )
         for source, source_records in grouped.items()
     }
-
-
-def source_observation_date_counts_for(
-    source: str,
-    records: list[SourceInstitutionRecord],
-) -> tuple[tuple[str, int], ...]:
-    counts = Counter(record.source_as_of for record in records)
-    if source == "SEN_REVIEWED_CSV":
-        counts[max(counts)] += 1
-    return tuple(sorted(counts.items()))
 
 
 def standard_enrichment_provenance(
@@ -5428,6 +7389,28 @@ def reviewed_counts_fixture(counts: Mapping[str, int]) -> ReviewedSchoolCounts:
     )
 
 
+def reviewed_population_fixture() -> tuple[
+    SchoolCountPopulationProfile,
+    ReviewedSchoolCounts,
+    tuple[SourceInstitutionRecord, ...],
+    dict[str, SourceProvenance],
+]:
+    return shared_reviewed_population_fixture()
+
+
+def drift_one_elementary_record(
+    records: tuple[SourceInstitutionRecord, ...],
+) -> tuple[SourceInstitutionRecord, ...]:
+    mutable = list(records)
+    index = next(
+        index
+        for index, record in enumerate(mutable)
+        if record.source_kind_label == "초등학교"
+    )
+    mutable[index] = replace(mutable[index], institution_type="MIDDLE_SCHOOL")
+    return tuple(mutable)
+
+
 def records_for_type_counts(
     counts: Mapping[str, int],
 ) -> tuple[SourceInstitutionRecord, ...]:
@@ -5477,4 +7460,15 @@ def source_record(
         source_region_code="B10",
         source_as_of="2026-08-10",
         coordinate_quality="MANUALLY_VERIFIED",
+    )
+
+
+def mixed_neis_records() -> tuple[SourceInstitutionRecord, ...]:
+    dates = ("2026-04-23", "2026-04-23", "2026-05-17", "2026-06-07")
+    return tuple(
+        replace(
+            source_record(institution_id=f"neis:B10:{7010001 + index}"),
+            source_as_of=source_date,
+        )
+        for index, source_date in enumerate(dates)
     )

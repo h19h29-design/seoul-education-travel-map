@@ -3,16 +3,42 @@ import json
 import sys
 from pathlib import Path
 
-from app.institutions.sync import (
-    SnapshotQualityError,
-    approve_candidate_snapshot,
-)
+from app.institutions.sync import SnapshotQualityError, approve_candidate_snapshot
 from app.policy.coverage import CoverageService
+
+
+def _preflight_arguments(parser: argparse.ArgumentParser) -> None:
+    argument_index = 1
+    while argument_index < len(sys.argv):
+        if sys.argv[argument_index] in ("-h", "--help"):
+            argument_index += 1
+        elif sys.argv[argument_index] == "--snapshot-id":
+            argument_index += 2
+        elif sys.argv[argument_index].startswith("--snapshot-id="):
+            argument_index += 1
+        elif sys.argv[argument_index] == "--review-digest":
+            argument_index += 2
+        elif sys.argv[argument_index].startswith("--review-digest="):
+            argument_index += 1
+        elif sys.argv[argument_index] == "--reviewer-role":
+            argument_index += 2
+        elif sys.argv[argument_index].startswith("--reviewer-role="):
+            argument_index += 1
+        elif sys.argv[argument_index] == "--snapshot-root":
+            argument_index += 2
+        elif sys.argv[argument_index].startswith("--snapshot-root="):
+            argument_index += 1
+        elif sys.argv[argument_index] == "--geodata-root":
+            argument_index += 2
+        elif sys.argv[argument_index].startswith("--geodata-root="):
+            argument_index += 1
+        else:
+            parser.error("invalid command arguments")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Approve a reviewed Seoul education institution snapshot."
+        description="Approve an independently reviewed institution snapshot."
     )
     parser.add_argument("--snapshot-id", required=True)
     parser.add_argument("--review-digest", required=True)
@@ -27,6 +53,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("apps/travel-map/resources/geodata"),
     )
+    _preflight_arguments(parser)
     return parser.parse_args()
 
 
@@ -44,8 +71,8 @@ def main() -> int:
             snapshot_root=args.snapshot_root,
             coverage=coverage,
         )
-    except (SnapshotQualityError, OSError, ValueError) as exc:
-        print(f"candidate approval failed: {exc}", file=sys.stderr)
+    except (SnapshotQualityError, OSError, ValueError):
+        print("institution snapshot approval failed", file=sys.stderr)
         return 1
     print(
         json.dumps(

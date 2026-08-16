@@ -30,3 +30,5 @@ resources/geodata/source/
 resources/institution-sources/
 resources/raw/
 **/raw/
+**/._*
+**/.DS_Store
