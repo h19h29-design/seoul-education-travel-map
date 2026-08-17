@@ -100,7 +100,7 @@ class RuleRepository:
                 )
             source_refs = payload["sourceRefs"]
             if not isinstance(source_refs, list):
-                raise TypeError("source_refs must contain only non-blank HTTP(S) URLs")
+                raise TypeError("source_refs must contain only non-blank HTTPS URLs")
             rules.append(
                 RuleSet(
                     rule_set_id=payload["ruleSetId"],
@@ -175,12 +175,12 @@ class RuleRepository:
             raise ValueError("source_refs must not be empty")
         for source_ref in rule.source_refs:
             if type(source_ref) is not str or not source_ref.strip():
-                raise ValueError("source_refs must contain only non-blank HTTP(S) URLs")
+                raise ValueError("source_refs must contain only non-blank HTTPS URLs")
             parsed = urlsplit(source_ref)
             if (
                 source_ref != source_ref.strip()
                 or any(character.isspace() for character in source_ref)
-                or parsed.scheme not in {"http", "https"}
+                or parsed.scheme != "https"
                 or not parsed.hostname
             ):
-                raise ValueError("source_refs must contain only non-blank HTTP(S) URLs")
+                raise ValueError("source_refs must contain only non-blank HTTPS URLs")

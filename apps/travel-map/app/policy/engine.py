@@ -1,3 +1,4 @@
+from datetime import date
 from zoneinfo import ZoneInfo
 
 from app.policy.models import (
@@ -18,6 +19,9 @@ SEOUL_TIMEZONE = ZoneInfo("Asia/Seoul")
 class PolicyEngine:
     def __init__(self, rule_repository: RuleRepository) -> None:
         self._rule_repository = rule_repository
+
+    def rule_for_date(self, on_date: date) -> RuleSet:
+        return self._rule_repository.for_date(on_date)
 
     def calculate(self, policy_input: PolicyInput) -> PolicyResult:
         self._validate_input(policy_input)

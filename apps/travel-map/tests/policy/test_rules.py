@@ -213,7 +213,7 @@ def test_repository_rejects_duplicate_rule_set_ids() -> None:
     "source_ref",
     ["", "   ", "ftp://example.com/rule", "https:///missing-host", 1],
 )
-def test_repository_requires_nonblank_http_source_urls(source_ref: object) -> None:
+def test_repository_requires_nonblank_https_source_urls(source_ref: object) -> None:
     invalid = replace(
         make_rule("invalid", date(2026, 7, 1)),
         source_refs=(source_ref,),
@@ -221,7 +221,22 @@ def test_repository_requires_nonblank_http_source_urls(source_ref: object) -> No
 
     with pytest.raises(
         ValueError,
-        match=r"source_refs must contain only non-blank HTTP\(S\) URLs",
+        match="source_refs must contain only non-blank HTTPS URLs",
+    ):
+        RuleRepository((invalid,))
+
+
+# Production break caught: allowing a network observer to alter a disclosed legal
+# source by accepting a plain-HTTP policy reference.
+def test_repository_rejects_plain_http_source_reference() -> None:
+    invalid = replace(
+        make_rule("invalid", date(2026, 7, 1)),
+        source_refs=("http://www.law.go.kr/LSW/lsInfoP.do?lsiSeq=287535",),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="source_refs must contain only non-blank HTTPS URLs",
     ):
         RuleRepository((invalid,))
 

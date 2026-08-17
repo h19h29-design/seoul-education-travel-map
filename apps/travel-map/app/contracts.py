@@ -167,6 +167,20 @@ class TripPreviewResponse(ApiModel):
     warnings: tuple[str, ...]
 
 
+class PolicyDisclosureResponse(ApiModel):
+    profile: Literal["SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED"]
+    profile_label: Literal["서울특별시교육청 공무원 여비 기준"]
+    rule_set_id: str
+    effective_from: str
+    local_round_trip_exclusive_meters: int
+    actual_expense_inclusive_meters: int
+    four_hours_minutes: int
+    under_four_hours_krw: int
+    four_hours_or_more_krw: int
+    official_vehicle_deduction_krw: int
+    source_refs: tuple[str, ...]
+
+
 class InstitutionSearchItemResponse(ApiModel):
     institution_id: str
     site_id: str
