@@ -25,6 +25,19 @@ test("keeps institution filters available without crowding the initial form", as
   ).toBeVisible();
 });
 
+test("never renders a raw main site token when displayName is missing", async ({ page }) => {
+  const institutions = readFixture<{ items: Array<Record<string, string>> }>(
+    "institutions.json",
+  );
+  const malformed = { ...institutions.items[0], siteName: "main" };
+  delete malformed.displayName;
+  await installMockApi(page, { institutions: { items: [malformed] } });
+  await page.goto("/");
+  await page.getByLabel("출발 기관").fill("샘물");
+
+  await expect(page.getByRole("option", { name: /main/ })).toHaveCount(0);
+});
+
 test("uses normalized institution filters to narrow origin results", async ({ page }) => {
   const filterQueries: URL[] = [];
   await installMockApi(page);

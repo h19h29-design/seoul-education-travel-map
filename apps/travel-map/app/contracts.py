@@ -1,11 +1,13 @@
 """Pydantic contracts for the public no-login API."""
 
 from datetime import datetime, timedelta
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from pydantic.alias_generators import to_camel
 
+from app.institutions.facets import InstitutionFacetOption, InstitutionFacets
+from app.institutions.models import InstitutionSearchItem
 from app.policy.models import PolicyProfile, VehicleUse
 from app.routing.models import FuelType, TravelMode
 
@@ -151,8 +153,90 @@ class TripPreviewResponse(ApiModel):
     warnings: tuple[str, ...]
 
 
+class InstitutionSearchItemResponse(ApiModel):
+    institution_id: str
+    site_id: str
+    site_name: str
+    official_name: str
+    display_name: str
+    institution_type: str
+    foundation_type: str
+    education_office: str | None
+    road_address: str
+    district: str
+    coordinate: CoordinateResponse
+    coordinate_quality: str
+    snapshot_id: str
+    snapshot_as_of: str
+
+    @classmethod
+    def from_domain(cls, value: InstitutionSearchItem) -> Self:
+        return cls(
+            institution_id=value.institution_id,
+            site_id=value.site_id,
+            site_name=value.site_name,
+            official_name=value.official_name,
+            display_name=value.display_name,
+            institution_type=value.institution_type,
+            foundation_type=value.foundation_type,
+            education_office=value.education_office,
+            road_address=value.road_address,
+            district=value.district,
+            coordinate=CoordinateResponse(
+                latitude=value.coordinate.latitude,
+                longitude=value.coordinate.longitude,
+            ),
+            coordinate_quality=value.coordinate_quality,
+            snapshot_id=value.snapshot_id,
+            snapshot_as_of=value.snapshot_as_of,
+        )
+
+
 class InstitutionSearchResponse(ApiModel):
-    items: tuple[dict[str, object], ...]
+    items: tuple[InstitutionSearchItemResponse, ...]
+    total: int
+    next_offset: int | None
+    snapshot_id: str
+
+
+class InstitutionFacetOptionResponse(ApiModel):
+    value: str
+    label: str
+    count: int
+
+    @classmethod
+    def from_domain(cls, value: InstitutionFacetOption) -> Self:
+        return cls(value=value.value, label=value.label, count=value.count)
+
+
+class InstitutionFacetsResponse(ApiModel):
+    snapshot_id: str
+    institution_types: tuple[InstitutionFacetOptionResponse, ...]
+    foundation_types: tuple[InstitutionFacetOptionResponse, ...]
+    education_offices: tuple[InstitutionFacetOptionResponse, ...]
+    districts: tuple[InstitutionFacetOptionResponse, ...]
+
+    @classmethod
+    def from_domain(cls, value: InstitutionFacets) -> Self:
+        return cls(
+            snapshot_id=value.snapshot_id,
+            institution_types=tuple(
+                InstitutionFacetOptionResponse.from_domain(item)
+                for item in value.institution_types
+            ),
+            foundation_types=tuple(
+                InstitutionFacetOptionResponse.from_domain(item)
+                for item in value.foundation_types
+            ),
+            education_offices=tuple(
+                InstitutionFacetOptionResponse.from_domain(item)
+                for item in value.education_offices
+            ),
+            districts=tuple(
+                InstitutionFacetOptionResponse.from_domain(item)
+                for item in value.districts
+            ),
+        )
 
 
 class PlacesResponse(ApiModel):

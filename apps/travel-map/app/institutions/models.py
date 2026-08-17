@@ -1,10 +1,13 @@
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
+
+from app.routing.models import Coordinate
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -288,14 +291,24 @@ class InstitutionSearchItem(_StrictSnapshotModel):
     site_id: str
     site_name: str
     official_name: str
+    display_name: str
     institution_type: str
     foundation_type: str
     education_office: str | None
     road_address: str
     district: str
+    coordinate: Coordinate
     coordinate_quality: str
     snapshot_id: str
     snapshot_as_of: str
+
+
+@dataclass(frozen=True)
+class InstitutionSearchPage:
+    items: tuple[InstitutionSearchItem, ...]
+    total: int
+    next_offset: int | None
+    snapshot_id: str
 
 
 def _require_sorted_positive_count_map(

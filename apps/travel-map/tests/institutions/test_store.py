@@ -68,6 +68,115 @@ def load_store_with_verified_unclassified_school(tmp_path: Path) -> InstitutionS
     return InstitutionStore.load(snapshot_root)
 
 
+def load_store_with_equal_ranked_active_sites(tmp_path: Path) -> InstitutionStore:
+    snapshot_root = tmp_path / "equal-ranked-sites"
+    shutil.copytree(SNAPSHOT_ROOT, snapshot_root)
+    snapshot = snapshot_root / "fixture-001"
+    institution_path = snapshot / "institutions.jsonl"
+    site_path = snapshot / "sites.jsonl"
+    institutions = [
+        json.loads(line)
+        for line in institution_path.read_text(encoding="utf-8").splitlines()
+    ]
+    sites = [
+        json.loads(line) for line in site_path.read_text(encoding="utf-8").splitlines()
+    ]
+    base_institution = next(
+        item
+        for item in institutions
+        if item["institutionId"] == "test-neis:B10:SEMWATER-ES"
+    )
+    base_site = next(
+        item for item in sites if item["siteId"] == "test-neis:B10:SEMWATER-ES:main"
+    )
+    for number in range(21):
+        suffix = f"PAGED-{number:02d}"
+        institution = dict(base_institution)
+        institution.update(
+            {
+                "institutionId": f"test-neis:B10:{suffix}",
+                "officialName": f"동률학교{number:02d}",
+                "aliases": [],
+            }
+        )
+        site = dict(base_site)
+        site.update(
+            {
+                "siteId": f"test-neis:B10:{suffix}:main",
+                "institutionId": institution["institutionId"],
+                "roadAddress": f"서울특별시 샘물구 동률로 {number + 1}",
+            }
+        )
+        institutions.append(institution)
+        sites.append(site)
+    institution_bytes = (
+        "\n".join(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            for item in institutions
+        )
+        + "\n"
+    ).encode()
+    site_bytes = (
+        "\n".join(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            for item in sites
+        )
+        + "\n"
+    ).encode()
+    institution_path.write_bytes(institution_bytes)
+    site_path.write_bytes(site_bytes)
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["institutionsSha256"] = hashlib.sha256(institution_bytes).hexdigest()
+    manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
+    manifest["institutionCount"] += 21
+    manifest["siteCount"] += 21
+    manifest["countsByType"]["ELEMENTARY_SCHOOL"] += 21
+    manifest["countsByFoundation"]["PUBLIC"] += 21
+    manifest["countsByStatus"]["ACTIVE"] += 21
+    manifest["coordinateQualityCounts"]["ROOFTOP"] += 21
+    source = manifest["sources"][0]
+    source["fetchedRowCount"] += 21
+    source["rowCount"] += 21
+    source["normalizedRowCount"] += 21
+    source["normalizedObservationDateCounts"]["2026-08-01"] += 21
+    source["sourceObservationDateCounts"]["2026-08-01"] += 21
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return InstitutionStore.load(snapshot_root)
+
+
+def load_store_with_main_site_name(tmp_path: Path) -> InstitutionStore:
+    snapshot_root = tmp_path / "main-site-name"
+    shutil.copytree(SNAPSHOT_ROOT, snapshot_root)
+    snapshot = snapshot_root / "fixture-001"
+    site_path = snapshot / "sites.jsonl"
+    sites = [
+        json.loads(line) for line in site_path.read_text(encoding="utf-8").splitlines()
+    ]
+    next(item for item in sites if item["siteId"] == "test-neis:B10:SEMWATER-ES:main")[
+        "siteName"
+    ] = "main"
+    site_bytes = (
+        "\n".join(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+            for item in sites
+        )
+        + "\n"
+    ).encode()
+    site_path.write_bytes(site_bytes)
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sitesSha256"] = hashlib.sha256(site_bytes).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return InstitutionStore.load(snapshot_root)
+
+
 # Production break caught: collapsing two institutions because they share an address.
 def test_search_keeps_co_located_school_and_kindergarten_separate() -> None:
     store = InstitutionStore.load(SNAPSHOT_ROOT)
@@ -115,6 +224,68 @@ def test_search_returns_each_physical_site_with_its_site_name() -> None:
     assert [(item.site_id, item.site_name) for item in results] == [
         ("test-neis:B10:SAEBOM:branch", "분교장"),
         ("test-neis:B10:SAEBOM:main", "본교"),
+    ]
+
+
+# Production mutation caught: rendering the source site token instead of the
+# authoritative institution name for the sole selectable physical site.
+def test_single_site_search_uses_official_name(tmp_path: Path) -> None:
+    store = load_store_with_main_site_name(tmp_path)
+
+    result = store.search(query="샘물초등학교", limit=20)
+
+    assert result[0].official_name == "샘물초등학교"
+    assert result[0].site_name == "main"
+    assert result[0].display_name == "샘물초등학교"
+    assert store.display_name_for_site(result[0].site_id) == "샘물초등학교"
+
+
+# Production mutation caught: dropping a meaningful active branch label and
+# making two selectable physical sites indistinguishable in the origin picker.
+def test_multisite_headquarters_and_branch_have_distinct_display_names() -> None:
+    store = InstitutionStore.load(SNAPSHOT_ROOT)
+
+    results = store.search(query="새봄학교", limit=20)
+
+    assert [(item.site_name, item.display_name) for item in results] == [
+        ("분교장", "새봄학교 · 분교장"),
+        ("본교", "새봄학교 · 본교"),
+    ]
+
+
+# Production mutation caught: returning browser/address coordinates instead of
+# the verified active-site routing anchor attached to the selected site.
+def test_search_item_exposes_only_the_verified_routing_anchor_coordinate() -> None:
+    store = InstitutionStore.load(SNAPSHOT_ROOT)
+
+    item = store.search(query="샘물초등학교", limit=20)[0]
+
+    assert item.coordinate.latitude == 37.5501
+    assert item.coordinate.longitude == 126.9801
+    assert (item.coordinate.latitude, item.coordinate.longitude) != (37.55, 126.98)
+
+
+# Production mutation caught: slicing before stable sorting or failing to return
+# an exact next offset, which duplicates or omits equal-rank search results.
+def test_search_page_has_stable_nonoverlapping_offsets_and_total(
+    tmp_path: Path,
+) -> None:
+    store = load_store_with_equal_ranked_active_sites(tmp_path)
+
+    first = store.search_page(query="동률학교", limit=20, offset=0)
+    second = store.search_page(
+        query="동률학교", limit=20, offset=first.next_offset or 0
+    )
+
+    combined = first.items + second.items
+    assert first.total == 21
+    assert first.next_offset == 20
+    assert second.next_offset is None
+    assert len(combined) == 21
+    assert len({item.site_id for item in combined}) == 21
+    assert [item.site_id for item in combined] == [
+        item.site_id
+        for item in store.search_page(query="동률학교", limit=50, offset=0).items
     ]
 
 

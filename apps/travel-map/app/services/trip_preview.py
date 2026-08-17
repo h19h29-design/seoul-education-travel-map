@@ -52,7 +52,11 @@ class TripPreviewService:
             longitude=request.destination.longitude,
         )
         coverage_state = self._dependencies.coverage.classify(destination)
-        origin_response = _origin_response(site, origin)
+        origin_response = _origin_response(
+            site,
+            origin,
+            self._dependencies.institutions.display_name_for_site(site.site_id),
+        )
         snapshot_id = _snapshot_id(self._dependencies, site.site_id)
 
         if coverage_state is CoverageState.OUTSIDE:
@@ -264,10 +268,14 @@ def _site_coordinate(site: InstitutionSite) -> Coordinate:
     )
 
 
-def _origin_response(site: InstitutionSite, coordinate: Coordinate) -> OriginResponse:
+def _origin_response(
+    site: InstitutionSite,
+    coordinate: Coordinate,
+    display_name: str,
+) -> OriginResponse:
     return OriginResponse(
         site_id=site.site_id,
-        name=site.site_name,
+        name=display_name,
         address=site.road_address,
         coordinate=CoordinateResponse(
             latitude=coordinate.latitude,

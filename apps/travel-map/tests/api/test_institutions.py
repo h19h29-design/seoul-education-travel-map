@@ -15,6 +15,43 @@ def test_institutions_search_returns_public_camel_case_records(client) -> None:
     assert "site_id" not in body["items"][0]
 
 
+# Production mutation caught: requiring an anonymous text query even when an
+# approved server-side facet alone identifies the institution search result.
+def test_institutions_api_lists_items_for_filter_only_blank_query(client) -> None:
+    response = client.get(
+        "/api/v1/institutions",
+        params={"institution_type": "KINDERGARTEN"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["siteId"] for item in body["items"]] == [
+        "test-neis:B10:SEMWATER-KG:main"
+    ]
+    assert body["total"] == 1
+    assert body["nextOffset"] is None
+    assert body["snapshotId"] == "fixture-001"
+
+
+# Production mutation caught: leaking source-office strings or snake_case facet
+# fields instead of counted canonical options at the anonymous API boundary.
+def test_institution_facets_api_uses_counted_camel_case_options(client) -> None:
+    response = client.get("/api/v1/institutions/facets")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["snapshotId"] == "fixture-001"
+    assert body["institutionTypes"] == [
+        {"value": "ELEMENTARY_SCHOOL", "label": "ELEMENTARY_SCHOOL", "count": 5},
+        {"value": "KINDERGARTEN", "label": "KINDERGARTEN", "count": 1},
+    ]
+    assert {
+        item["value"]: (item["label"], item["count"])
+        for item in body["educationOffices"]
+    }["SEOUL_EDU_SUPPORT_GANGNAM_SEOCHO"] == ("강남서초교육지원청", 1)
+    assert "institution_types" not in body
+
+
 def test_institutions_search_applies_normalized_type_and_foundation_filters(
     client,
 ) -> None:

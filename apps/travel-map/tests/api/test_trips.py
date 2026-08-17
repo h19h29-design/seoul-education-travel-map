@@ -1,5 +1,30 @@
+from pathlib import Path
+
 from app.cache import WALK_TTL_SECONDS
 from tests.api.conftest import trip_payload
+from tests.institutions.test_store import load_store_with_main_site_name
+
+
+# Production mutation caught: showing the source site token (including `main`)
+# as a trip origin despite the canonical picker/search display-name rule.
+def test_main_site_uses_official_name_in_search_and_trip_origin(
+    client,
+    tmp_path: Path,
+) -> None:
+    client.app.state.dependencies.institutions = load_store_with_main_site_name(
+        tmp_path
+    )
+    search = client.get("/api/v1/institutions", params={"q": "샘물초등학교"})
+    preview = client.post("/api/v1/trips/preview", json=trip_payload())
+
+    assert search.status_code == preview.status_code == 200
+    searched = next(
+        item
+        for item in search.json()["items"]
+        if item["siteId"] == "test-neis:B10:SEMWATER-ES:main"
+    )
+    assert searched["displayName"] == "샘물초등학교"
+    assert preview.json()["origin"]["name"] == "샘물초등학교"
 
 
 # Break caught: trusting caller coordinates for an institution origin instead of its verified site id.

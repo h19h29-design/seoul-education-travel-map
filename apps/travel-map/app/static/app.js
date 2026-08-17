@@ -101,7 +101,7 @@ function setDefaultDates() {
 
 function optionText(item, kind) {
   return kind === "origin"
-    ? `${item.siteName} · ${institutionDetails(item)}`
+    ? `${item.displayName} · ${institutionDetails(item)}`
     : `${item.name} · ${item.roadAddress || item.lotAddress}`;
 }
 
@@ -142,7 +142,7 @@ function renderSuggestions(kind, items) {
 function selectSuggestion(kind, item) {
   if (kind === "origin") {
     state.origin = item;
-    controls.origin.value = item.siteName;
+    controls.origin.value = item.displayName;
     controls.originNote.textContent = institutionDetails(item);
   } else {
     state.destination = item;

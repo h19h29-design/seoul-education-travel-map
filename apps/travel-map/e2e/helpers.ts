@@ -6,6 +6,7 @@ import type { Page, Route } from "@playwright/test";
 const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 export type MockApiOptions = {
+  institutions?: { items: Array<Record<string, string>> };
   preview?: object;
   previewForPayload?: (payload: Record<string, unknown>) => object;
   reverse?: object;
@@ -136,7 +137,7 @@ export async function installMockApi(
   );
   await page.route("**/api/v1/institutions**", (route) => {
     const requestUrl = new URL(route.request().url());
-    const payload = readFixture<{ items: Array<Record<string, string>> }>("institutions.json");
+    const payload = options.institutions ?? readFixture<{ items: Array<Record<string, string>> }>("institutions.json");
     const items = payload.items.filter((item) => (
       (!requestUrl.searchParams.get("institution_type") || item.institutionType === requestUrl.searchParams.get("institution_type"))
       && (!requestUrl.searchParams.get("foundation_type") || item.foundationType === requestUrl.searchParams.get("foundation_type"))
