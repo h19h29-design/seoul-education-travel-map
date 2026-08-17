@@ -355,7 +355,7 @@ GET    /api/v1/policy/current
 5. ID 토큰의 서명, `iss`, `aud`, `iat`, `exp`, `nonce`를 검증한다.
 6. `sub`는 별도 비밀키로 HMAC 처리해 내부 사용자 키를 만든다.
 7. 카카오 토큰과 선택 프로필 정보는 검증 직후 폐기한다.
-8. 32바이트 세션 토큰을 만들고 DB에는 SHA-256 해시만 저장한다.
+8. 32바이트 세션 토큰을 만들고 DB에는 별도 세션 비밀키를 사용한 HMAC-SHA-256 digest만 저장한다.
 9. 쿠키 이름은 `__Host-travel_session`으로 고정하고 `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`을 사용한다.
 10. 세션은 절대 7일 만료이며 서버에서 즉시 폐기할 수 있다.
 
@@ -363,6 +363,7 @@ GET    /api/v1/policy/current
 
 카카오 콘솔 설정:
 
+- 길찾기·장소검색용 `KAKAO_REST_API_KEY`와 분리된 로그인 전용 카카오 애플리케이션/REST 키 사용
 - Kakao Login 활성화
 - OpenID Connect 활성화
 - REST API 키의 Client secret 활성화
@@ -552,8 +553,11 @@ user_settings
 - 사용자 DB만 10 TB `/volume2`에 둔다.
 - Compose는 `/data` 쓰기 볼륨을 추가하고 나머지 루트 파일시스템은 읽기 전용으로 유지한다.
 - DB 디렉터리를 기존 이미지·설정 백업과 분리하고 백업 제외 규칙을 검증한다.
-- 운영 비밀값에 Kakao Client secret, 세션 비밀, 사용자 HMAC 키, 데이터 암호화 키를 추가한다.
+- 로그인 전용 공개 client ID와 그 Client secret, 세션 비밀, 사용자 HMAC 키, 데이터 암호화 키를 운영 설정에 추가한다. 길찾기·장소검색용 `KAKAO_REST_API_KEY`는 authorize URL에 재사용하거나 브라우저에 노출하지 않는다.
 - 키 값은 Git, 이미지, Compose, Notion, 로그, 스크린샷에 기록하지 않는다.
+- NAS 아키텍처용으로 전체 release gate를 통과한 동일 로컬 이미지 한 개만 GHCR에 게시하고, 원격 manifest의 config digest가 검토된 로컬 image ID와 일치한 경우에만 `@sha256:` 참조로 배포한다. 게시 과정에서 이미지를 다시 빌드하지 않는다.
+- Compose·마이그레이션·배포·백업 제외 자산은 검토된 `main`에서 비공개 staging으로 복사하고, 양쪽 SHA-256을 대조한 뒤 고정 권한으로 원자적으로 설치한다. `runtime.env`와 이미지 digest 파일은 이 복사 과정에서 덮어쓰지 않는다.
+- 현재 운영 이미지의 유효한 불변 GHCR digest를 `0600` rollback 기준으로 보존하지 못하면 최초 교체도 중단한다. 새 배포는 기존 digest를 별도 rollback 파일로 검증·복사한 뒤에만 마이그레이션과 Compose 교체를 진행한다.
 - 배포 전 DB 마이그레이션을 별도 검증하고 실패 시 이전 이미지와 빈 DB 상태로 롤백할 수 있어야 한다.
 - 배포 후 비로그인 계산, 로그인, 근무지 저장, 이력 생성·삭제, 168시간 정리 시뮬레이션을 확인한다.
 
