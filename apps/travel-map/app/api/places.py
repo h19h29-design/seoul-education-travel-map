@@ -72,8 +72,10 @@ async def reverse_places(
 
 
 def _check_places_limit(request: Request) -> None:
-    decision = dependencies_for(request).rate_limiter.check(
-        "places", client_ip(request)
+    dependencies = dependencies_for(request)
+    decision = dependencies.rate_limiter.check(
+        "places",
+        client_ip(request, dependencies.settings.trusted_proxy_cidrs or ()),
     )
     if not decision.allowed:
         raise HTTPException(

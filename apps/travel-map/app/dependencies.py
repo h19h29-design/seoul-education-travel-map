@@ -1,14 +1,20 @@
 """Application-owned dependencies and production fail-closed assembly."""
 
 import json
+import sqlite3
+from base64 import b64decode
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
 import orjson
+from pydantic import SecretStr
 
 from app.auth.models import UserServices
+from app.auth.oauth import KakaoOidcClient, OAuthAttemptRepository
+from app.auth.session import SessionService
 from app.cache import TtlLruCache
 from app.institutions.store import InstitutionStore
 from app.policy.coverage import CoverageService, verify_geodata_resources
@@ -26,6 +32,13 @@ from app.routing.models import Coordinate
 from app.routing.orchestrator import RouteOrchestrator
 from app.routing.provider import RouteProvider
 from app.settings import Settings
+from app.storage.crypto import PayloadCipher
+from app.storage.database import SqliteDatabase
+from app.storage.history import HistoryRepository
+from app.storage.models import StorageIntegrityError
+from app.storage.retention import RetentionCleaner
+from app.storage.user_settings import UserSettingsRepository
+from app.storage.users import UserSessionRepository
 
 
 class PlaceClient(Protocol):
@@ -82,6 +95,8 @@ class AppDependencies:
                     yield from chain
         yield self.classification_provider
         yield self.place_client
+        if type(self.user_services) is UserServices:
+            yield self.user_services.oidc_client
 
 
 def build_production_dependencies(settings: Settings) -> AppDependencies:
@@ -101,6 +116,7 @@ def build_production_dependencies(settings: Settings) -> AppDependencies:
         "seoul-plus-12km.geojson",
     )
     route_providers = build_route_providers(settings)
+    user_services = _optional_user_services(settings)
     return AppDependencies(
         settings=settings,
         institutions=InstitutionStore.load(snapshot_root),
@@ -122,11 +138,69 @@ def build_production_dependencies(settings: Settings) -> AppDependencies:
         ),
         cache=TtlLruCache(max_entries=2_000),
         rate_limiter=FixedWindowRateLimiter(
-            limits={"places": (10, 60.0), "preview": (20, 60.0)}
+            limits={
+                "places": (10, 60.0),
+                "preview": (20, 60.0),
+                "auth-start": (10, 60.0),
+                "auth-callback": (20, 60.0),
+            }
         ),
         seoul_geojson=seoul_geojson,
         support_geojson=support_geojson,
+        user_services=user_services,
     )
+
+
+def _optional_user_services(settings: Settings) -> UserServices | None:
+    """Contain verified private-store failures at the optional login boundary."""
+
+    if settings.user_database_path is None:
+        return None
+    try:
+        return _build_user_services(settings)
+    except (StorageIntegrityError, sqlite3.Error):
+        return None
+
+
+def _build_user_services(settings: Settings) -> UserServices:
+    """Assemble private services only after the operator-provisioned schema verifies."""
+
+    if (
+        settings.user_database_path is None
+        or settings.kakao_oidc_client_id is None
+        or settings.kakao_oidc_client_secret is None
+        or settings.session_hmac_key is None
+        or settings.kakao_subject_hmac_key is None
+        or settings.data_encryption_key_v1 is None
+    ):
+        raise StorageIntegrityError("storage configuration is unavailable")
+    database = SqliteDatabase(Path(settings.user_database_path))
+    database.verify_current_schema()
+    session_hmac_key = _decode_settings_key(settings.session_hmac_key)
+    subject_hmac_key = _decode_settings_key(settings.kakao_subject_hmac_key)
+    data_encryption_key = _decode_settings_key(settings.data_encryption_key_v1)
+    cipher = PayloadCipher(keys={1: data_encryption_key})
+    return UserServices(
+        oauth_attempts=OAuthAttemptRepository(database, hmac_key=session_hmac_key),
+        sessions=SessionService(
+            UserSessionRepository(database), hmac_key=session_hmac_key
+        ),
+        history=HistoryRepository(database, cipher, clock=lambda: datetime.now(UTC)),
+        settings=UserSettingsRepository(database, cipher),
+        retention_cleaner=RetentionCleaner(database, clock=lambda: datetime.now(UTC)),
+        oidc_client=KakaoOidcClient(
+            client_id=settings.kakao_oidc_client_id,
+            client_secret=settings.kakao_oidc_client_secret,
+            subject_hmac_key=subject_hmac_key,
+            timeout_seconds=settings.provider_timeout_seconds,
+        ),
+    )
+
+
+def _decode_settings_key(value: SecretStr) -> bytes:
+    """Decode a Settings-validated unpadded base64url key without logging it."""
+
+    return b64decode(value.get_secret_value() + "=", altchars=b"-_", validate=True)
 
 
 def _verified_geojson_bytes(data: bytes, label: str) -> bytes:

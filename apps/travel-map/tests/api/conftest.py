@@ -255,7 +255,12 @@ def client(
         place_client=fake_place_client,
         cache=TtlLruCache(max_entries=100, now=lambda: cache_clock[0]),
         rate_limiter=FixedWindowRateLimiter(
-            limits={"places": (10, 60.0), "preview": (20, 60.0)}
+            limits={
+                "places": (10, 60.0),
+                "preview": (20, 60.0),
+                "auth-start": (10, 60.0),
+                "auth-callback": (20, 60.0),
+            }
         ),
         seoul_geojson=(FIXTURES / "geodata/seoul-square.geojson").read_bytes(),
         support_geojson=(FIXTURES / "geodata/seoul-square.geojson").read_bytes(),

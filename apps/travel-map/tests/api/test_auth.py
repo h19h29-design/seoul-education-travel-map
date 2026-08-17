@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -9,6 +10,7 @@ from app.auth.oauth import OAuthAttemptRepository
 from app.auth.session import SessionService
 from app.settings import Settings
 from app.storage.database import SqliteDatabase
+from app.storage.models import StorageIntegrityError
 from app.storage.users import UserSessionRepository
 
 pytest_plugins = ("tests.api.conftest",)
@@ -118,6 +120,117 @@ def test_auth_unavailable_responses_are_no_store_and_clear_callback_attempt(
     assert callback.json() == {"error": {"code": "AUTH_UNAVAILABLE"}}
     assert callback.headers["cache-control"] == "no-store"
     assert callback.headers["pragma"] == "no-cache"
+    cleared = callback.headers.get_list("set-cookie")
+    assert len(cleared) == 1
+    assert "__Host-travel_oauth=" in cleared[0]
+    assert "Max-Age=0" in cleared[0]
+
+
+class _UnavailableAttempts:
+    def __init__(self, error_type: type[Exception]) -> None:
+        self._error_type = error_type
+
+    async def create(self, *, now: datetime) -> object:
+        raise self._error_type("storage unavailable")
+
+    async def consume(self, *, attempt_token: str, state: str, now: datetime) -> bytes:
+        raise self._error_type("storage unavailable")
+
+
+class _UnavailableSessions:
+    def __init__(self, error_type: type[Exception]) -> None:
+        self._error_type = error_type
+
+    async def resolve(self, *, raw_token: str, now: datetime) -> None:
+        raise self._error_type("storage unavailable")
+
+
+class _OperationFailingConnection:
+    def execute(self, statement: str, *args: object) -> object:
+        if statement == "BEGIN IMMEDIATE":
+            return object()
+        raise sqlite3.OperationalError("sqlite unavailable")
+
+    def rollback(self) -> None:
+        return None
+
+
+# Break caught: OAuthAttemptRepository translating a SQLite execution failure
+# into AuthRejected, which makes real post-start storage outages look like a
+# normal login rejection and return a redirect instead of a fixed 503.
+def test_oauth_operation_sqlite_failure_is_fixed_auth_unavailable(
+    client, tmp_path: Path, monkeypatch
+) -> None:
+    database = SqliteDatabase(tmp_path / "private" / "travel-map.sqlite3")
+    database.migrate()
+
+    async def failing_write(operation: object) -> object:
+        return operation(_OperationFailingConnection())  # type: ignore[operator]
+
+    monkeypatch.setattr(database, "write", failing_write)
+    dependencies = client.app.state.dependencies
+    dependencies.user_services = UserServices(
+        oauth_attempts=OAuthAttemptRepository(database, hmac_key=b"o" * 32),
+        sessions=None,
+        history=None,
+        settings=None,
+        retention_cleaner=None,
+        oidc_client=None,
+    )
+
+    start = client.get("/auth/kakao/start", follow_redirects=False)
+    callback = client.get(
+        "/auth/kakao/callback?state=state&code=code",
+        headers={"Cookie": "__Host-travel_oauth=attempt"},
+        follow_redirects=False,
+    )
+
+    for response in (start, callback):
+        assert response.status_code == 503
+        assert response.json() == {"error": {"code": "AUTH_UNAVAILABLE"}}
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["pragma"] == "no-cache"
+    cleared = callback.headers.get_list("set-cookie")
+    assert len(cleared) == 1
+    assert "__Host-travel_oauth=" in cleared[0]
+    assert "Max-Age=0" in cleared[0]
+
+
+# Break caught: a private-store failure after startup returning a redirect or
+# raw 500 rather than the fixed fail-closed 503 for every login/account API.
+@pytest.mark.parametrize(
+    "error_type", (StorageIntegrityError, sqlite3.OperationalError)
+)
+def test_post_start_storage_outage_is_fixed_auth_unavailable(
+    client, error_type: type[Exception]
+) -> None:
+    dependencies = client.app.state.dependencies
+    dependencies.user_services = UserServices(
+        oauth_attempts=_UnavailableAttempts(error_type),
+        sessions=_UnavailableSessions(error_type),
+        history=None,
+        settings=None,
+        retention_cleaner=None,
+        oidc_client=None,
+    )
+
+    start = client.get("/auth/kakao/start", follow_redirects=False)
+    callback = client.get(
+        "/auth/kakao/callback?state=state&code=code",
+        headers={"Cookie": "__Host-travel_oauth=attempt"},
+        follow_redirects=False,
+    )
+    me = client.get(
+        "/api/v1/me",
+        headers={"Cookie": "__Host-travel_session=opaque"},
+    )
+
+    for response in (start, callback, me):
+        assert response.status_code == 503
+        assert response.json() == {"error": {"code": "AUTH_UNAVAILABLE"}}
+        assert response.headers["cache-control"] == "no-store"
+    for response in (start, callback):
+        assert response.headers["pragma"] == "no-cache"
     cleared = callback.headers.get_list("set-cookie")
     assert len(cleared) == 1
     assert "__Host-travel_oauth=" in cleared[0]

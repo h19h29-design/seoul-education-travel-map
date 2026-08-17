@@ -174,9 +174,8 @@ class Settings(BaseSettings):
             if (
                 type(network) not in {IPv4Network, IPv6Network}
                 or network.prefixlen != network.max_prefixlen
-                or not network.network_address.is_global
             ):
-                raise ValueError("trusted proxy CIDRs must be exact global peers")
+                raise ValueError("trusted proxy CIDRs must be exact peers")
             networks.append(network)
         if len(networks) != len(set(networks)):
             raise ValueError("trusted proxy CIDRs must be unique")

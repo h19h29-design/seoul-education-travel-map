@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import sqlite3
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -16,12 +18,17 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api import router as api_router
 from app.api.auth import oauth_router
+from app.api.common import client_ip
+from app.auth.models import UserServices
 from app.dependencies import AppDependencies, build_production_dependencies
 from app.settings import Settings
+from app.storage.models import StorageIntegrityError
 
 _ACCESS_LOG = logging.getLogger("travel_map.access")
 _MAX_REQUEST_BYTES = 32 * 1024
 _MAX_CONTENT_LENGTH_DIGITS = 20
+_RETENTION_RETRY_SECONDS = 60 * 60
+_USER_STORAGE_LOG = logging.getLogger("travel_map.user_storage")
 # Kakao Maps loads the SDK bootstrap/API from dapi.kakao.com, its runtime from
 # t1.daumcdn.net, and map tile images from Daum CDN subdomains. These are the
 # only third-party origins required by the public map; no inline code is allowed.
@@ -37,6 +44,22 @@ _PUBLIC_CONTENT_SECURITY_POLICY = (
     "form-action 'self'; "
     "frame-ancestors 'none'"
 )
+
+
+async def _supervise_retention(cleaner: object) -> None:
+    """Keep the sole cleanup task alive only across fixed storage failures."""
+
+    run_forever = getattr(cleaner, "run_forever", None)
+    if not callable(run_forever):
+        raise TypeError("retention cleaner is invalid")
+    while True:
+        try:
+            await run_forever()
+        except asyncio.CancelledError:
+            raise
+        except (StorageIntegrityError, sqlite3.Error):
+            _USER_STORAGE_LOG.warning("code=STORAGE_CLEANUP_UNAVAILABLE")
+            await asyncio.sleep(_RETENTION_RETRY_SECONDS)
 
 
 class RequestTooLargeError(Exception):
@@ -178,11 +201,33 @@ def create_app(
         if active_dependencies is None and active_settings.environment == "production":
             active_dependencies = build_production_dependencies(active_settings)
         app.state.dependencies = active_dependencies
+        retention_task: asyncio.Task[None] | None = None
+        if (
+            type(active_dependencies) is AppDependencies
+            and type(active_dependencies.user_services) is UserServices
+        ):
+            retention_task = asyncio.create_task(
+                _supervise_retention(
+                    active_dependencies.user_services.retention_cleaner
+                ),
+                name="travel-map-retention",
+            )
         try:
             yield
         finally:
+            retention_failure: Exception | None = None
+            if retention_task is not None:
+                retention_task.cancel()
+                try:
+                    await retention_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # noqa: BLE001 - propagate task failures after close
+                    retention_failure = exc
             if active_dependencies is not None:
                 await active_dependencies.aclose()
+            if retention_failure is not None:
+                raise retention_failure
 
     app = FastAPI(
         title="서울교육기관 관내출장 지도",
@@ -232,6 +277,35 @@ def create_app(
             "Permissions-Policy", "geolocation=(), camera=(), microphone=()"
         )
         return response
+
+    @app.middleware("http")
+    async def auth_rate_limit(request: Request, call_next: object) -> object:
+        """Reject OAuth floods before any private-store or provider operation."""
+
+        scope = {
+            ("GET", "/auth/kakao/start"): "auth-start",
+            ("GET", "/auth/kakao/callback"): "auth-callback",
+        }.get((request.method, request.url.path))
+        active_dependencies = getattr(request.app.state, "dependencies", None)
+        if scope is not None and type(active_dependencies) is AppDependencies:
+            decision = active_dependencies.rate_limiter.check(
+                scope,
+                client_ip(
+                    request,
+                    active_dependencies.settings.trusted_proxy_cidrs or (),
+                ),
+            )
+            if not decision.allowed:
+                return JSONResponse(
+                    {"error": {"code": "RATE_LIMITED"}},
+                    status_code=429,
+                    headers={
+                        "Retry-After": str(decision.retry_after_seconds),
+                        "Cache-Control": "no-store",
+                        "Pragma": "no-cache",
+                    },
+                )
+        return await call_next(request)  # type: ignore[operator]
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:

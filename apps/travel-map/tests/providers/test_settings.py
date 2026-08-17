@@ -216,7 +216,7 @@ def test_allowed_hosts_are_exact_canonical_names(host: str) -> None:
         ("public_base_url", "https://other.example"),
         ("user_database_path", "/tmp/travel-map.sqlite3"),
         ("allowed_origins", ("https://other.example",)),
-        ("trusted_proxy_cidrs", ("10.0.0.1/32",)),
+        ("trusted_proxy_cidrs", ("10.0.0.0/24",)),
         ("trusted_proxy_cidrs", ("1.1.1.0/24",)),
     ],
 )
@@ -283,7 +283,7 @@ def test_partial_auth_settings_are_rejected_in_development(environment: str) -> 
     assert settings.user_database_path == "/data/travel-map.sqlite3"
 
 
-def test_environment_trusted_proxy_list_requires_one_exact_global_peer(
+def test_environment_trusted_proxy_list_requires_one_exact_peer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://travel.h19h19.com")
@@ -298,6 +298,18 @@ def test_environment_trusted_proxy_list_requires_one_exact_global_peer(
     settings = Settings(_env_file=None)
 
     assert settings.trusted_proxy_cidrs == (ip_network("1.1.1.1/32"),)
+
+
+# Break caught: the exact local Cloudflare connector/NAT socket peer being
+# rejected even though only its one host address (not a private network) is
+# trusted to supply the canonical global CF client address.
+def test_settings_allows_only_exact_loopback_connector_peer() -> None:
+    values = auth_storage_values()
+    values["trusted_proxy_cidrs"] = ("127.0.0.1/32",)
+
+    settings = Settings(environment="test", **values, _env_file=None)
+
+    assert settings.trusted_proxy_cidrs == (ip_network("127.0.0.1/32"),)
 
 
 @pytest.mark.parametrize(

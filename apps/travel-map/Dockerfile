@@ -51,4 +51,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
 
 # create_app builds production dependencies during the lifespan startup. Invalid
 # credentials or a missing/invalid approved snapshot therefore prevent serving.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log", "--no-proxy-headers"]

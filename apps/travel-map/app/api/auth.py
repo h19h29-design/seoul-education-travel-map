@@ -1,5 +1,6 @@
 """Top-level Kakao login and versioned opaque-session endpoints."""
 
+import sqlite3
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, Request
@@ -49,8 +50,10 @@ async def kakao_start(request: Request) -> Response:
         )
         _set_attempt_cookie(response, issued.attempt_token)
         return response
-    except (AuthRejected, StorageIntegrityError):
+    except AuthRejected:
         return _redirect(_HOME_LOCATION)
+    except (StorageIntegrityError, sqlite3.Error):
+        return auth_unavailable_response(clear_attempt=False)
 
 
 @oauth_router.get("/kakao/callback")
@@ -80,8 +83,10 @@ async def kakao_callback(
             subject_hmac=verified.subject_hmac,
             now=datetime.now(UTC),
         )
-    except (AuthRejected, OidcLoginFailed, StorageIntegrityError):
+    except (AuthRejected, OidcLoginFailed):
         return _cleared_attempt_redirect()
+    except (StorageIntegrityError, sqlite3.Error):
+        return auth_unavailable_response(clear_attempt=True)
     except OidcInternalError:
         return _cleared_internal_oidc_error()
     response = _redirect(_HOME_LOCATION)
@@ -93,11 +98,14 @@ async def kakao_callback(
 @session_router.post("/logout", status_code=204)
 async def logout(request: Request) -> Response:
     services = user_services_for(request)
-    await require_mutating_principal(request, services=services)
-    raw_token = request.cookies.get(_SESSION_COOKIE)
-    if raw_token is None:
-        raise HTTPException(status_code=401, detail="UNAUTHENTICATED")
-    await services.sessions.revoke(raw_token=raw_token)
+    try:
+        await require_mutating_principal(request, services=services)
+        raw_token = request.cookies.get(_SESSION_COOKIE)
+        if raw_token is None:
+            raise HTTPException(status_code=401, detail="UNAUTHENTICATED")
+        await services.sessions.revoke(raw_token=raw_token)
+    except (StorageIntegrityError, sqlite3.Error):
+        return auth_unavailable_response(clear_attempt=False)
     response = Response(status_code=204)
     _clear_all_auth_cookies(response)
     return response
@@ -156,14 +164,18 @@ def _oauth_services_or_unavailable(
     except HTTPException as exc:
         if exc.status_code != 503 or exc.detail != "AUTH_UNAVAILABLE":
             raise
-        response = JSONResponse(
-            {"error": {"code": "AUTH_UNAVAILABLE"}}, status_code=503
-        )
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["Pragma"] = "no-cache"
-        if clear_attempt:
-            _clear_attempt_cookie(response)
-        return response
+        return auth_unavailable_response(clear_attempt=clear_attempt)
+
+
+def auth_unavailable_response(*, clear_attempt: bool) -> JSONResponse:
+    """Return the fixed private-store boundary without diagnostic context."""
+
+    response = JSONResponse({"error": {"code": "AUTH_UNAVAILABLE"}}, status_code=503)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    if clear_attempt:
+        _clear_attempt_cookie(response)
+    return response
 
 
 def _cleared_attempt_redirect() -> RedirectResponse:

@@ -115,9 +115,12 @@ class OAuthAttemptRepository:
             except AuthRejected:
                 connection.rollback()
                 raise
-            except (sqlite3.Error, _OidcSchemaFailure):
+            except _OidcSchemaFailure:
                 connection.rollback()
                 raise AuthRejected() from None
+            except sqlite3.Error:
+                connection.rollback()
+                raise StorageIntegrityError("storage unavailable") from None
 
         await self._database.write(operation)
         return IssuedOAuthAttempt(
@@ -163,7 +166,7 @@ class OAuthAttemptRepository:
                 raise
             except sqlite3.Error:
                 connection.rollback()
-                raise AuthRejected() from None
+                raise StorageIntegrityError("storage unavailable") from None
 
         return await self._database.write(operation)
 
