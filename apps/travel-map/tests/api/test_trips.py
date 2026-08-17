@@ -1,8 +1,402 @@
+from datetime import datetime
 from pathlib import Path
 
+import pytest
 from app.cache import WALK_TTL_SECONDS
+from app.routing.models import Coordinate, TravelMode
 from tests.api.conftest import trip_payload
 from tests.institutions.test_store import load_store_with_main_site_name
+
+ORIGIN = Coordinate(latitude=37.5501, longitude=126.9801)
+DESTINATION = Coordinate(latitude=37.5662952, longitude=126.9779451)
+STARTS_AT = datetime.fromisoformat("2026-08-10T09:00:00+09:00")
+ENDS_AT = datetime.fromisoformat("2026-08-10T13:00:00+09:00")
+
+
+def route_for(leg: dict[str, object], mode: str) -> dict[str, object]:
+    routes = leg["routes"]
+    assert isinstance(routes, list)
+    return next(route for route in routes if route["mode"] == mode)
+
+
+# Production mutation caught: planning only the outbound leg, swapping a leg's
+# endpoints/time, or letting display and classification providers plan independently.
+def test_round_trip_queries_both_display_and_classification_legs_at_exact_times(
+    client,
+    fake_route_providers,
+    fake_classification_provider,
+) -> None:
+    response = client.post("/api/v1/trips/preview", json=trip_payload())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [leg["direction"] for leg in body["routeLegs"]] == ["OUTBOUND", "RETURN"]
+    for mode, provider in fake_route_providers.items():
+        assert len(provider.queries) == 2
+        outbound, returning = provider.queries
+        assert (outbound.origin, outbound.destination, outbound.depart_at) == (
+            ORIGIN,
+            DESTINATION,
+            STARTS_AT,
+        )
+        assert (returning.origin, returning.destination, returning.depart_at) == (
+            DESTINATION,
+            ORIGIN,
+            ENDS_AT,
+        )
+        assert outbound.mode is returning.mode is mode
+    assert [
+        (query.origin, query.destination, query.depart_at, query.mode)
+        for query in fake_classification_provider.queries
+    ] == [
+        (ORIGIN, DESTINATION, STARTS_AT, TravelMode.CAR),
+        (DESTINATION, ORIGIN, ENDS_AT, TravelMode.CAR),
+    ]
+
+
+# Production mutation caught: issuing a hidden return provider request or adding
+# a return-leg fastest cost to an outbound-only preview.
+def test_outbound_only_never_queries_return_providers_or_counts_return_cost(
+    client,
+    fake_route_providers,
+    fake_classification_provider,
+) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(tripPattern="OUTBOUND_ONLY_END_AFTER_SCHEDULE"),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [leg["direction"] for leg in body["routeLegs"]] == ["OUTBOUND"]
+    assert body["mobilityCost"] == {
+        "status": "ESTIMATED",
+        "amountKrw": 2_000,
+        "warnings": [],
+    }
+    for mode, provider in fake_route_providers.items():
+        assert len(provider.queries) == 1
+        query = provider.queries[0]
+        assert (query.origin, query.destination, query.depart_at, query.mode) == (
+            ORIGIN,
+            DESTINATION,
+            STARTS_AT,
+            mode,
+        )
+    assert len(fake_classification_provider.queries) == 1
+    assert fake_classification_provider.queries[0].origin == ORIGIN
+
+
+# Production mutation caught: treating return-only as an outbound departure or
+# querying it at startsAt instead of endsAt.
+def test_return_only_queries_destination_to_workplace_at_ends_at_only(
+    client,
+    fake_route_providers,
+    fake_classification_provider,
+) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(
+            tripPattern="RETURN_ONLY_DIRECT_TO_DESTINATION",
+            carAssumptions={
+                "fuelType": "GASOLINE",
+                "efficiencyKmPerLiter": 10.0,
+                "parkingCostKrw": 700,
+            },
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [leg["direction"] for leg in body["routeLegs"]] == ["RETURN"]
+    assert body["mobilityCost"]["amountKrw"] == 2_700
+    for mode, provider in fake_route_providers.items():
+        assert len(provider.queries) == 1
+        query = provider.queries[0]
+        assert (query.origin, query.destination, query.depart_at, query.mode) == (
+            DESTINATION,
+            ORIGIN,
+            ENDS_AT,
+            mode,
+        )
+    assert [
+        (query.origin, query.destination, query.depart_at, query.mode)
+        for query in fake_classification_provider.queries
+    ] == [(DESTINATION, ORIGIN, ENDS_AT, TravelMode.CAR)]
+
+
+# Production mutation caught: flattening both directions into one route collection
+# or exposing one direction's fastest amount as the whole-trip total.
+def test_route_legs_keep_directional_routes_and_costs_separate(client) -> None:
+    response = client.post("/api/v1/trips/preview", json=trip_payload())
+
+    assert response.status_code == 200
+    body = response.json()
+    outbound, returning = body["routeLegs"]
+    assert outbound["departAt"] == "2026-08-10T09:00:00+09:00"
+    assert returning["departAt"] == "2026-08-10T13:00:00+09:00"
+    assert outbound["mobilityCost"]["amountKrw"] == 2_000
+    assert returning["mobilityCost"]["amountKrw"] == 2_500
+    assert outbound["best"]["fastestRouteId"] == route_for(outbound, "CAR")["id"]
+    assert returning["best"]["fastestRouteId"] == route_for(returning, "CAR")["id"]
+    assert body["mobilityCost"]["amountKrw"] == 4_500
+    assert "routes" not in body
+    assert "best" not in body
+
+
+# Production mutation caught: summing only known directional fastest costs and
+# presenting a partial trip total instead of withholding the aggregate amount.
+def test_unknown_fastest_leg_cost_makes_aggregate_mobility_cost_partial(
+    client,
+    fake_route_providers,
+) -> None:
+    fake_route_providers[TravelMode.CAR].return_unknown_cost_on_call(2)
+
+    response = client.post("/api/v1/trips/preview", json=trip_payload())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [leg["mobilityCost"] for leg in body["routeLegs"]] == [
+        {"status": "ESTIMATED", "amountKrw": 2_000, "warnings": []},
+        {"status": "UNKNOWN", "amountKrw": None, "warnings": []},
+    ]
+    assert body["mobilityCost"] == {
+        "status": "UNKNOWN",
+        "amountKrw": None,
+        "warnings": ["PARTIAL_MOBILITY_COST"],
+    }
+
+
+# Production mutation caught: forwarding the configured parking assumption into
+# both round-trip car queries instead of only the outbound car leg.
+def test_round_trip_applies_parking_cost_exactly_once(
+    client,
+    fake_route_providers,
+) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(
+            carAssumptions={
+                "fuelType": "GASOLINE",
+                "efficiencyKmPerLiter": 10.0,
+                "parkingCostKrw": 3_000,
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    cars = [route_for(leg, "CAR") for leg in body["routeLegs"]]
+    assert [car["costBreakdown"]["parkingKrw"] for car in cars] == [3_000, 0]
+    assert sum(car["costBreakdown"]["parkingKrw"] for car in cars) == 3_000
+    assert body["mobilityCost"]["amountKrw"] == 7_500
+    car_queries = fake_route_providers[TravelMode.CAR].queries
+    assert [query.car_assumptions.parking_cost_krw for query in car_queries] == [
+        3_000,
+        0,
+    ]
+
+
+# Production mutation caught: using coverage to suppress a supported one-way route,
+# or paying an outside trip from one-way lower-bound evidence.
+def test_outside_one_way_returns_its_actual_route_leg_but_requires_allowance_review(
+    client,
+    fake_route_providers,
+) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(
+            tripPattern="OUTBOUND_ONLY_END_AFTER_SCHEDULE",
+            destination={
+                "name": "부산광역시청",
+                "address": "부산광역시 연제구 중앙대로 1001",
+                "latitude": 35.1798159,
+                "longitude": 129.0750222,
+            },
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["coverage"]["status"] == "OUT_OF_COVERAGE"
+    assert [leg["direction"] for leg in body["routeLegs"]] == ["OUTBOUND"]
+    assert len(body["routeLegs"][0]["routes"]) == 3
+    assert all(provider.call_count == 1 for provider in fake_route_providers.values())
+    assert body["classificationDistanceMeters"] == 1_500
+    assert body["classificationDistanceBasis"] == "ONE_WAY_LOWER_BOUND"
+    assert body["classification"] == "REVIEW_REQUIRED"
+    assert body["allowance"] == {
+        "status": "REVIEW_REQUIRED",
+        "amountKrw": None,
+        "warnings": ["TRIP_PATTERN_DISTANCE_RULE_UNVERIFIED"],
+    }
+
+
+# Production mutation caught: treating a BUFFER destination as provider-ineligible
+# or converting its one-way distance into a fabricated exact round trip.
+def test_buffer_one_way_returns_its_actual_route_leg_but_requires_allowance_review(
+    client,
+    fake_route_providers,
+) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(
+            tripPattern="RETURN_ONLY_DIRECT_TO_DESTINATION",
+            destination={
+                "name": "서울 북쪽 지원영역",
+                "address": "경기도 고양시 덕양구",
+                "latitude": 37.61,
+                "longitude": 126.98,
+            },
+        ),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["coverage"]["status"] == "BUFFER"
+    assert [leg["direction"] for leg in body["routeLegs"]] == ["RETURN"]
+    assert len(body["routeLegs"][0]["routes"]) == 3
+    assert all(provider.call_count == 1 for provider in fake_route_providers.values())
+    assert body["classificationDistanceBasis"] == "ONE_WAY_LOWER_BOUND"
+    assert body["allowance"]["status"] == "REVIEW_REQUIRED"
+    assert body["allowance"]["amountKrw"] is None
+    assert body["allowance"]["warnings"] == ["TRIP_PATTERN_DISTANCE_RULE_UNVERIFIED"]
+
+
+# Production mutation caught: treating a short Seoul one-way lower bound as proof
+# that the inclusive two-kilometre rule has been resolved.
+def test_short_seoul_one_way_requires_distance_rule_review(client) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(tripPattern="OUTBOUND_ONLY_END_AFTER_SCHEDULE"),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["classification"] == "LOCAL"
+    assert body["classificationDistanceMeters"] == 1_500
+    assert body["classificationDistanceBasis"] == "ONE_WAY_LOWER_BOUND"
+    assert body["allowance"] == {
+        "status": "REVIEW_REQUIRED",
+        "amountKrw": None,
+        "warnings": ["TRIP_PATTERN_DISTANCE_RULE_UNVERIFIED"],
+    }
+
+
+# Production mutation caught: substituting zero or a claimed basis when any
+# classification leg required by the selected pattern is missing.
+def test_missing_classification_leg_has_no_distance_basis_and_requires_review(
+    client,
+    fake_classification_provider,
+) -> None:
+    fake_classification_provider.return_no_route_on_call(2)
+
+    response = client.post("/api/v1/trips/preview", json=trip_payload())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["routeLegs"]
+    assert body["classification"] == "REVIEW_REQUIRED"
+    assert body["classificationDistanceMeters"] is None
+    assert body["classificationDistanceBasis"] is None
+    assert body["classificationPath"] is None
+    assert body["allowance"] == {
+        "status": "REVIEW_REQUIRED",
+        "amountKrw": None,
+        "warnings": ["DISTANCE_EVIDENCE_UNAVAILABLE"],
+    }
+    assert "DISTANCE_EVIDENCE_UNAVAILABLE" in body["warnings"]
+
+
+# Production mutation caught: retaining either removed request field as an alias
+# or allowing callers to choose the server-owned policy scope.
+@pytest.mark.parametrize(
+    ("legacy_field", "value"),
+    [
+        ("returnsAt", "2026-08-10T13:00:00+09:00"),
+        ("policyProfile", "NONPUBLIC_OR_UNKNOWN"),
+    ],
+)
+def test_preview_rejects_legacy_returns_at_and_caller_policy_profile(
+    client,
+    legacy_field: str,
+    value: str,
+) -> None:
+    payload = trip_payload()
+    payload[legacy_field] = value
+
+    response = client.post("/api/v1/trips/preview", json=payload)
+
+    assert response.status_code == 422
+
+
+# Production mutation caught: using naive wall time, a non-positive/one-minute
+# interval, or a duration longer than the public 24-hour contract.
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"startsAt": "2026-08-10T09:00:00"},
+        {"endsAt": "2026-08-10T13:00:00"},
+        {"endsAt": "2026-08-10T08:59:00+09:00"},
+        {"endsAt": "2026-08-10T09:01:00+09:00"},
+        {"endsAt": "2026-08-11T09:00:01+09:00"},
+    ],
+)
+def test_preview_rejects_naive_reversed_one_minute_and_over_twenty_four_hour_intervals(
+    client,
+    overrides: dict[str, object],
+) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(**overrides),
+    )
+
+    assert response.status_code == 422
+
+
+# Production mutation caught: loosening the canonical site-id grammar or either
+# side of the previous-allowance public bound.
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"originSiteId": "BAD SITE ID"},
+        {"previousAllowanceKrw": -1},
+        {"previousAllowanceKrw": 20_001},
+    ],
+)
+def test_preview_rejects_invalid_origin_id_and_previous_allowance_bounds(
+    client,
+    overrides: dict[str, object],
+) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(**overrides),
+    )
+
+    assert response.status_code == 422
+
+
+# Production mutation caught: deriving policy scope from request/login state or
+# returning anything other than the fixed public Seoul education profile.
+@pytest.mark.parametrize(
+    "trip_pattern",
+    [
+        "ROUND_TRIP",
+        "OUTBOUND_ONLY_END_AFTER_SCHEDULE",
+        "RETURN_ONLY_DIRECT_TO_DESTINATION",
+    ],
+)
+def test_preview_always_reports_seoul_education_policy_scope(
+    client,
+    trip_pattern: str,
+) -> None:
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(tripPattern=trip_pattern),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["policyScope"] == "SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED"
 
 
 # Production mutation caught: showing the source site token (including `main`)
@@ -27,14 +421,15 @@ def test_main_site_uses_official_name_in_search_and_trip_origin(
     assert preview.json()["origin"]["name"] == "샘물초등학교"
 
 
-# Break caught: trusting caller coordinates for an institution origin instead of its verified site id.
+# Production mutation caught: trusting caller coordinates for the origin or
+# merging mobility cost and allowance into one amount.
 def test_trip_preview_resolves_origin_by_site_id_and_separates_costs(client) -> None:
     response = client.post("/api/v1/trips/preview", json=trip_payload())
 
     assert response.status_code == 200
     body = response.json()
     assert body["origin"]["siteId"] == "test-neis:B10:SEMWATER-ES:main"
-    assert body["best"]["fastestRouteId"]
+    assert body["routeLegs"][0]["best"]["fastestRouteId"]
     assert body["mobilityCost"] != body["allowance"]
     assert body["allowance"]["amountKrw"] == 20_000
 
@@ -87,74 +482,59 @@ def test_same_day_remaining_allowance_never_exceeds_the_daily_cap(client) -> Non
     assert exhausted.json()["allowance"]["amountKrw"] == 0
 
 
-# Break caught: contacting route providers after an out-of-coverage destination has been determined.
-def test_outside_coverage_stops_before_provider_calls(client, fake_provider) -> None:
-    payload = trip_payload(
-        destination={
-            "name": "부산광역시청",
-            "address": "부산광역시 연제구 중앙대로 1001",
-            "latitude": 35.1798159,
-            "longitude": 129.0750222,
-        }
-    )
-
-    response = client.post("/api/v1/trips/preview", json=payload)
-
-    assert response.status_code == 200
-    assert response.json()["coverage"]["status"] == "OUT_OF_COVERAGE"
-    assert response.json()["routes"] == []
-    assert fake_provider.call_count == 0
-
-
-# Break caught: assigning a flat allowance when the employment status is unverified.
-def test_unknown_profile_returns_routes_but_withholds_allowance(client) -> None:
-    response = client.post(
-        "/api/v1/trips/preview",
-        json=trip_payload(policyProfile="NONPUBLIC_OR_UNKNOWN"),
-    )
-
-    assert response.status_code == 200
-    assert response.json()["routes"]
-    assert response.json()["allowance"]["status"] == "REVIEW_REQUIRED"
-    assert response.json()["allowance"]["amountKrw"] is None
-
-
-# Break caught: repeating an identical preview invokes display route providers inside
-# their five-minute cache window.
+# Production mutation caught: repeating an identical preview invokes either
+# direction's display providers inside their five-minute cache window.
 def test_trip_preview_caches_display_routes(client, fake_provider) -> None:
     first = client.post("/api/v1/trips/preview", json=trip_payload())
     second = client.post("/api/v1/trips/preview", json=trip_payload())
 
     assert first.status_code == second.status_code == 200
-    assert fake_provider.call_count == 1
+    assert fake_provider.call_count == 2
 
 
-# Break caught: a combined five-minute display cache expiring walk results with
-# car/transit, instead of retaining the walk mode for its seven-day policy.
+# Production mutation caught: a combined five-minute display cache expires walk
+# results with car/transit instead of retaining each direction's seven-day walk entry.
 def test_trip_preview_keeps_walk_cached_after_car_and_transit_expire(
-    client, cache_clock
+    client,
+    cache_clock,
 ) -> None:
     first = client.post("/api/v1/trips/preview", json=trip_payload())
     cache_clock[0] += 301.0
     second = client.post("/api/v1/trips/preview", json=trip_payload())
 
     assert first.status_code == second.status_code == 200
-    first_ids = {route["mode"]: route["id"] for route in first.json()["routes"]}
-    second_ids = {route["mode"]: route["id"] for route in second.json()["routes"]}
-    assert second_ids["WALK"] == first_ids["WALK"]
-    assert second_ids["CAR"] != first_ids["CAR"]
-    assert second_ids["TRANSIT"] != first_ids["TRANSIT"]
+    first_ids = {
+        (leg["direction"], route["mode"]): route["id"]
+        for leg in first.json()["routeLegs"]
+        for route in leg["routes"]
+    }
+    second_ids = {
+        (leg["direction"], route["mode"]): route["id"]
+        for leg in second.json()["routeLegs"]
+        for route in leg["routes"]
+    }
+    for direction in ("OUTBOUND", "RETURN"):
+        assert second_ids[(direction, "WALK")] == first_ids[(direction, "WALK")]
+        assert second_ids[(direction, "CAR")] != first_ids[(direction, "CAR")]
+        assert second_ids[(direction, "TRANSIT")] != first_ids[(direction, "TRANSIT")]
 
     cache_clock[0] = WALK_TTL_SECONDS + 1.0
     expired = client.post("/api/v1/trips/preview", json=trip_payload())
-    expired_ids = {route["mode"]: route["id"] for route in expired.json()["routes"]}
+    expired_ids = {
+        (leg["direction"], route["mode"]): route["id"]
+        for leg in expired.json()["routeLegs"]
+        for route in leg["routes"]
+    }
     assert expired.status_code == 200
-    assert expired_ids["WALK"] != first_ids["WALK"]
+    for direction in ("OUTBOUND", "RETURN"):
+        assert expired_ids[(direction, "WALK")] != first_ids[(direction, "WALK")]
 
 
-# Break caught: using the displayed route or one-way distance for the legal two-kilometre branch.
+# Production mutation caught: using display distance or one direction only for
+# the legal two-kilometre branch of a round trip.
 def test_seoul_destination_uses_two_directional_distance_for_two_km_branch(
-    client, fake_classification_provider
+    client,
+    fake_classification_provider,
 ) -> None:
     fake_classification_provider.set_directional_distances(900, 1_100)
 
@@ -164,6 +544,7 @@ def test_seoul_destination_uses_two_directional_distance_for_two_km_branch(
     body = response.json()
     assert body["classification"] == "LOCAL"
     assert body["classificationDistanceMeters"] == 2_000
+    assert body["classificationDistanceBasis"] == "ROUND_TRIP_EXACT"
     assert body["allowance"]["status"] == "REVIEW_REQUIRED"
     assert body["allowance"]["amountKrw"] is None
     assert [query.origin for query in fake_classification_provider.queries] == [

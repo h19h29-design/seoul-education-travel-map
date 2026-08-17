@@ -85,7 +85,7 @@ export class KakaoMapController {
     this.overlays.forEach((overlay) => overlay.setMap?.(null));
     this.overlays = [];
     this.routeLines.clear();
-    this.element.dataset.activeRoute = "";
+    this.element.dataset.activeRoutes = "";
   }
 
   showRoutes({ origin, destination, routes, classificationPath }) {
@@ -130,15 +130,16 @@ export class KakaoMapController {
     this.map.setBounds?.(bounds);
   }
 
-  setActiveRoute(routeId) {
+  setActiveRoutes(routeIds) {
     if (!this.map) return;
+    const activeRouteIds = new Set(routeIds);
     this.routeLines.forEach((line, id) => {
       line.setOptions?.({
-        strokeWeight: id === routeId ? 8 : 4,
-        strokeOpacity: id === routeId ? 1 : 0.35,
+        strokeWeight: activeRouteIds.has(id) ? 8 : 4,
+        strokeOpacity: activeRouteIds.has(id) ? 1 : 0.35,
       });
     });
-    this.element.dataset.activeRoute = routeId;
+    this.element.dataset.activeRoutes = routeIds.join(" ");
   }
 
   async setBoundary(name, visible, fetchGeojson) {

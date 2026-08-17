@@ -550,20 +550,8 @@ def test_live_case_report_only_emits_approved_operational_fields() -> None:
     module = runpy.run_path(str(SMOKE), run_name="release_smoke_test")
     report_case = module["_case_report"]
     response = TripPreviewResponse.model_validate(
-        {
-            "coverage": {"status": "SEOUL"},
-            "origin": {
-                "siteId": "test-neis:B10:private-origin",
-                "name": "sensitive origin",
-                "address": "sensitive origin address",
-                "coordinate": {"latitude": 37.55, "longitude": 126.98},
-            },
-            "institutionSnapshotId": "fixture-001",
-            "policyScope": "NONPUBLIC_OR_UNKNOWN",
-            "classification": "LOCAL",
-            "classificationDistanceMeters": 1200,
-            "classificationPath": None,
-            "routes": [
+        _trip_response_payload(
+            routes=[
                 {
                     "id": "sensitive-route-id",
                     "mode": "CAR",
@@ -581,18 +569,8 @@ def test_live_case_report_only_emits_approved_operational_fields() -> None:
                     "warnings": [],
                 }
             ],
-            "best": {
-                "fastestRouteId": "sensitive-route-id",
-                "shortestRouteId": "sensitive-route-id",
-                "cheapestRouteId": "sensitive-route-id",
-            },
-            "mobilityCost": {"status": "KNOWN", "amountKrw": 200},
-            "allowance": {"status": "REVIEW_REQUIRED", "amountKrw": None},
-            "ruleSetId": "fixture-rule",
-            "effectiveFrom": "2026-08-01",
-            "sourceRefs": [],
-            "warnings": [],
-        }
+            warnings=[],
+        )
     )
 
     report = report_case("NONPUBLIC", response, latency_ms=12)
@@ -712,17 +690,32 @@ def _trip_response_payload(
             "coordinate": {"latitude": 37.55, "longitude": 126.98},
         },
         "institutionSnapshotId": "fixture-001",
-        "policyScope": "NONPUBLIC_OR_UNKNOWN",
+        "tripPattern": "OUTBOUND_ONLY_END_AFTER_SCHEDULE",
+        "routeLegs": [
+            {
+                "direction": "OUTBOUND",
+                "departAt": "2026-08-10T09:00:00Z",
+                "routes": routes,
+                "best": {
+                    "fastestRouteId": route_id if routes else None,
+                    "shortestRouteId": route_id if routes else None,
+                    "cheapestRouteId": route_id if routes else None,
+                },
+                "mobilityCost": {
+                    "status": "KNOWN" if routes else "UNKNOWN",
+                    "amountKrw": 200 if routes else None,
+                },
+            }
+        ],
+        "policyScope": "SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED",
         "classification": "LOCAL",
         "classificationDistanceMeters": 1200,
+        "classificationDistanceBasis": "ONE_WAY_LOWER_BOUND",
         "classificationPath": None,
-        "routes": routes,
-        "best": {
-            "fastestRouteId": route_id if routes else None,
-            "shortestRouteId": route_id if routes else None,
-            "cheapestRouteId": route_id if routes else None,
+        "mobilityCost": {
+            "status": "KNOWN" if routes else "UNKNOWN",
+            "amountKrw": 200 if routes else None,
         },
-        "mobilityCost": {"status": "KNOWN", "amountKrw": 200},
         "allowance": {"status": "REVIEW_REQUIRED", "amountKrw": None},
         "ruleSetId": "fixture-rule",
         "effectiveFrom": "2026-08-01",

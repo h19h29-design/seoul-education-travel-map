@@ -13,7 +13,7 @@
       <a class="brand" href="/" aria-label="서울교육 출장 경로·여비 계산 홈">서울교육 출장 경로·여비 계산</a>
       <nav class="utility-nav" aria-label="도움말 및 설정">
         <a href="#notice">ⓘ 사용 안내</a>
-        <a href="#policy-profile">▧ 관련 규정</a>
+        <a href="#policy-disclosure">▧ 관련 규정</a>
         <a href="#results">◷ 계산 이력</a>
         <button type="button" class="utility-button">⚙ 설정</button>
       </nav>
@@ -89,15 +89,10 @@
               </label>
             </div>
 
-            <label class="select-field" for="policy-profile">적용 규정
-              <select id="policy-profile" required>
-                <option value="">선택하세요</option>
-                <option value="SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED">서울시교육청 공무원 신분 확인</option>
-                <option value="NATIONAL_PUBLIC_OFFICIAL_CONFIRMED">국가공무원 여비 규정 적용 확인</option>
-                <option value="INTERNAL_RULE_ADOPTION_CONFIRMED_BY_USER">기관 내부 규정 준용 확인</option>
-                <option value="NONPUBLIC_OR_UNKNOWN">사립 또는 신분·규정 미확인</option>
-              </select>
-            </label>
+            <section id="policy-disclosure" class="policy-disclosure" role="note" aria-label="고정 적용 규정">
+              <strong>적용 규정</strong>
+              <span>서울시교육청 공무원 여비 규정(공무원 신분 확인)을 고정 적용합니다.</span>
+            </section>
 
             <fieldset class="vehicle-assumptions">
               <legend>자동차 이용 가정 <span>(선택)</span></legend>
@@ -164,7 +159,7 @@
           <label><input id="support-layer" type="checkbox" /> 12km 지원영역</label>
           <p>경로를 선택하면 해당 선을 강조합니다.</p>
         </div>
-        <div id="map" class="map-canvas" aria-label="서울 출장 경로 지도" data-active-route="">
+        <div id="map" class="map-canvas" aria-label="서울 출장 경로 지도" data-active-routes="">
           <div class="map-placeholder" aria-hidden="true"><span>서울 지도</span><small>경로 계산 후 지도에 표시합니다</small></div>
           <p id="map-status" class="map-status" role="status">지도를 준비하고 있습니다.</p>
         </div>

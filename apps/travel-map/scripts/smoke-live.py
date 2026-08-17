@@ -11,12 +11,12 @@ from pathlib import Path
 from time import perf_counter
 from zoneinfo import ZoneInfo
 
-from app.contracts import TripPreviewRequest, TripPreviewResponse
+from app.contracts import RouteResponse, TripPreviewRequest, TripPreviewResponse
 from app.dependencies import AppDependencies, build_production_dependencies
 from app.environment import EnvironmentFileError, load_environment_file
 from app.institutions.models import InstitutionSearchItem
 from app.institutions.snapshot import SnapshotIntegrityError, verify_snapshot
-from app.policy.models import CoverageState, PolicyProfile, VehicleUse
+from app.policy.models import CoverageState, VehicleUse
 from app.routing.models import Coordinate, FuelType
 from app.services.trip_preview import TripPreviewService
 from app.settings import Settings
@@ -89,9 +89,7 @@ class SmokeCase:
     case_id: str
     origin_site_id: str
     destination: dict[str, str | float]
-    policy_profile: PolicyProfile
     expect_local: bool = False
-    expect_no_allowance_amount: bool = False
     expect_out_of_coverage: bool = False
 
 
@@ -118,7 +116,7 @@ def _case_report(
     return {
         "caseId": case_id,
         "providerStatus": _provider_status(response),
-        "routeCount": len(response.routes),
+        "routeCount": len(_all_routes(response)),
         "decision": response.classification,
         "latencyMs": latency_ms,
     }
@@ -127,7 +125,7 @@ def _case_report(
 def _provider_status(response: TripPreviewResponse) -> str:
     if response.coverage.status == "OUT_OF_COVERAGE":
         return "NOT_CALLED_OUT_OF_COVERAGE"
-    if response.routes:
+    if _all_routes(response):
         return "ROUTES_AVAILABLE"
     for warning in response.warnings:
         provider_status = _PROVIDER_STATUS_BY_WARNING.get(warning)
@@ -177,14 +175,14 @@ def _nearest_active_school_site(
 
 def _request_for(case: SmokeCase) -> TripPreviewRequest:
     starts_at = datetime.now(_SEOUL_TZ).replace(second=0, microsecond=0)
-    returns_at = starts_at + timedelta(hours=4)
+    ends_at = starts_at + timedelta(hours=4)
     return TripPreviewRequest.model_validate(
         {
             "originSiteId": case.origin_site_id,
             "destination": case.destination,
             "startsAt": starts_at.isoformat(),
-            "returnsAt": returns_at.isoformat(),
-            "policyProfile": case.policy_profile.value,
+            "endsAt": ends_at.isoformat(),
+            "tripPattern": "ROUND_TRIP",
             "vehicleUse": VehicleUse.NONE.value,
             "carAssumptions": {
                 "fuelType": FuelType.GASOLINE.value,
@@ -216,20 +214,23 @@ def _validate_case(
     case: SmokeCase,
     response: TripPreviewResponse,
 ) -> None:
+    routes = _all_routes(response)
     if case.expect_out_of_coverage:
-        if response.coverage.status != "OUT_OF_COVERAGE" or response.routes:
+        if response.coverage.status != "OUT_OF_COVERAGE" or routes:
             raise SmokeExpectationError("out-of-coverage response was not fail-closed")
         return
-    if not response.routes:
+    if not routes:
         raise SmokeExpectationError("a route response was required")
     if case.expect_local:
-        mode_count = len({route.mode for route in response.routes})
+        mode_count = len({route.mode for route in routes})
         if response.classification != "LOCAL" or mode_count < 2:
             raise SmokeExpectationError(
                 "public local case did not meet route expectations"
             )
-    if case.expect_no_allowance_amount and response.allowance.amount_krw is not None:
-        raise SmokeExpectationError("nonpublic case exposed an allowance amount")
+
+
+def _all_routes(response: TripPreviewResponse) -> tuple[RouteResponse, ...]:
+    return tuple(route for leg in response.route_legs for route in leg.routes)
 
 
 async def _run_cases(dependencies: AppDependencies) -> list[dict[str, object]]:
@@ -241,21 +242,17 @@ async def _run_cases(dependencies: AppDependencies) -> list[dict[str, object]]:
             case_id="PUBLIC_LOCAL",
             origin_site_id=public_site_id,
             destination=_CITY_HALL,
-            policy_profile=PolicyProfile.SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED,
             expect_local=True,
         ),
         SmokeCase(
-            case_id="NONPUBLIC",
+            case_id="PRIVATE_ORIGIN",
             origin_site_id=private_site_id,
             destination=_CITY_HALL,
-            policy_profile=PolicyProfile.NONPUBLIC_OR_UNKNOWN,
-            expect_no_allowance_amount=True,
         ),
         SmokeCase(
             case_id="OUT_OF_COVERAGE",
             origin_site_id=public_site_id,
             destination=_OUT_OF_COVERAGE,
-            policy_profile=PolicyProfile.SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED,
             expect_out_of_coverage=True,
         ),
     )

@@ -12,9 +12,147 @@
     }
   },
   "institutionSnapshotId": "fixture-001",
+  "tripPattern": "ROUND_TRIP",
+  "routeLegs": [
+    {
+      "direction": "OUTBOUND",
+      "departAt": "2026-08-10T09:00:00+09:00",
+      "routes": [
+        {
+          "id": "transit-1",
+          "mode": "TRANSIT",
+          "durationSeconds": 1650,
+          "distanceMeters": 7900,
+          "mobilityCostKrw": 1400,
+          "costStatus": "KNOWN",
+          "costBreakdown": { "fareKrw": 1400, "fuelKrw": null, "tollKrw": null, "parkingKrw": null },
+          "geometry": [
+            { "latitude": 37.5585, "longitude": 126.9752 },
+            { "latitude": 37.5612, "longitude": 126.9814 },
+            { "latitude": 37.5663, "longitude": 126.9779 }
+          ],
+          "source": "SEOUL_TRANSIT",
+          "sourceAsOf": "2026-08-10T09:00:00+09:00",
+          "warnings": []
+        },
+        {
+          "id": "car-1",
+          "mode": "CAR",
+          "durationSeconds": 1200,
+          "distanceMeters": 10100,
+          "mobilityCostKrw": 6500,
+          "costStatus": "ESTIMATED",
+          "costBreakdown": { "fareKrw": null, "fuelKrw": 5500, "tollKrw": 0, "parkingKrw": 1000 },
+          "geometry": [
+            { "latitude": 37.5585, "longitude": 126.9752 },
+            { "latitude": 37.5531, "longitude": 126.9654 },
+            { "latitude": 37.5663, "longitude": 126.9779 }
+          ],
+          "source": "KAKAO_MOBILITY",
+          "sourceAsOf": "2026-08-10T09:00:00+09:00",
+          "warnings": ["PARKING_COST_ESTIMATED"]
+        },
+        {
+          "id": "walk-1",
+          "mode": "WALK",
+          "durationSeconds": 2100,
+          "distanceMeters": 2900,
+          "mobilityCostKrw": 0,
+          "costStatus": "KNOWN",
+          "costBreakdown": { "fareKrw": 0, "fuelKrw": null, "tollKrw": null, "parkingKrw": null },
+          "geometry": [
+            { "latitude": 37.5585, "longitude": 126.9752 },
+            { "latitude": 37.5625, "longitude": 126.9728 },
+            { "latitude": 37.5663, "longitude": 126.9779 }
+          ],
+          "source": "KAKAO_LOCAL",
+          "sourceAsOf": "2026-08-10T09:00:00+09:00",
+          "warnings": []
+        }
+      ],
+      "best": {
+        "fastestRouteId": "car-1",
+        "shortestRouteId": "walk-1",
+        "cheapestRouteId": "walk-1"
+      },
+      "mobilityCost": {
+        "status": "ESTIMATED",
+        "amountKrw": 6500,
+        "warnings": ["PARKING_COST_ESTIMATED"]
+      }
+    },
+    {
+      "direction": "RETURN",
+      "departAt": "2026-08-10T13:00:00+09:00",
+      "routes": [
+        {
+          "id": "transit-1",
+          "mode": "TRANSIT",
+          "durationSeconds": 1750,
+          "distanceMeters": 8000,
+          "mobilityCostKrw": 1400,
+          "costStatus": "KNOWN",
+          "costBreakdown": { "fareKrw": 1400, "fuelKrw": null, "tollKrw": null, "parkingKrw": null },
+          "geometry": [
+            { "latitude": 37.5663, "longitude": 126.9779 },
+            { "latitude": 37.5612, "longitude": 126.9814 },
+            { "latitude": 37.5585, "longitude": 126.9752 }
+          ],
+          "source": "SEOUL_TRANSIT",
+          "sourceAsOf": "2026-08-10T13:00:00+09:00",
+          "warnings": []
+        },
+        {
+          "id": "car-1",
+          "mode": "CAR",
+          "durationSeconds": 1300,
+          "distanceMeters": 10200,
+          "mobilityCostKrw": 5500,
+          "costStatus": "ESTIMATED",
+          "costBreakdown": { "fareKrw": null, "fuelKrw": 5500, "tollKrw": 0, "parkingKrw": 0 },
+          "geometry": [
+            { "latitude": 37.5663, "longitude": 126.9779 },
+            { "latitude": 37.5531, "longitude": 126.9654 },
+            { "latitude": 37.5585, "longitude": 126.9752 }
+          ],
+          "source": "KAKAO_MOBILITY",
+          "sourceAsOf": "2026-08-10T13:00:00+09:00",
+          "warnings": []
+        },
+        {
+          "id": "walk-1",
+          "mode": "WALK",
+          "durationSeconds": 2200,
+          "distanceMeters": 3000,
+          "mobilityCostKrw": 0,
+          "costStatus": "KNOWN",
+          "costBreakdown": { "fareKrw": 0, "fuelKrw": null, "tollKrw": null, "parkingKrw": null },
+          "geometry": [
+            { "latitude": 37.5663, "longitude": 126.9779 },
+            { "latitude": 37.5625, "longitude": 126.9728 },
+            { "latitude": 37.5585, "longitude": 126.9752 }
+          ],
+          "source": "KAKAO_LOCAL",
+          "sourceAsOf": "2026-08-10T13:00:00+09:00",
+          "warnings": []
+        }
+      ],
+      "best": {
+        "fastestRouteId": "car-1",
+        "shortestRouteId": "walk-1",
+        "cheapestRouteId": "walk-1"
+      },
+      "mobilityCost": {
+        "status": "ESTIMATED",
+        "amountKrw": 5500,
+        "warnings": []
+      }
+    }
+  ],
   "policyScope": "SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED",
   "classification": "LOCAL",
   "classificationDistanceMeters": 12800,
+  "classificationDistanceBasis": "ROUND_TRIP_EXACT",
   "classificationPath": {
     "id": "classification-outbound+classification-return",
     "distanceMeters": 12800,
@@ -24,73 +162,15 @@
       { "latitude": 37.5585, "longitude": 126.9752 }
     ],
     "source": "KAKAO_MOBILITY+KAKAO_MOBILITY",
-    "queriedAt": "2026-08-10T09:00:00+09:00"
-  },
-  "routes": [
-    {
-      "id": "transit-1",
-      "mode": "TRANSIT",
-      "durationSeconds": 1650,
-      "distanceMeters": 7900,
-      "mobilityCostKrw": 1400,
-      "costStatus": "KNOWN",
-      "costBreakdown": { "fareKrw": 1400, "fuelKrw": null, "tollKrw": null, "parkingKrw": null },
-      "geometry": [
-        { "latitude": 37.5585, "longitude": 126.9752 },
-        { "latitude": 37.5612, "longitude": 126.9814 },
-        { "latitude": 37.5663, "longitude": 126.9779 }
-      ],
-      "source": "SEOUL_TRANSIT",
-      "sourceAsOf": "2026-08-10T09:00:00+09:00",
-      "warnings": []
-    },
-    {
-      "id": "car-1",
-      "mode": "CAR",
-      "durationSeconds": 1200,
-      "distanceMeters": 10100,
-      "mobilityCostKrw": 6500,
-      "costStatus": "ESTIMATED",
-      "costBreakdown": { "fareKrw": null, "fuelKrw": 5500, "tollKrw": 0, "parkingKrw": 1000 },
-      "geometry": [
-        { "latitude": 37.5585, "longitude": 126.9752 },
-        { "latitude": 37.5531, "longitude": 126.9654 },
-        { "latitude": 37.5663, "longitude": 126.9779 }
-      ],
-      "source": "KAKAO_MOBILITY",
-      "sourceAsOf": "2026-08-10T09:00:00+09:00",
-      "warnings": ["PARKING_COST_ESTIMATED"]
-    },
-    {
-      "id": "walk-1",
-      "mode": "WALK",
-      "durationSeconds": 2100,
-      "distanceMeters": 2900,
-      "mobilityCostKrw": 0,
-      "costStatus": "KNOWN",
-      "costBreakdown": { "fareKrw": 0, "fuelKrw": null, "tollKrw": null, "parkingKrw": null },
-      "geometry": [
-        { "latitude": 37.5585, "longitude": 126.9752 },
-        { "latitude": 37.5625, "longitude": 126.9728 },
-        { "latitude": 37.5663, "longitude": 126.9779 }
-      ],
-      "source": "KAKAO_LOCAL",
-      "sourceAsOf": "2026-08-10T09:00:00+09:00",
-      "warnings": []
-    }
-  ],
-  "best": {
-    "fastestRouteId": "car-1",
-    "shortestRouteId": "walk-1",
-    "cheapestRouteId": "walk-1"
+    "queriedAt": "2026-08-10T13:00:00+09:00"
   },
   "mobilityCost": {
     "status": "ESTIMATED",
-    "amountKrw": 6500,
+    "amountKrw": 12000,
     "warnings": ["PARKING_COST_ESTIMATED"]
   },
   "allowance": {
-    "status": "PAYABLE",
+    "status": "ESTIMATED",
     "amountKrw": 20000,
     "warnings": []
   },

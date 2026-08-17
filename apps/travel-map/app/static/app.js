@@ -10,7 +10,6 @@ const controls = {
   destinationResults: $("#destination-results"),
   originNote: $("#origin-selection"),
   destinationNote: $("#destination-selection"),
-  policy: $("#policy-profile"),
   formError: $("#form-error"),
   results: $("#results"),
   routeList: $("#route-list"),
@@ -27,13 +26,14 @@ const state = {
   origin: null,
   destination: null,
   preview: null,
-  activeRouteId: null,
+  activeRouteIds: {},
   sort: "time",
   activeSuggestions: { origin: -1, destination: -1 },
 };
 
 const map = new KakaoMapController($("#map"), $("#map-status"), reverseDestination);
 const modeName = { TRANSIT: "대중교통", CAR: "자동차", WALK: "도보" };
+const directionName = { OUTBOUND: "가는 길", RETURN: "돌아오는 길" };
 const bestName = {
   fastestRouteId: "최단시간",
   shortestRouteId: "최단거리",
@@ -83,9 +83,7 @@ function setFormError(message = "") {
 }
 
 function updateCalculateAvailability() {
-  controls.calculateButton.disabled = !(
-    state.origin && state.destination && controls.policy.value
-  );
+  controls.calculateButton.disabled = !(state.origin && state.destination);
 }
 
 function setDefaultDates() {
@@ -242,8 +240,8 @@ function requestPayload() {
       longitude: state.destination.longitude,
     },
     startsAt: `${$("#starts-date").value}T${$("#starts-time").value}:00+09:00`,
-    returnsAt: `${$("#returns-date").value}T${$("#returns-time").value}:00+09:00`,
-    policyProfile: controls.policy.value,
+    endsAt: `${$("#returns-date").value}T${$("#returns-time").value}:00+09:00`,
+    tripPattern: "ROUND_TRIP",
     vehicleUse: $("#vehicle-use").value,
     carAssumptions: {
       fuelType: $("#fuel-type").value,
@@ -270,38 +268,54 @@ function sortRoutes(routes) {
   });
 }
 
-function bestLabelsFor(route) {
+function bestLabelsFor(route, leg) {
   return Object.entries(bestName)
-    .filter(([key]) => state.preview.best[key] === route.id)
+    .filter(([key]) => leg.best[key] === route.id)
     .map(([, label]) => label);
+}
+
+function routeKey(direction, routeId) {
+  return `${direction}:${routeId}`;
+}
+
+function directionalRoutes({ sorted = false } = {}) {
+  return state.preview.routeLegs.flatMap((leg) =>
+    (sorted ? sortRoutes(leg.routes) : leg.routes).map((route) => ({
+      direction: leg.direction,
+      key: routeKey(leg.direction, route.id),
+      leg,
+      route,
+    })),
+  );
 }
 
 function warningText(warning) {
   return {
     PARKING_COST_ESTIMATED: "주차비는 예상값입니다",
-    DATA_UNAVAILABLE: "경로 일부 정보 확인 필요",
+    DISTANCE_EVIDENCE_UNAVAILABLE: "분류 경로 정보 확인 필요",
+    PARTIAL_MOBILITY_COST: "이동비 일부 정보 확인 필요",
   }[warning] || "경로 정보 일부를 확인해 주세요";
 }
 
 function renderRoutes() {
-  const routes = sortRoutes(state.preview.routes);
-  controls.routeCount.textContent = `${routes.length}개`;
+  const entries = directionalRoutes({ sorted: true });
+  controls.routeCount.textContent = `${entries.length}개`;
   controls.routeList.replaceChildren();
-  routes.forEach((route) => {
+  entries.forEach(({ direction, key, leg, route }) => {
     const card = document.createElement("button");
-    const selected = route.id === state.activeRouteId;
+    const selected = key === state.activeRouteIds[direction];
     card.type = "button";
     const routeMode = { TRANSIT: "transit", CAR: "car", WALK: "walk" }[route.mode] || "unknown";
     card.className = `route-card mode-${routeMode}`;
-    card.dataset.routeId = route.id;
+    card.dataset.routeId = key;
     card.setAttribute("aria-current", String(selected));
     const top = document.createElement("span");
     top.className = "route-top";
     const title = document.createElement("strong");
-    title.textContent = `${modeName[route.mode] || "이동 경로"} · ${formatDuration(route.durationSeconds)}`;
+    title.textContent = `${directionName[direction] || direction} · ${modeName[route.mode] || "이동 경로"} · ${formatDuration(route.durationSeconds)}`;
     const badges = document.createElement("span");
     badges.className = "route-badges";
-    bestLabelsFor(route).forEach((label) => {
+    bestLabelsFor(route, leg).forEach((label) => {
       const badge = document.createElement("span");
       badge.className = "route-badge";
       badge.textContent = label;
@@ -336,19 +350,26 @@ function renderRoutes() {
     source.className = "route-source";
     source.textContent = `${route.source} 기준`;
     card.append(source);
-    card.addEventListener("click", () => selectRoute(route.id));
+    card.addEventListener("click", () => selectRoute(direction, key));
     controls.routeList.append(card);
   });
 }
 
-function selectRoute(routeId) {
-  state.activeRouteId = routeId;
-  map.setActiveRoute(routeId);
+function selectRoute(direction, routeId) {
+  state.activeRouteIds[direction] = routeId;
+  map.setActiveRoutes(Object.values(state.activeRouteIds));
   renderRoutes();
 }
 
 function renderSummary() {
-  const { coverage, classification, classificationDistanceMeters, mobilityCost, allowance } = state.preview;
+  const {
+    coverage,
+    classification,
+    classificationDistanceMeters,
+    classificationDistanceBasis,
+    mobilityCost,
+    allowance,
+  } = state.preview;
   $("#coverage-status").textContent = coverage.status === "SEOUL" ? "서울 경계 내" : coverage.status;
   $("#classification-result").textContent = {
     LOCAL: "관내출장",
@@ -358,33 +379,39 @@ function renderSummary() {
     ? "기관의 최종 관외 판단과 지급 기준을 확인하세요."
     : classificationDistanceMeters == null
       ? "분류 경로 확인 필요"
-      : `분류 왕복 ${formatDistance(classificationDistanceMeters)}`;
+      : classificationDistanceBasis === "ONE_WAY_LOWER_BOUND"
+        ? `분류 편도 하한 ${formatDistance(classificationDistanceMeters)}`
+        : `분류 왕복 ${formatDistance(classificationDistanceMeters)}`;
   $("#mobility-cost").textContent = formatMoney(mobilityCost.amountKrw);
   $("#mobility-status").textContent = mobilityCost.status === "ESTIMATED" ? "예상값" : "경로 기준";
-  const profileNeedsReview = controls.policy.value === "NONPUBLIC_OR_UNKNOWN";
-  const allowanceNeedsReview = profileNeedsReview || allowance.status === "REVIEW_REQUIRED" || allowance.amountKrw == null;
+  const allowanceNeedsReview = allowance.status === "REVIEW_REQUIRED" || allowance.amountKrw == null;
   $("#allowance-amount").textContent = allowanceNeedsReview ? "여비 판정 보류" : formatMoney(allowance.amountKrw);
   $("#allowance-status").textContent = allowanceNeedsReview ? "신분·규정을 확인하세요" : "지급 확정액 아님";
 }
 
 function renderPreview() {
-  state.activeRouteId = state.preview.best.fastestRouteId || state.preview.routes[0]?.id || null;
+  state.activeRouteIds = Object.fromEntries(
+    state.preview.routeLegs.flatMap((leg) => {
+      const routeId = leg.best.fastestRouteId || leg.routes[0]?.id;
+      return routeId ? [[leg.direction, routeKey(leg.direction, routeId)]] : [];
+    }),
+  );
   controls.results.hidden = false;
   renderSummary();
   renderRoutes();
   map.showRoutes({
     origin: state.preview.origin,
     destination: state.destination,
-    routes: state.preview.routes,
+    routes: directionalRoutes().map(({ key, route }) => ({ ...route, id: key })),
     classificationPath: state.preview.classificationPath,
   });
-  if (state.activeRouteId) map.setActiveRoute(state.activeRouteId);
+  map.setActiveRoutes(Object.values(state.activeRouteIds));
 }
 
 async function calculate(event) {
   event.preventDefault();
-  if (!state.origin || !state.destination || !controls.policy.value) {
-    setFormError("출발 기관, 출장지, 적용 규정을 모두 선택하세요.");
+  if (!state.origin || !state.destination) {
+    setFormError("출발 기관과 출장지를 모두 선택하세요.");
     return;
   }
   if (!controls.form.checkValidity()) {
@@ -454,7 +481,6 @@ async function initialize() {
   controls.form.addEventListener("submit", calculate);
   bindSortTabs();
   bindMapControls();
-  controls.policy.addEventListener("change", updateCalculateAvailability);
   controls.otherTrips.addEventListener("change", updatePreviousAllowanceControl);
   updatePreviousAllowanceControl();
   updateCalculateAvailability();

@@ -1,4 +1,4 @@
-"""Trip-preview orchestration that keeps legal classification independent of display routes."""
+"""Directional trip-preview orchestration with independent policy evidence."""
 
 import asyncio
 from dataclasses import replace
@@ -14,6 +14,7 @@ from app.contracts import (
     CoverageResponse,
     OriginResponse,
     RouteCostResponse,
+    RouteLegResponse,
     RouteResponse,
     TripPreviewRequest,
     TripPreviewResponse,
@@ -21,11 +22,11 @@ from app.contracts import (
 from app.dependencies import AppDependencies
 from app.institutions.models import InstitutionSite
 from app.policy.models import (
-    AllowanceResult,
-    AllowanceStatus,
     Classification,
     CoverageState,
+    DistanceEvidenceBasis,
     PolicyInput,
+    PolicyProfile,
     PolicyResult,
 )
 from app.routing.models import (
@@ -38,6 +39,9 @@ from app.routing.models import (
     RouteQuery,
     TravelMode,
 )
+from app.trips.models import PlannedTripLeg, RouteDirection, TripPattern
+
+PUBLIC_POLICY_PROFILE = PolicyProfile.SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED
 
 
 class TripPreviewService:
@@ -58,66 +62,70 @@ class TripPreviewService:
             self._dependencies.institutions.display_name_for_site(site.site_id),
         )
         snapshot_id = _snapshot_id(self._dependencies, site.site_id)
+        car_assumptions = CarAssumptions(
+            fuel_type=request.car_assumptions.fuel_type,
+            efficiency_km_per_liter=request.car_assumptions.efficiency_km_per_liter,
+            parking_cost_krw=request.car_assumptions.parking_cost_krw,
+        )
+        planned_legs = _plan_trip_legs(
+            request=request,
+            origin=origin,
+            destination=destination,
+            car_assumptions=car_assumptions,
+        )
 
-        if coverage_state is CoverageState.OUTSIDE:
+        if (
+            coverage_state is CoverageState.OUTSIDE
+            and request.trip_pattern is TripPattern.ROUND_TRIP
+        ):
             return _outside_response(
                 request=request,
                 origin=origin_response,
                 snapshot_id=snapshot_id,
             )
 
-        car_assumptions = CarAssumptions(
-            fuel_type=request.car_assumptions.fuel_type,
-            efficiency_km_per_liter=request.car_assumptions.efficiency_km_per_liter,
-            parking_cost_krw=request.car_assumptions.parking_cost_krw,
+        display_collections = await asyncio.gather(
+            *(self._display_leg(leg) for leg in planned_legs)
         )
-        display_query = RouteQuery(
-            origin=origin,
-            destination=destination,
-            depart_at=request.starts_at,
-            mode=TravelMode.CAR,
-            car_assumptions=car_assumptions,
-        )
-        display_routes = await self._display_routes(display_query)
-        outbound = await self._classification_route(display_query)
-        returning = await self._classification_route(
-            RouteQuery(
-                origin=destination,
-                destination=origin,
-                depart_at=request.returns_at,
-                mode=TravelMode.CAR,
-                car_assumptions=car_assumptions,
+        classification_routes = await self._classification_routes(planned_legs)
+        classification_path, classification_distance, classification_basis = (
+            _classification_evidence(
+                request.trip_pattern,
+                classification_routes,
             )
         )
-        classification_path, classification_distance = _classification_path(
-            outbound,
-            returning,
-        )
-        policy, data_warnings = self._policy_result(
+        policy = self._policy_result(
             request=request,
             coverage_state=coverage_state,
             classification_distance=classification_distance,
+            classification_basis=classification_basis,
         )
-        warnings = (
-            tuple(warning.code for warning in display_routes.warnings) + data_warnings
+        route_legs = tuple(
+            _route_leg_response(planned, collection)
+            for planned, collection in zip(
+                planned_legs,
+                display_collections,
+                strict=True,
+            )
         )
-        routes = tuple(_route_response(route) for route in display_routes.routes)
-        best = BestResponse(
-            fastest_route_id=display_routes.best.fastest_route_id,
-            shortest_route_id=display_routes.best.shortest_route_id,
-            cheapest_route_id=display_routes.best.cheapest_route_id,
+        provider_warnings = tuple(
+            warning.code
+            for collection in display_collections
+            for warning in collection.warnings
         )
+        warnings = _unique(provider_warnings + policy.allowance.warnings)
         return TripPreviewResponse(
             coverage=CoverageResponse(status=_coverage_status(coverage_state)),
             origin=origin_response,
             institution_snapshot_id=snapshot_id,
-            policy_scope=request.policy_profile,
-            classification=policy.classification.value,
+            trip_pattern=request.trip_pattern,
+            route_legs=route_legs,
+            policy_scope=PUBLIC_POLICY_PROFILE,
+            classification=policy.classification,
             classification_distance_meters=classification_distance,
+            classification_distance_basis=classification_basis,
             classification_path=classification_path,
-            routes=routes,
-            best=best,
-            mobility_cost=_mobility_cost(display_routes.routes, best.fastest_route_id),
+            mobility_cost=_aggregate_mobility_cost(route_legs),
             allowance=AllowanceResponse(
                 status=policy.allowance.status.value,
                 amount_krw=policy.allowance.amount_krw,
@@ -129,9 +137,23 @@ class TripPreviewService:
             warnings=warnings,
         )
 
-    async def _display_routes(self, query: RouteQuery) -> RouteCollection:
+    async def _display_leg(self, planned: PlannedTripLeg) -> RouteCollection:
         collections = await asyncio.gather(
-            *(self._display_mode_routes(query, mode) for mode in TravelMode)
+            *(
+                self._display_mode_routes(
+                    replace(
+                        planned.query,
+                        mode=mode,
+                        car_assumptions=(
+                            planned.query.car_assumptions
+                            if mode is TravelMode.CAR
+                            else None
+                        ),
+                    ),
+                    mode,
+                )
+                for mode in TravelMode
+            )
         )
         return self._dependencies.route_orchestrator.combine_collections(
             dict(zip(TravelMode, collections, strict=True))
@@ -173,10 +195,7 @@ class TripPreviewService:
         cached = self._dependencies.cache.get(key)
         if type(cached) is RouteCollection:
             return cached
-        collected = await self._dependencies.route_orchestrator.collect(
-            query,
-            {mode},
-        )
+        collected = await self._dependencies.route_orchestrator.collect(query, {mode})
         return self._dependencies.cache.set(
             key,
             collected,
@@ -186,6 +205,15 @@ class TripPreviewService:
                 else CAR_AND_TRANSIT_TTL_SECONDS
             ),
         )
+
+    async def _classification_routes(
+        self,
+        planned_legs: tuple[PlannedTripLeg, ...],
+    ) -> tuple[RouteOption | None, ...]:
+        routes: list[RouteOption | None] = []
+        for leg in planned_legs:
+            routes.append(await self._classification_route(leg.query))
+        return tuple(routes)
 
     async def _classification_route(self, query: RouteQuery) -> RouteOption | None:
         provider = self._dependencies.classification_provider
@@ -225,38 +253,62 @@ class TripPreviewService:
         request: TripPreviewRequest,
         coverage_state: CoverageState,
         classification_distance: int | None,
-    ) -> tuple[PolicyResult, tuple[str, ...]]:
-        is_seoul = coverage_state is CoverageState.SEOUL
-        data_unavailable = classification_distance is None
-        policy = self._dependencies.policy.calculate(
+        classification_basis: DistanceEvidenceBasis | None,
+    ) -> PolicyResult:
+        return self._dependencies.policy.calculate(
             PolicyInput(
-                destination_in_seoul=is_seoul,
-                round_trip_distance_m=classification_distance or 0,
+                destination_in_seoul=coverage_state is CoverageState.SEOUL,
+                measured_distance_m=classification_distance,
+                distance_evidence_basis=classification_basis,
                 starts_at=request.starts_at,
-                returns_at=request.returns_at,
-                policy_profile=request.policy_profile,
+                ends_at=request.ends_at,
+                policy_profile=PUBLIC_POLICY_PROFILE,
                 vehicle_use=request.vehicle_use,
                 has_other_local_trips_today=request.has_other_local_trips_today,
                 previous_allowance_krw=request.previous_allowance_krw,
             )
         )
-        if not data_unavailable:
-            return policy, ()
-        classification = (
-            Classification.LOCAL if is_seoul else Classification.REVIEW_REQUIRED
-        )
-        return (
-            replace(
-                policy,
-                classification=classification,
-                allowance=AllowanceResult(
-                    status=AllowanceStatus.REVIEW_REQUIRED,
-                    amount_krw=None,
-                    warnings=("DATA_UNAVAILABLE",),
-                ),
-            ),
-            ("DATA_UNAVAILABLE",),
-        )
+
+
+def _plan_trip_legs(
+    *,
+    request: TripPreviewRequest,
+    origin: Coordinate,
+    destination: Coordinate,
+    car_assumptions: CarAssumptions,
+) -> tuple[PlannedTripLeg, ...]:
+    outbound = PlannedTripLeg(
+        direction=RouteDirection.OUTBOUND,
+        query=RouteQuery(
+            origin=origin,
+            destination=destination,
+            depart_at=request.starts_at,
+            mode=TravelMode.CAR,
+            car_assumptions=car_assumptions,
+        ),
+    )
+    returning_assumptions = (
+        replace(car_assumptions, parking_cost_krw=0)
+        if request.trip_pattern is TripPattern.ROUND_TRIP
+        else car_assumptions
+    )
+    returning = PlannedTripLeg(
+        direction=RouteDirection.RETURN,
+        query=RouteQuery(
+            origin=destination,
+            destination=origin,
+            depart_at=request.ends_at,
+            mode=TravelMode.CAR,
+            car_assumptions=returning_assumptions,
+        ),
+    )
+    if request.trip_pattern is TripPattern.ROUND_TRIP:
+        return (outbound, returning)
+    if request.trip_pattern is TripPattern.OUTBOUND_ONLY_END_AFTER_SCHEDULE:
+        return (outbound,)
+    if request.trip_pattern is TripPattern.RETURN_ONLY_DIRECT_TO_DESTINATION:
+        return (returning,)
+    raise ValueError("unsupported trip pattern")
 
 
 def _site_coordinate(site: InstitutionSite) -> Coordinate:
@@ -318,19 +370,16 @@ def _outside_response(
         coverage=CoverageResponse(status="OUT_OF_COVERAGE"),
         origin=origin,
         institution_snapshot_id=snapshot_id,
-        policy_scope=request.policy_profile,
-        classification=Classification.REVIEW_REQUIRED.value,
+        trip_pattern=request.trip_pattern,
+        route_legs=(),
+        policy_scope=PUBLIC_POLICY_PROFILE,
+        classification=Classification.REVIEW_REQUIRED,
         classification_distance_meters=None,
+        classification_distance_basis=None,
         classification_path=None,
-        routes=(),
-        best=BestResponse(
-            fastest_route_id=None,
-            shortest_route_id=None,
-            cheapest_route_id=None,
-        ),
         mobility_cost=unavailable,
         allowance=AllowanceResponse(
-            status=AllowanceStatus.REVIEW_REQUIRED.value,
+            status="REVIEW_REQUIRED",
             amount_krw=None,
             warnings=("OUT_OF_COVERAGE",),
         ),
@@ -341,22 +390,55 @@ def _outside_response(
     )
 
 
-def _classification_path(
-    outbound: RouteOption | None,
-    returning: RouteOption | None,
-) -> tuple[ClassificationPathResponse | None, int | None]:
-    if outbound is None or returning is None:
-        return None, None
-    geometry = outbound.geometry + returning.geometry
+def _classification_evidence(
+    trip_pattern: TripPattern,
+    routes: tuple[RouteOption | None, ...],
+) -> tuple[
+    ClassificationPathResponse | None,
+    int | None,
+    DistanceEvidenceBasis | None,
+]:
+    if not routes or any(route is None for route in routes):
+        return None, None, None
+    available = tuple(route for route in routes if route is not None)
+    basis = (
+        DistanceEvidenceBasis.ROUND_TRIP_EXACT
+        if trip_pattern is TripPattern.ROUND_TRIP
+        else DistanceEvidenceBasis.ONE_WAY_LOWER_BOUND
+    )
+    distance = sum(route.distance_meters for route in available)
     return (
         ClassificationPathResponse(
-            id=f"{outbound.id}+{returning.id}",
-            distance_meters=outbound.distance_meters + returning.distance_meters,
-            geometry=tuple(_coordinate_response(item) for item in geometry),
-            source=f"{outbound.source}+{returning.source}",
-            queried_at=max(outbound.source_as_of, returning.source_as_of),
+            id="+".join(route.id for route in available),
+            distance_meters=distance,
+            geometry=tuple(
+                _coordinate_response(coordinate)
+                for route in available
+                for coordinate in route.geometry
+            ),
+            source="+".join(route.source for route in available),
+            queried_at=max(route.source_as_of for route in available),
         ),
-        outbound.distance_meters + returning.distance_meters,
+        distance,
+        basis,
+    )
+
+
+def _route_leg_response(
+    planned: PlannedTripLeg,
+    collection: RouteCollection,
+) -> RouteLegResponse:
+    best = BestResponse(
+        fastest_route_id=collection.best.fastest_route_id,
+        shortest_route_id=collection.best.shortest_route_id,
+        cheapest_route_id=collection.best.cheapest_route_id,
+    )
+    return RouteLegResponse(
+        direction=planned.direction,
+        depart_at=planned.query.depart_at,
+        routes=tuple(_route_response(route) for route in collection.routes),
+        best=best,
+        mobility_cost=_mobility_cost(collection.routes, best.fastest_route_id),
     )
 
 
@@ -395,11 +477,51 @@ def _mobility_cost(
     fastest_route_id: str | None,
 ) -> AmountResponse:
     route = next((item for item in routes if item.id == fastest_route_id), None)
-    if route is None:
-        return AmountResponse(status="UNAVAILABLE", amount_krw=None)
-    status = (
-        route.cost_status.value
-        if route.cost_status is not CostStatus.UNKNOWN
-        else "UNAVAILABLE"
+    if route is None or route.cost_status is CostStatus.UNKNOWN:
+        return AmountResponse(
+            status="UNKNOWN",
+            amount_krw=None,
+            warnings=route.warnings if route is not None else (),
+        )
+    return AmountResponse(
+        status=route.cost_status.value,
+        amount_krw=route.mobility_cost_krw,
+        warnings=route.warnings,
     )
-    return AmountResponse(status=status, amount_krw=route.mobility_cost_krw)
+
+
+def _aggregate_mobility_cost(
+    route_legs: tuple[RouteLegResponse, ...],
+) -> AmountResponse:
+    if not route_legs or any(
+        leg.mobility_cost.status not in {"KNOWN", "ESTIMATED"}
+        or leg.mobility_cost.amount_krw is None
+        for leg in route_legs
+    ):
+        return AmountResponse(
+            status="UNKNOWN",
+            amount_krw=None,
+            warnings=("PARTIAL_MOBILITY_COST",),
+        )
+    status = (
+        "ESTIMATED"
+        if any(leg.mobility_cost.status == "ESTIMATED" for leg in route_legs)
+        else "KNOWN"
+    )
+    return AmountResponse(
+        status=status,
+        amount_krw=sum(
+            leg.mobility_cost.amount_krw
+            for leg in route_legs
+            if leg.mobility_cost.amount_krw is not None
+        ),
+        warnings=_unique(
+            tuple(
+                warning for leg in route_legs for warning in leg.mobility_cost.warnings
+            )
+        ),
+    )
+
+
+def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))

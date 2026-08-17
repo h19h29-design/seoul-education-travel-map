@@ -8,8 +8,14 @@ from pydantic.alias_generators import to_camel
 
 from app.institutions.facets import InstitutionFacetOption, InstitutionFacets
 from app.institutions.models import InstitutionSearchItem
-from app.policy.models import PolicyProfile, VehicleUse
+from app.policy.models import (
+    Classification,
+    DistanceEvidenceBasis,
+    PolicyProfile,
+    VehicleUse,
+)
 from app.routing.models import FuelType, TravelMode
+from app.trips.models import RouteDirection, TripPattern
 
 
 class ApiModel(BaseModel):
@@ -53,24 +59,23 @@ class TripPreviewRequest(ApiRequestModel):
     ]
     destination: DestinationInput
     starts_at: datetime
-    returns_at: datetime
-    policy_profile: PolicyProfile
+    ends_at: datetime
+    trip_pattern: TripPattern
     vehicle_use: VehicleUse
     car_assumptions: CarAssumptionsInput
     has_other_local_trips_today: bool
     previous_allowance_krw: Annotated[int, Field(ge=0, le=20_000)]
 
     @model_validator(mode="after")
-    def trip_interval_is_aware_and_bounded(self) -> "TripPreviewRequest":
-        for name, value in (
-            ("startsAt", self.starts_at),
-            ("returnsAt", self.returns_at),
+    def interval_is_aware_and_bounded(self) -> Self:
+        if any(
+            value.tzinfo is None or value.utcoffset() is None
+            for value in (self.starts_at, self.ends_at)
         ):
-            if value.tzinfo is None or value.utcoffset() is None:
-                raise ValueError(f"{name} must be timezone-aware")
-        interval = self.returns_at - self.starts_at
-        if not timedelta(0) < interval <= timedelta(hours=24):
-            raise ValueError("returnsAt must be after startsAt and within 24 hours")
+            raise ValueError("startsAt and endsAt must be timezone-aware")
+        duration = self.ends_at - self.starts_at
+        if not timedelta(minutes=2) <= duration <= timedelta(hours=24):
+            raise ValueError("trip duration must be in [2 minutes, 24 hours]")
         return self
 
 
@@ -135,18 +140,27 @@ class ClassificationPathResponse(ApiModel):
     queried_at: datetime
 
 
+class RouteLegResponse(ApiModel):
+    direction: RouteDirection
+    depart_at: datetime
+    routes: tuple[RouteResponse, ...]
+    best: BestResponse
+    mobility_cost: AmountResponse
+
+
 class TripPreviewResponse(ApiModel):
     coverage: CoverageResponse
     origin: OriginResponse
     institution_snapshot_id: str | None
+    trip_pattern: TripPattern
+    route_legs: tuple[RouteLegResponse, ...]
     policy_scope: PolicyProfile
-    classification: str
+    classification: Classification
     classification_distance_meters: int | None
+    classification_distance_basis: DistanceEvidenceBasis | None
     classification_path: ClassificationPathResponse | None
-    routes: tuple[RouteResponse, ...]
-    best: BestResponse
     mobility_cost: AmountResponse
-    allowance: AmountResponse
+    allowance: AllowanceResponse
     rule_set_id: str | None
     effective_from: str | None
     source_refs: tuple[str, ...]

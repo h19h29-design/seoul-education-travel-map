@@ -22,6 +22,7 @@ from app.routing.models import (
     Coordinate,
     CostStatus,
     ProviderResult,
+    RouteCostBreakdown,
     RouteOption,
     RouteQuery,
     TravelMode,
@@ -40,30 +41,58 @@ class FakeRouteProvider:
         self.name = name
         self.supported_modes = frozenset({mode})
         self._mode = mode
-        self.call_count = 0
+        self.queries: list[RouteQuery] = []
+        self._unknown_cost_calls: set[int] = set()
+
+    @property
+    def call_count(self) -> int:
+        return len(self.queries)
+
+    def return_unknown_cost_on_call(self, call_number: int) -> None:
+        self._unknown_cost_calls.add(call_number)
 
     async def get_routes(self, query: RouteQuery) -> ProviderResult:
-        self.call_count += 1
+        self.queries.append(query)
+        call_index = len(self.queries)
+        if self._mode is TravelMode.TRANSIT:
+            cost = 1_550 + 100 * (call_index - 1)
+            status = CostStatus.KNOWN
+            breakdown = RouteCostBreakdown(fare_krw=cost)
+        elif self._mode is TravelMode.CAR:
+            parking = (
+                query.car_assumptions.parking_cost_krw
+                if query.car_assumptions is not None
+                else 0
+            )
+            fuel = 2_000 + 500 * (call_index - 1)
+            cost = fuel + parking
+            status = CostStatus.ESTIMATED
+            breakdown = RouteCostBreakdown(fuel_krw=fuel, parking_krw=parking)
+        else:
+            cost = 0
+            status = CostStatus.KNOWN
+            breakdown = RouteCostBreakdown()
+        if call_index in self._unknown_cost_calls:
+            cost = None
+            status = CostStatus.UNKNOWN
+            breakdown = None
         route = RouteOption(
-            id=f"{self.name.lower()}-{self.call_count}",
+            id=f"{self.name.lower()}-{call_index}",
             mode=self._mode,
             duration_seconds={
                 TravelMode.TRANSIT: 1_200,
                 TravelMode.CAR: 900,
                 TravelMode.WALK: 4_800,
-            }[self._mode],
+            }[self._mode]
+            + 100 * (call_index - 1),
             distance_meters={
                 TravelMode.TRANSIT: 4_500,
                 TravelMode.CAR: 4_000,
                 TravelMode.WALK: 3_600,
             }[self._mode],
-            mobility_cost_krw=1_550 if self._mode is TravelMode.TRANSIT else None,
-            cost_status=(
-                CostStatus.KNOWN
-                if self._mode is TravelMode.TRANSIT
-                else CostStatus.UNKNOWN
-            ),
-            cost_breakdown=None,
+            mobility_cost_krw=cost,
+            cost_status=status,
+            cost_breakdown=breakdown,
             geometry=(query.origin, query.destination),
             source=self.name,
             source_as_of=datetime(2026, 8, 10, 9, 0, tzinfo=SEOUL),
@@ -80,14 +109,20 @@ class FakeClassificationProvider:
         self.destination_coordinate: Coordinate | None = None
         self.queries: list[RouteQuery] = []
         self._distances = [1_500, 1_500]
+        self._missing_calls: set[int] = set()
 
     def set_directional_distances(self, outbound: int, returning: int) -> None:
         self._distances = [outbound, returning]
+
+    def return_no_route_on_call(self, call_number: int) -> None:
+        self._missing_calls.add(call_number)
 
     async def get_routes(self, query: RouteQuery) -> ProviderResult:
         self.queries.append(query)
         if self.destination_coordinate is None:
             self.destination_coordinate = query.destination
+        if len(self.queries) in self._missing_calls:
+            return ProviderResult(provider=self.name, routes=())
         distance = self._distances.pop(0) if self._distances else 1_500
         route = RouteOption(
             id=f"classification-{len(self.queries)}",
@@ -239,8 +274,8 @@ def trip_payload(**overrides: object) -> dict[str, object]:
             "longitude": 126.9779451,
         },
         "startsAt": "2026-08-10T09:00:00+09:00",
-        "returnsAt": "2026-08-10T13:00:00+09:00",
-        "policyProfile": "SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED",
+        "endsAt": "2026-08-10T13:00:00+09:00",
+        "tripPattern": "ROUND_TRIP",
         "vehicleUse": "NONE",
         "carAssumptions": {
             "fuelType": "GASOLINE",

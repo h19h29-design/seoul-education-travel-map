@@ -204,8 +204,5 @@ export async function completePublicOfficialTrip(page: Page): Promise<void> {
   await page
     .getByRole("option", { name: /서울특별시청.*세종대로 110/ })
     .click();
-  await page
-    .getByLabel("적용 규정")
-    .selectOption("SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED");
   await page.getByRole("button", { name: "경로 계산" }).click();
 }

@@ -117,29 +117,111 @@ test("selects a private school origin and shows route rankings", async ({ page }
   await page
     .getByRole("option", { name: /서울특별시청.*세종대로 110/ })
     .click();
-  await page.getByLabel("적용 규정").selectOption("NONPUBLIC_OR_UNKNOWN");
   await page.getByRole("button", { name: "경로 계산" }).click();
 
-  await expect(page.getByText("최단시간")).toBeVisible();
-  await expect(page.getByText("최단거리")).toBeVisible();
-  await expect(page.getByText("최저비용")).toBeVisible();
-  await expect(page.getByText("여비 판정 보류")).toBeVisible();
+  await expect(page.getByText("최단시간")).toHaveCount(2);
+  await expect(page.getByText("최단거리")).toHaveCount(2);
+  await expect(page.getByText("최저비용")).toHaveCount(2);
+  await expect(page.locator("#allowance-amount")).toHaveText("20,000원");
   await expect(
     page.getByRole("heading", { name: "예상 이동비" }),
   ).toBeVisible();
 });
 
-test("selecting a route updates the emphasized polyline", async ({ page }) => {
+// Production mutation caught: storing one global selected route discards the
+// other direction and de-emphasizes its polyline when a return route is chosen.
+test("keeps one selected and emphasized route for each round-trip direction", async ({
+  page,
+}) => {
   await installMockApi(page);
   await page.goto("/");
   await completePublicOfficialTrip(page);
-  await page.getByRole("button", { name: /도보.*35분/ }).click();
 
-  await expect(page.locator("[data-route-id='walk-1']")).toHaveAttribute(
+  await expect(page.locator("[data-route-id='OUTBOUND:car-1']")).toHaveAttribute(
     "aria-current",
     "true",
   );
-  await expect(page.locator("#map")).toHaveAttribute("data-active-route", "walk-1");
+  await expect(page.locator("[data-route-id='RETURN:car-1']")).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+  const eventCountBeforeSelection = (await mapState(page)).events.length;
+  await page.locator("[data-route-id='RETURN:walk-1']").click();
+
+  await expect(page.locator("[data-route-id='OUTBOUND:car-1']")).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+  await expect(page.locator("[data-route-id='RETURN:walk-1']")).toHaveAttribute(
+    "aria-current",
+    "true",
+  );
+  await expect(page.locator("[data-route-id='RETURN:car-1']")).toHaveAttribute(
+    "aria-current",
+    "false",
+  );
+  await expect(page.locator("#map")).toHaveAttribute(
+    "data-active-routes",
+    "OUTBOUND:car-1 RETURN:walk-1",
+  );
+  const selectionEvents = (await mapState(page)).events
+    .slice(eventCountBeforeSelection)
+    .filter(({ kind, type }) => kind === "PolylineFake" && type === "setOptions");
+  expect(selectionEvents).toHaveLength(6);
+  expect(
+    selectionEvents.filter(({ options }) => options?.strokeWeight === 8),
+  ).toHaveLength(2);
+});
+
+// Production mutation caught: retaining the caller-editable legacy policy
+// selector or requiring its value before enabling the fixed-policy preview.
+test("discloses the fixed public policy without an editable selector", async ({ page }) => {
+  await installMockApi(page);
+  await page.goto("/");
+
+  await expect(page.locator("#policy-profile")).toHaveCount(0);
+  await expect(
+    page.getByRole("note", { name: "고정 적용 규정" }),
+  ).toContainText("서울시교육청 공무원 여비 규정");
+  await page.getByLabel("출발 기관").fill("샘물");
+  await page
+    .getByRole("option", { name: /샘물공립초등학교.*공립.*중구/ })
+    .click();
+  await page.getByLabel("출장지").fill("서울시청");
+  await page
+    .getByRole("option", { name: /서울특별시청.*세종대로 110/ })
+    .click();
+
+  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await page.getByRole("button", { name: "경로 계산" }).click();
+  await expect(page.getByRole("heading", { name: "추천 경로" })).toBeVisible();
+});
+
+// Production mutation caught: reading removed top-level routes/best, sending legacy
+// request fields, or keying same-id directional route cards without their direction.
+test("browser renders route legs without legacy top-level routes", async ({ page }) => {
+  let submitted: Record<string, unknown> = {};
+  await installMockApi(page, {
+    previewForPayload: (payload) => {
+      submitted = payload;
+      return readFixture<Record<string, unknown>>("preview.json");
+    },
+  });
+  await page.goto("/");
+  await completePublicOfficialTrip(page);
+
+  await expect(page.locator("#route-count")).toHaveText("6개");
+  await expect(page.locator("[data-route-id='OUTBOUND:car-1']")).toBeVisible();
+  await expect(page.locator("[data-route-id='RETURN:car-1']")).toBeVisible();
+  await page.locator("[data-route-id='RETURN:car-1']").click();
+  await expect(page.locator("#map")).toHaveAttribute(
+    "data-active-routes",
+    "OUTBOUND:car-1 RETURN:car-1",
+  );
+  expect(submitted.tripPattern).toBe("ROUND_TRIP");
+  expect(submitted.endsAt).toBeTruthy();
+  expect(submitted).not.toHaveProperty("returnsAt");
+  expect(submitted).not.toHaveProperty("policyProfile");
 });
 
 test("keeps localized time controls readable on mobile", async ({ page }) => {
@@ -173,7 +255,9 @@ test("shows the input rail, rankings, and collapsible map without mobile overflo
   await page.goto("/");
   await expect(page.getByLabel("출발 기관")).toBeVisible();
   await expect(page.getByLabel("출장지")).toBeVisible();
-  await expect(page.getByLabel("적용 규정")).toBeVisible();
+  await expect(
+    page.getByRole("note", { name: "고정 적용 규정" }),
+  ).toBeVisible();
 
   await completePublicOfficialTrip(page);
   await expect(page.getByRole("heading", { name: "추천 경로" })).toBeVisible();
@@ -196,9 +280,9 @@ test("shows a route-level warning for partial route data", async ({ page }) => {
 
 test("renders route source data as inert text", async ({ page }) => {
   const preview = readFixture<{
-    routes: Array<{ source: string }>;
+    routeLegs: Array<{ routes: Array<{ source: string }> }>;
   }>("preview.json");
-  preview.routes[0].source =
+  preview.routeLegs[0].routes[0].source =
     '<img src=x onerror="window.__task8Xss=\'executed\'">';
   await installMockApi(page, { preview });
   await page.goto("/");
@@ -238,10 +322,6 @@ test("map click invalidates the selected destination until its result is confirm
   await page
     .getByRole("option", { name: /서울특별시청.*세종대로 110/ })
     .click();
-  await page
-    .getByLabel("적용 규정")
-    .selectOption("SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED");
-
   await triggerMapClick(page);
 
   await expect(
@@ -285,12 +365,12 @@ test("map polyline, cleanup, and boundary effects reach the Kakao adapter", asyn
   await installMockApi(page);
   await page.goto("/");
   await completePublicOfficialTrip(page);
-  await expect(page.locator("[data-route-id='car-1']")).toBeVisible();
+  await expect(page.locator("[data-route-id='OUTBOUND:car-1']")).toBeVisible();
 
   const initialMapState = await mapState(page);
   expect(
     initialMapState.created.filter(({ kind }) => kind === "PolylineFake"),
-  ).toHaveLength(4);
+  ).toHaveLength(7);
   expect(
     initialMapState.events.some(
       ({ options, type }) =>
@@ -298,7 +378,7 @@ test("map polyline, cleanup, and boundary effects reach the Kakao adapter", asyn
     ),
   ).toBe(true);
 
-  await page.getByRole("button", { name: /도보.*35분/ }).click();
+  await page.locator("[data-route-id='RETURN:walk-1']").click();
   await expect
     .poll(async () =>
       (await mapState(page)).events.some(
@@ -371,9 +451,6 @@ test("keyboard option selection authorizes calculation while free text does not"
   await page.getByLabel("출발 기관").press("Enter");
   await expect(page.getByLabel("출발 기관")).toHaveValue("샘물공립초등학교");
   await page.getByLabel("출장지").fill("서울시청");
-  await page
-    .getByLabel("적용 규정")
-    .selectOption("SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED");
   await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
 
   await page.getByLabel("출장지").press("ArrowDown");
