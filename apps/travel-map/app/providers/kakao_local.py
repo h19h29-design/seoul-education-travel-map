@@ -1,7 +1,10 @@
+import asyncio
 import hashlib
 import json
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from math import isfinite
+from typing import Any
 
 import httpx
 from pydantic import SecretStr
@@ -83,6 +86,18 @@ class PlaceCandidate:
                 raise ValueError(f"{name} is outside geographic bounds")
 
 
+@dataclass(frozen=True)
+class PlaceSearchResult:
+    candidates: tuple[PlaceCandidate, ...]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReversePlaceResult:
+    candidate: PlaceCandidate | None
+    warnings: tuple[str, ...]
+
+
 class KakaoLocalClient:
     def __init__(
         self,
@@ -116,7 +131,6 @@ class KakaoLocalClient:
         self._http = self._transport.http
         self._client = self._http
         self._legacy = legacy
-        self.last_warnings: tuple[str, ...] = ()
         self._raw_sha256 = hashlib.sha256()
         self._request_count = 0
         self._cumulative_bytes = 0
@@ -219,18 +233,58 @@ class KakaoLocalClient:
         query: str,
         *,
         bounds: BoundingBox,
-    ) -> tuple[PlaceCandidate, ...]:
+    ) -> PlaceSearchResult:
         if type(query) is not str or type(bounds) is not BoundingBox:
             raise TypeError("query and bounds must use exact provider input types")
         normalized = query.strip()
         if not 2 <= len(normalized) <= 80:
-            self.last_warnings = ("INVALID_QUERY",)
-            return ()
+            return PlaceSearchResult(candidates=(), warnings=("INVALID_QUERY",))
+        keyword_worker: Coroutine[Any, Any, PlaceSearchResult] | None = None
+        address_worker: Coroutine[Any, Any, PlaceSearchResult] | None = None
+        keyword_task: asyncio.Task[PlaceSearchResult] | None = None
+        address_task: asyncio.Task[PlaceSearchResult] | None = None
+        try:
+            keyword_worker = self._search_keyword(normalized, bounds)
+            keyword_task = asyncio.create_task(keyword_worker)
+            keyword_worker = None
+            address_worker = self._search_address(normalized, bounds)
+            address_task = asyncio.create_task(address_worker)
+            address_worker = None
+            keyword, address = await asyncio.gather(keyword_task, address_task)
+        except BaseException:
+            if keyword_worker is not None:
+                keyword_worker.close()
+            if address_worker is not None:
+                address_worker.close()
+            tasks = tuple(
+                task for task in (keyword_task, address_task) if task is not None
+            )
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        if keyword.warnings == ("KEYWORD_SEARCH_UNAVAILABLE",) and address.warnings == (
+            "ADDRESS_SEARCH_UNAVAILABLE",
+        ):
+            return PlaceSearchResult(
+                candidates=(), warnings=("PLACE_PROVIDER_UNAVAILABLE",)
+            )
+        return PlaceSearchResult(
+            candidates=_merge_place_candidates(
+                normalized, keyword.candidates, address.candidates
+            ),
+            warnings=keyword.warnings + address.warnings,
+        )
+
+    async def _search_keyword(
+        self, query: str, bounds: BoundingBox
+    ) -> PlaceSearchResult:
         try:
             payload = await self._transport.get_json(
                 url=_KEYWORD_ENDPOINT,
                 params={
-                    "query": normalized,
+                    "query": query,
                     "rect": bounds.parameter(),
                     "page": "1",
                     "size": "15",
@@ -238,13 +292,34 @@ class KakaoLocalClient:
                 header_secret=self._rest_key,
             )
             places, parse_warnings = _parse_places(payload, bounds)
-        except ProviderRequestError as exc:
-            self.last_warnings = (exc.code,)
-            return ()
-        self.last_warnings = parse_warnings
-        return places
+        except ProviderRequestError:
+            return PlaceSearchResult(
+                candidates=(), warnings=("KEYWORD_SEARCH_UNAVAILABLE",)
+            )
+        return PlaceSearchResult(candidates=places, warnings=parse_warnings)
 
-    async def reverse_geocode(self, coordinate: Coordinate) -> PlaceCandidate | None:
+    async def _search_address(
+        self, query: str, bounds: BoundingBox
+    ) -> PlaceSearchResult:
+        try:
+            payload = await self._transport.get_json(
+                url=_ENDPOINT,
+                params={
+                    "query": query,
+                    "rect": bounds.parameter(),
+                    "page": "1",
+                    "size": "15",
+                },
+                header_secret=self._rest_key,
+            )
+            places, parse_warnings = _parse_address_places(payload, bounds)
+        except ProviderRequestError:
+            return PlaceSearchResult(
+                candidates=(), warnings=("ADDRESS_SEARCH_UNAVAILABLE",)
+            )
+        return PlaceSearchResult(candidates=places, warnings=parse_warnings)
+
+    async def reverse_geocode(self, coordinate: Coordinate) -> ReversePlaceResult:
         _require_coordinate(coordinate)
         try:
             payload = await self._transport.get_json(
@@ -258,10 +333,8 @@ class KakaoLocalClient:
             )
             place = _parse_reverse(payload, coordinate)
         except ProviderRequestError as exc:
-            self.last_warnings = (exc.code,)
-            return None
-        self.last_warnings = ()
-        return place
+            return ReversePlaceResult(candidate=None, warnings=(exc.code,))
+        return ReversePlaceResult(candidate=place, warnings=())
 
     async def aclose(self) -> None:
         await self._transport.aclose()
@@ -389,6 +462,145 @@ def _parse_places(
             "SCHEMA_MISMATCH", "Kakao Local place schema mismatch"
         ) from None
     return tuple(places), tuple(warnings)
+
+
+def _parse_address_places(
+    payload: dict[str, object], bounds: BoundingBox
+) -> tuple[tuple[PlaceCandidate, ...], tuple[str, ...]]:
+    documents = payload.get("documents")
+    if type(documents) is not list:
+        raise ProviderRequestError(
+            "SCHEMA_MISMATCH", "Kakao Local address search schema mismatch"
+        )
+    if len(documents) > 15:
+        raise ProviderRequestError(
+            "RESPONSE_LIMIT_EXCEEDED",
+            "Kakao Local address search result limit exceeded",
+        )
+    places: list[PlaceCandidate] = []
+    warnings: list[str] = []
+    try:
+        for document in documents:
+            if type(document) is not dict:
+                raise ValueError
+            road = document.get("road_address")
+            if road is not None and type(road) is not dict:
+                raise ValueError
+            lot = document.get("address")
+            if lot is not None and type(lot) is not dict:
+                raise ValueError
+            top_level_address = _text(document, "address_name", required=True)
+            address_type = _text(document, "address_type", required=True)
+            road_address = _text(road, "address_name") if type(road) is dict else ""
+            if type(lot) is dict:
+                lot_address = _text(lot, "address_name", required=True)
+            elif address_type in {"REGION_ADDR", "LOT_ADDR"}:
+                lot_address = top_level_address
+            else:
+                lot_address = ""
+            canonical_address = _canonical_address(
+                road_address or lot_address or top_level_address
+            )
+            latitude = _number(document, "y")
+            longitude = _number(document, "x")
+            if not (
+                bounds.west <= longitude <= bounds.east
+                and bounds.south <= latitude <= bounds.north
+            ):
+                if "OUT_OF_BOUNDS_RESULT" not in warnings:
+                    warnings.append("OUT_OF_BOUNDS_RESULT")
+                continue
+            building_name = _text(road, "building_name") if type(road) is dict else ""
+            name = building_name or road_address or lot_address or top_level_address
+            digest = hashlib.sha256(
+                f"{canonical_address}|{latitude.hex()}|{longitude.hex()}".encode()
+            ).hexdigest()
+            places.append(
+                PlaceCandidate(
+                    place_id=f"address:{digest}",
+                    name=name,
+                    road_address=road_address,
+                    lot_address=lot_address,
+                    latitude=latitude,
+                    longitude=longitude,
+                )
+            )
+    except (TypeError, ValueError):
+        raise ProviderRequestError(
+            "SCHEMA_MISMATCH", "Kakao Local address search schema mismatch"
+        ) from None
+    return tuple(places), tuple(warnings)
+
+
+def _merge_place_candidates(
+    query: str,
+    keyword: tuple[PlaceCandidate, ...],
+    addresses: tuple[PlaceCandidate, ...],
+    *,
+    limit: int = 15,
+) -> tuple[PlaceCandidate, ...]:
+    if type(query) is not str or type(limit) is not int or limit < 1:
+        raise ValueError("place merge inputs are invalid")
+    selected: list[PlaceCandidate] = []
+    seen_ids: set[str] = set()
+    locations: dict[tuple[str, str], set[str]] = {}
+    for candidate in keyword + addresses:
+        if candidate.place_id in seen_ids:
+            continue
+        seen_ids.add(candidate.place_id)
+        canonical_addresses = {
+            _canonical_address(address)
+            for address in (candidate.road_address, candidate.lot_address)
+            if address
+        }
+        location_key = (
+            format(candidate.latitude, ".5f"),
+            format(candidate.longitude, ".5f"),
+        )
+        known_addresses = locations.setdefault(location_key, set())
+        if known_addresses.intersection(canonical_addresses):
+            continue
+        known_addresses.update(canonical_addresses)
+        selected.append(candidate)
+    return tuple(sorted(selected, key=lambda item: _place_rank(query, item))[:limit])
+
+
+def _place_rank(
+    candidate_query: str, candidate: PlaceCandidate
+) -> tuple[int, str, str, str]:
+    query = _normalize_match(candidate_query)
+    values = tuple(
+        _normalize_match(value)
+        for value in (candidate.name, candidate.road_address, candidate.lot_address)
+        if value
+    )
+    if query in values:
+        match = 0
+    elif any(value.startswith(query) for value in values):
+        match = 1
+    elif any(query in value for value in values):
+        match = 2
+    else:
+        match = 3
+    return (
+        match,
+        _normalize_match(candidate.name),
+        _canonical_address(candidate.road_address or candidate.lot_address),
+        candidate.place_id,
+    )
+
+
+def _canonical_address(value: str) -> str:
+    return _canonicalize_road_address(value).casefold()
+
+
+def _normalize_match(value: str) -> str:
+    normalized = _normalize_address_whitespace(value)
+    if normalized.startswith("서울특별시"):
+        normalized = f"서울{normalized.removeprefix('서울특별시')}"
+    elif normalized.startswith("서울시"):
+        normalized = f"서울{normalized.removeprefix('서울시')}"
+    return normalized.casefold()
 
 
 def _parse_reverse(

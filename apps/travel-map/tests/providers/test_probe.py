@@ -113,6 +113,9 @@ def test_live_probe_calls_every_integration_and_records_observed_counts() -> Non
         if path.endswith("/search/keyword.json"):
             payload: object = load_json("kakao-keyword.json")
             content_type = "application/json"
+        elif path.endswith("/search/address.json"):
+            payload = load_json("kakao-address-search.json")
+            content_type = "application/json"
         elif path.endswith("/geo/coord2address.json"):
             payload = load_json("kakao-coord2address.json")
             content_type = "application/json"
@@ -165,6 +168,7 @@ def test_live_probe_calls_every_integration_and_records_observed_counts() -> Non
 
     assert set(calls) == {
         "/v2/local/search/keyword.json",
+        "/v2/local/search/address.json",
         "/v2/local/geo/coord2address.json",
         "/v2/routing/publictraffic",
         "/v2/routing/walk",

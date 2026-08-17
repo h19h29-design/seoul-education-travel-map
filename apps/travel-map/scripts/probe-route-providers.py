@@ -109,20 +109,20 @@ async def _probe(
         operations.append(
             _place_observation(
                 "KAKAO_LOCAL_SEARCH",
-                places,
+                places.candidates,
                 http_status=local.last_status_code,
                 schema_fingerprint=local.last_schema_fingerprint,
-                warnings=local.last_warnings,
+                warnings=places.warnings,
             )
         )
         reverse = await local.reverse_geocode(args.origin)
         operations.append(
             _place_observation(
                 "KAKAO_LOCAL_REVERSE",
-                (() if reverse is None else (reverse,)),
+                (() if reverse.candidate is None else (reverse.candidate,)),
                 http_status=local.last_status_code,
                 schema_fingerprint=local.last_schema_fingerprint,
-                warnings=local.last_warnings,
+                warnings=reverse.warnings,
             )
         )
 

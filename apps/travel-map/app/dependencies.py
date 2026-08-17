@@ -13,15 +13,27 @@ from app.institutions.store import InstitutionStore
 from app.policy.coverage import CoverageService, verify_geodata_resources
 from app.policy.engine import PolicyEngine
 from app.policy.rules import RuleRepository
-from app.providers.kakao_local import KakaoLocalClient
+from app.providers.kakao_local import (
+    BoundingBox,
+    KakaoLocalClient,
+    PlaceSearchResult,
+    ReversePlaceResult,
+)
 from app.rate_limit import FixedWindowRateLimiter
 from app.routing.bootstrap import build_classification_provider, build_route_providers
+from app.routing.models import Coordinate
 from app.routing.orchestrator import RouteOrchestrator
 from app.routing.provider import RouteProvider
 from app.settings import Settings
 
 
 class PlaceClient(Protocol):
+    async def search(self, query: str, *, bounds: BoundingBox) -> PlaceSearchResult:
+        raise NotImplementedError
+
+    async def reverse_geocode(self, coordinate: Coordinate) -> ReversePlaceResult:
+        raise NotImplementedError
+
     async def aclose(self) -> None:
         raise NotImplementedError
 

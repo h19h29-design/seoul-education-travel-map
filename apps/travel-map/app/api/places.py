@@ -1,11 +1,15 @@
-from typing import Annotated, cast
+from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.api.common import client_ip, dependencies_for
 from app.cache import PLACES_TTL_SECONDS
 from app.contracts import PlacesResponse, ReversePlaceResponse
-from app.providers.kakao_local import BoundingBox, PlaceCandidate
+from app.providers.kakao_local import (
+    BoundingBox,
+    PlaceCandidate,
+    PlaceSearchResult,
+)
 from app.routing.models import Coordinate
 
 router = APIRouter(tags=["places"])
@@ -21,17 +25,17 @@ async def places(
     _check_places_limit(request)
     key = dependencies.cache.key("places", {"query": q.strip()})
     cached = dependencies.cache.get(key)
-    if isinstance(cached, tuple):
-        candidates = cast(tuple[PlaceCandidate, ...], cached)
-        return PlacesResponse(items=tuple(_place_response(item) for item in candidates))
-    candidates = await dependencies.place_client.search(q, bounds=_SEOUL_BOUNDS)  # type: ignore[attr-defined]
-    warnings = tuple(getattr(dependencies.place_client, "last_warnings", ()))
-    if not candidates and warnings:
+    if type(cached) is PlaceSearchResult:
+        result = cached
+    else:
+        result = await dependencies.place_client.search(q, bounds=_SEOUL_BOUNDS)
+    if not result.candidates and result.warnings == ("PLACE_PROVIDER_UNAVAILABLE",):
         raise HTTPException(status_code=503, detail="PLACE_PROVIDER_UNAVAILABLE")
-    dependencies.cache.set(key, candidates, ttl_seconds=PLACES_TTL_SECONDS)
+    if type(cached) is not PlaceSearchResult:
+        dependencies.cache.set(key, result, ttl_seconds=PLACES_TTL_SECONDS)
     return PlacesResponse(
-        items=tuple(_place_response(item) for item in candidates),
-        warnings=warnings,
+        items=tuple(_place_response(item) for item in result.candidates),
+        warnings=result.warnings,
     )
 
 
@@ -51,13 +55,14 @@ async def reverse_places(
     cached = dependencies.cache.get(key)
     if type(cached) is ReversePlaceResponse:
         return cached
-    candidate = await dependencies.place_client.reverse_geocode(coordinate)  # type: ignore[attr-defined]
-    warnings = tuple(getattr(dependencies.place_client, "last_warnings", ()))
-    if candidate is None and warnings:
+    result = await dependencies.place_client.reverse_geocode(coordinate)
+    if result.candidate is None and result.warnings:
         raise HTTPException(status_code=503, detail="PLACE_PROVIDER_UNAVAILABLE")
     response = ReversePlaceResponse(
-        item=_place_response(candidate) if candidate is not None else None,
-        warnings=warnings,
+        item=(
+            _place_response(result.candidate) if result.candidate is not None else None
+        ),
+        warnings=result.warnings,
     )
     return dependencies.cache.set(
         key,

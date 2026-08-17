@@ -11,7 +11,12 @@ from app.main import create_app
 from app.policy.coverage import CoverageService
 from app.policy.engine import PolicyEngine
 from app.policy.rules import RuleRepository
-from app.providers.kakao_local import BoundingBox, PlaceCandidate
+from app.providers.kakao_local import (
+    BoundingBox,
+    PlaceCandidate,
+    PlaceSearchResult,
+    ReversePlaceResult,
+)
 from app.rate_limit import FixedWindowRateLimiter
 from app.routing.models import (
     Coordinate,
@@ -103,35 +108,40 @@ class FakePlaceClient:
     def __init__(self) -> None:
         self.search_calls = 0
         self.reverse_calls = 0
-        self.last_warnings: tuple[str, ...] = ()
 
     async def search(
         self,
         query: str,
         *,
         bounds: BoundingBox,
-    ) -> tuple[PlaceCandidate, ...]:
+    ) -> PlaceSearchResult:
         self.search_calls += 1
-        return (
-            PlaceCandidate(
-                place_id="fixture-city-hall",
+        return PlaceSearchResult(
+            candidates=(
+                PlaceCandidate(
+                    place_id="fixture-city-hall",
+                    name="서울특별시청",
+                    road_address="서울특별시 중구 세종대로 110",
+                    lot_address="서울특별시 중구 태평로1가 31",
+                    latitude=37.5662952,
+                    longitude=126.9779451,
+                ),
+            ),
+            warnings=(),
+        )
+
+    async def reverse_geocode(self, coordinate: Coordinate) -> ReversePlaceResult:
+        self.reverse_calls += 1
+        return ReversePlaceResult(
+            candidate=PlaceCandidate(
+                place_id="fixture-reverse",
                 name="서울특별시청",
                 road_address="서울특별시 중구 세종대로 110",
                 lot_address="서울특별시 중구 태평로1가 31",
-                latitude=37.5662952,
-                longitude=126.9779451,
+                latitude=coordinate.latitude,
+                longitude=coordinate.longitude,
             ),
-        )
-
-    async def reverse_geocode(self, coordinate: Coordinate) -> PlaceCandidate:
-        self.reverse_calls += 1
-        return PlaceCandidate(
-            place_id="fixture-reverse",
-            name="서울특별시청",
-            road_address="서울특별시 중구 세종대로 110",
-            lot_address="서울특별시 중구 태평로1가 31",
-            latitude=coordinate.latitude,
-            longitude=coordinate.longitude,
+            warnings=(),
         )
 
     async def aclose(self) -> None:

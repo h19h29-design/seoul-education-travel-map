@@ -1,0 +1,29 @@
+{
+  "meta": {"is_end": true, "pageable_count": 2, "total_count": 2},
+  "documents": [
+    {
+      "address_name": "서울 중구 세종대로 110",
+      "address_type": "ROAD_ADDR",
+      "road_address": {
+        "address_name": "서울 중구 세종대로 110",
+        "building_name": "서울특별시청",
+        "x": "126.978388",
+        "y": "37.566610"
+      },
+      "address": {
+        "address_name": "서울 중구 태평로1가 31",
+        "x": "126.978388",
+        "y": "37.566610"
+      },
+      "x": "126.978388",
+      "y": "37.566610"
+    },
+    {
+      "address_name": "서울 중구 태평로1가 31",
+      "address_type": "REGION_ADDR",
+      "road_address": null,
+      "x": "126.977900",
+      "y": "37.566300"
+    }
+  ]
+}
