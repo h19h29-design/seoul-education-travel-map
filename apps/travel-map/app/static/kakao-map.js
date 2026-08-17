@@ -50,6 +50,7 @@ export class KakaoMapController {
     this.destinationCandidateMarker = null;
     this.activeRouteIds = new Map();
     this.routeLines = new Map();
+    this.routeOptions = new Map();
     this.overlays = [];
     this.boundaries = [];
   }
@@ -92,6 +93,8 @@ export class KakaoMapController {
     this.overlays.forEach((overlay) => overlay.setMap?.(null));
     this.overlays = [];
     this.routeLines.clear();
+    this.routeOptions.clear();
+    this.activeRouteIds.clear();
     this.element.dataset.activeRoutes = "";
   }
 
@@ -152,27 +155,42 @@ export class KakaoMapController {
     this.destinationCandidateMarker = null;
   }
 
-  showRoutes({ origin, destination, routes, classificationPath }) {
+  routeKey(direction, routeId) {
+    return `${direction}:${routeId}`;
+  }
+
+  updateActiveRouteDataset() {
+    this.element.dataset.activeRoutes = [...this.activeRouteIds.entries()]
+      .map(([direction, routeId]) => this.routeKey(direction, routeId))
+      .join(" ");
+  }
+
+  createRouteLine(route, direction) {
+    const maps = window.kakao.maps;
+    const line = new maps.Polyline({
+      map: this.map,
+      path: route.geometry.map(coordinate),
+      strokeWeight: 8,
+      strokeColor: direction === "OUTBOUND" ? "#2d6cdf" : "#4b9f88",
+      strokeOpacity: 1,
+      strokeStyle: route.mode === "WALK" ? "shortdash" : "solid",
+    });
+    this.overlays.push(line);
+    return line;
+  }
+
+  showRoutes({ origin, destination, routeLegs, selectedRouteIdsByDirection, classificationPath }) {
     if (!this.map || !window.kakao?.maps) return;
     this.clearRouteOverlays();
     const maps = window.kakao.maps;
     const bounds = new maps.LatLngBounds();
     const addPoint = (point) => bounds.extend(coordinate(point));
     [origin.coordinate, destination].forEach(addPoint);
-    routes.forEach((route, index) => {
-      const line = new maps.Polyline({
-        map: this.map,
-        path: route.geometry.map((point) => {
-          addPoint(point);
-          return coordinate(point);
-        }),
-        strokeWeight: 5,
-        strokeColor: ["#2d6cdf", "#4b9f88", "#8357cf"][index % 3],
-        strokeOpacity: 0.65,
-        strokeStyle: route.mode === "WALK" ? "shortdash" : "solid",
+    routeLegs.forEach((leg) => {
+      leg.routes.forEach((route) => {
+        route.geometry.forEach(addPoint);
+        this.routeOptions.set(this.routeKey(leg.direction, route.id), { direction: leg.direction, route });
       });
-      this.routeLines.set(route.id, line);
-      this.overlays.push(line);
     });
     if (classificationPath?.geometry?.length) {
       const classificationLine = new maps.Polyline({
@@ -186,33 +204,42 @@ export class KakaoMapController {
       this.overlays.push(classificationLine);
     }
     this.map.setBounds?.(bounds);
+    Object.entries(selectedRouteIdsByDirection).forEach(([direction, routeId]) => {
+      this.setActiveRoute(direction, routeId);
+    });
   }
 
   setActiveRoutes(routeIds) {
-    if (!this.map) return;
-    const activeRouteIds = new Set(routeIds);
-    this.routeLines.forEach((line, id) => {
-      line.setOptions?.({
-        strokeWeight: activeRouteIds.has(id) ? 8 : 4,
-        strokeOpacity: activeRouteIds.has(id) ? 1 : 0.35,
+    const next = new Map(routeIds.map((key) => {
+      const separator = key.indexOf(":");
+      return [key.slice(0, separator), key.slice(separator + 1)];
+    }));
+    [...this.activeRouteIds.keys()]
+      .filter((direction) => !next.has(direction))
+      .forEach((direction) => {
+        const routeId = this.activeRouteIds.get(direction);
+        const key = this.routeKey(direction, routeId);
+        this.routeLines.get(key)?.setMap?.(null);
+        this.routeLines.delete(key);
+        this.activeRouteIds.delete(direction);
       });
-    });
-    this.element.dataset.activeRoutes = routeIds.join(" ");
-    this.activeRouteIds.clear();
-    routeIds.forEach((routeId) => {
-      const separator = routeId.indexOf(":");
-      if (separator > 0) {
-        this.activeRouteIds.set(routeId.slice(0, separator), routeId);
-      }
-    });
+    next.forEach((routeId, direction) => this.setActiveRoute(direction, routeId));
   }
 
   setActiveRoute(direction, routeId) {
-    const key = routeId.startsWith(`${direction}:`)
-      ? routeId
-      : `${direction}:${routeId}`;
-    this.activeRouteIds.set(direction, key);
-    this.setActiveRoutes([...this.activeRouteIds.values()]);
+    if (!this.map || !window.kakao?.maps) return;
+    const key = this.routeKey(direction, routeId);
+    const option = this.routeOptions.get(key);
+    if (!option || this.activeRouteIds.get(direction) === routeId) return;
+    const previousRouteId = this.activeRouteIds.get(direction);
+    if (previousRouteId) {
+      const previousKey = this.routeKey(direction, previousRouteId);
+      this.routeLines.get(previousKey)?.setMap?.(null);
+      this.routeLines.delete(previousKey);
+    }
+    this.activeRouteIds.set(direction, routeId);
+    this.routeLines.set(key, this.createRouteLine(option.route, direction));
+    this.updateActiveRouteDataset();
   }
 
   async setBoundary(name, visible, fetchGeojson) {

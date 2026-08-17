@@ -1,0 +1,16 @@
+{
+  "mobilityCost": {
+    "status": "UNKNOWN",
+    "amountKrw": null,
+    "warnings": ["PARTIAL_MOBILITY_COST"]
+  },
+  "fastestLeg": {
+    "direction": "OUTBOUND",
+    "routeId": "car-1",
+    "updates": {
+      "mobilityCostKrw": null,
+      "costStatus": "UNKNOWN",
+      "warnings": ["PARTIAL_MOBILITY_COST"]
+    }
+  }
+}

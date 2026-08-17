@@ -18,7 +18,9 @@ export type MockApiOptions = {
   };
   places?: object;
   preview?: object;
-  previewForPayload?: (payload: Record<string, unknown>) => object;
+  previewForPayload?: (
+    payload: Record<string, unknown>,
+  ) => object | Promise<object>;
   reverse?: object;
 };
 
@@ -243,7 +245,7 @@ export async function installMockApi(
       const payload = JSON.parse(route.request().postData() || "{}") as Record<string, unknown>;
       return fulfillJson(
         route,
-        options.previewForPayload?.(payload)
+        await options.previewForPayload?.(payload)
           ?? options.preview
           ?? readFixture("preview.json"),
       );

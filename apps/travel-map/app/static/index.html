@@ -81,18 +81,49 @@
               </div>
             </div>
 
-            <div class="date-time-grid">
-              <label for="starts-date">출발 일시
-                <span class="inline-controls"><input id="starts-date" type="date" required /><input id="starts-time" type="time" value="09:00" required /></span>
-              </label>
-              <label for="returns-date">복귀 일시
-                <span class="inline-controls"><input id="returns-date" type="date" required /><input id="returns-time" type="time" value="13:00" required /></span>
-              </label>
-            </div>
+            <fieldset class="schedule-fields">
+              <legend>출장 일정</legend>
+              <div class="date-time-grid">
+                <div class="date-time-field">
+                  <strong>출발 일시</strong>
+                  <span class="inline-controls">
+                    <label>날짜<input id="starts-date" type="date" aria-label="출발 날짜" required /></label>
+                    <label>시간<input id="starts-time" type="time" aria-label="출발 시간" value="09:00" required /></label>
+                  </span>
+                </div>
+                <div class="date-time-field">
+                  <strong>출장 종료 일시</strong>
+                  <span class="inline-controls">
+                    <label>출장 종료 날짜<input id="returns-date" type="date" aria-label="출장 종료 날짜" required /></label>
+                    <label>출장 종료 시간<input id="returns-time" type="time" aria-label="출장 종료 시간" value="13:00" required /></label>
+                  </span>
+                </div>
+              </div>
+              <div class="duration-control">
+                <strong id="duration-label">출장 시간</strong>
+                <span class="duration-inputs" aria-labelledby="duration-label">
+                  <label>시간<input id="duration-hours" type="number" min="0" max="24" step="1" value="4" inputmode="numeric" aria-label="출장 시간 시간" required /></label>
+                  <label>분<input id="duration-minutes" type="number" min="0" max="59" step="1" value="0" inputmode="numeric" aria-label="출장 시간 분" required /></label>
+                </span>
+                <div class="duration-quick" aria-label="출장 시간 빠른 선택">
+                  <button type="button" data-duration-hours="1">1시간</button>
+                  <button type="button" data-duration-hours="2">2시간</button>
+                  <button type="button" data-duration-hours="4">4시간</button>
+                  <button type="button" data-duration-hours="5">5시간</button>
+                  <button type="button" data-duration-hours="8">8시간</button>
+                </div>
+              </div>
+              <fieldset class="trip-patterns">
+                <legend>출장 형태</legend>
+                <label><input type="radio" name="trip-pattern" value="ROUND_TRIP" checked /> 일반 왕복 <small>가는 길 + 돌아오는 길</small></label>
+                <label><input type="radio" name="trip-pattern" value="OUTBOUND_ONLY_END_AFTER_SCHEDULE" /> 일정 후 퇴근 <small>가는 길만</small></label>
+                <label><input type="radio" name="trip-pattern" value="RETURN_ONLY_DIRECT_TO_DESTINATION" aria-label="바로 출근 후 근무지 복귀" /> 출장지로 바로 출근 후 근무지 복귀 <small>돌아오는 길만</small></label>
+              </fieldset>
+            </fieldset>
 
             <section id="policy-disclosure" class="policy-disclosure" role="note" aria-label="고정 적용 규정">
-              <strong>적용 규정</strong>
-              <span>서울시교육청 공무원 여비 규정(공무원 신분 확인)을 고정 적용합니다.</span>
+              <strong class="policy-badge">서울특별시교육청 공무원 여비 기준</strong>
+              <span>계산 기준은 서버에서 고정 적용합니다. Kakao 로그인은 재직 확인이 아닙니다.</span>
             </section>
 
             <fieldset class="vehicle-assumptions">
@@ -137,8 +168,8 @@
             <span id="coverage-status" class="coverage-status">확인 중</span>
           </div>
           <div class="summary-grid">
-            <article class="summary-card"><h3>지역 분류</h3><p id="classification-result">—</p><small id="classification-distance"></small></article>
-            <article class="summary-card"><h3>예상 이동비</h3><p id="mobility-cost">—</p><small id="mobility-status"></small></article>
+            <article class="summary-card"><h3>지역 분류</h3><p id="classification-result">—</p><small id="classification-distance"></small><small id="classification-warning" hidden></small></article>
+            <article class="summary-card"><h3>예상 이동비</h3><p id="mobility-cost">—</p><small id="mobility-status"></small><small id="mobility-warning" role="status" aria-live="polite" hidden></small></article>
             <article class="summary-card"><h3>관내출장 예상 지급액</h3><p id="allowance-amount">—</p><small id="allowance-status"></small></article>
           </div>
           <section class="route-section" aria-labelledby="routes-title">
