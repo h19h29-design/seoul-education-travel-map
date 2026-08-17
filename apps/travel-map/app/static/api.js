@@ -43,6 +43,7 @@ export const api = {
     district: filters.district,
   }, new Set(["q"]))}`, options),
   places: (query, options = {}) => request(`/places?${queryString({ q: query })}`, options),
+  currentPolicy: (options = {}) => request("/policy/current", options),
   reversePlace: ({ latitude, longitude }, options = {}) => request(`/places/reverse?${queryString({ latitude, longitude })}`, options),
   preview: (payload) => request("/trips/preview", {
     method: "POST",

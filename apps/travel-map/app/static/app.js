@@ -2,6 +2,7 @@ import { api, ApiError } from "./api.js";
 import { createDestinationPicker } from "./destination-picker.js";
 import { createInstitutionPicker } from "./institution-picker.js";
 import { KakaoMapController } from "./kakao-map.js";
+import { createHelpPanels } from "./help.js";
 import { createRouteResults } from "./route-results.js";
 import { createScheduleController } from "./schedule.js";
 import { createTripForm } from "./trip-form.js";
@@ -31,9 +32,12 @@ const controls = {
   form: $("#trip-form"),
   formError: $("#form-error"),
   fuelType: $("#fuel-type"),
+  helpButton: $("#help-button"),
+  helpDialog: $("#help-dialog"),
   map: $("#map"),
   mapCollapse: $("#map-collapse"),
   mapStatus: $("#map-status"),
+  menuButton: $("#mobile-menu-button"),
   mobilityCost: $("#mobility-cost"),
   mobilityStatus: $("#mobility-status"),
   mobilityWarning: $("#mobility-warning"),
@@ -46,6 +50,8 @@ const controls = {
   parkingCost: $("#parking-cost"),
   previousAllowance: $("#previous-allowance"),
   previousAllowanceField: $("#previous-allowance-field"),
+  policyButton: $("#policy-button"),
+  policyDialog: $("#policy-dialog"),
   quickDurationButtons: [...document.querySelectorAll("[data-duration-hours]")],
   results: $("#results"),
   routeCount: $("#route-count"),
@@ -53,6 +59,7 @@ const controls = {
   startDate: $("#starts-date"),
   startTime: $("#starts-time"),
   tripPattern: [...document.querySelectorAll("input[name='trip-pattern']")],
+  utilityNav: $("#utility-nav"),
   vehicleUse: $("#vehicle-use"),
   boundaries: {
     seoul: $("#seoul-layer"),
@@ -69,6 +76,15 @@ const controls = {
 const map = new KakaoMapController(controls.map, controls.mapStatus);
 let tripForm;
 let previewRevision = 0;
+let destroyMobileMenu = () => {};
+
+const helpPanels = createHelpPanels({
+  api,
+  helpButton: controls.helpButton,
+  helpDialog: controls.helpDialog,
+  policyButton: controls.policyButton,
+  policyDialog: controls.policyDialog,
+});
 
 function setFormError(message = "") {
   controls.formError.textContent = message;
@@ -256,6 +272,28 @@ function bindMapControls() {
   });
 }
 
+function bindMobileMenu() {
+  const media = window.matchMedia("(max-width: 767px)");
+  const setOpen = (open) => {
+    const mobileOpen = media.matches && open;
+    controls.menuButton.setAttribute("aria-expanded", String(mobileOpen));
+    controls.utilityNav.classList.toggle("is-open", mobileOpen);
+  };
+  const onMenuClick = () => {
+    if (!media.matches) return;
+    setOpen(controls.menuButton.getAttribute("aria-expanded") !== "true");
+  };
+  const onMediaChange = () => setOpen(false);
+  controls.menuButton.addEventListener("click", onMenuClick);
+  media.addEventListener("change", onMediaChange);
+  setOpen(false);
+  return () => {
+    controls.menuButton.removeEventListener("click", onMenuClick);
+    media.removeEventListener("change", onMediaChange);
+    setOpen(false);
+  };
+}
+
 function updatePreviousAllowanceControl() {
   const enabled = controls.otherTrips.checked;
   controls.previousAllowanceField.hidden = !enabled;
@@ -271,6 +309,8 @@ async function initialize() {
   controls.form.addEventListener("submit", calculate);
   bindSortTabs();
   bindMapControls();
+  destroyMobileMenu = bindMobileMenu();
+  helpPanels.initialize();
   controls.otherTrips.addEventListener("change", updatePreviousAllowanceControl);
   updatePreviousAllowanceControl();
   updateCalculateAvailability();
@@ -286,6 +326,8 @@ window.addEventListener("pagehide", () => {
   schedule.destroy();
   institutionPicker.destroy();
   destinationPicker.destroy();
+  helpPanels.destroy();
+  destroyMobileMenu();
 }, { once: true });
 
 initialize();

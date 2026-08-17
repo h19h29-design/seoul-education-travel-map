@@ -1,0 +1,16 @@
+{
+  "profile": "SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED",
+  "profileLabel": "서울특별시교육청 공무원 여비 기준",
+  "ruleSetId": "seoul-edu-travel-2026-08",
+  "effectiveFrom": "2026-08-01",
+  "localRoundTripExclusiveMeters": 12000,
+  "actualExpenseInclusiveMeters": 2000,
+  "fourHoursMinutes": 240,
+  "underFourHoursKrw": 20000,
+  "fourHoursOrMoreKrw": 40000,
+  "officialVehicleDeductionKrw": 20000,
+  "sourceRefs": [
+    "https://www.law.go.kr/LSW/lsInfoP.do?lsiSeq=287535",
+    "https://www.mpm.go.kr/mpm/info/resultPay/payBoard/?boardId=bbs_0000000000000035&cntId=693&mode=view"
+  ]
+}

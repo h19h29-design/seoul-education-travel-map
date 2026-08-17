@@ -17,6 +17,8 @@ export type MockApiOptions = {
     snapshotId?: string;
   };
   places?: object;
+  policy?: object;
+  policyStatus?: number;
   preview?: object;
   previewForPayload?: (
     payload: Record<string, unknown>,
@@ -233,6 +235,15 @@ export async function installMockApi(
       return fulfillJson(
         route,
         options.places ?? readFixture("places.json"),
+      );
+    }
+    if (path === "/api/v1/policy/current") {
+      return fulfillJson(
+        route,
+        options.policyStatus
+          ? { error: { code: "POLICY_UNAVAILABLE" } }
+          : options.policy ?? readFixture("policy-current.json"),
+        options.policyStatus ?? 200,
       );
     }
     if (path === "/api/v1/geodata/seoul") {
