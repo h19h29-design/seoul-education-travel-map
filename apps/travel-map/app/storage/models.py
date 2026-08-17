@@ -1,17 +1,20 @@
 """Shared models and canonical values for private SQLite storage."""
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Literal
 
 from app.policy.models import VehicleUse
-from app.routing.models import FuelType
-from app.trips.models import TripPattern
+from app.routing.models import FuelType, TravelMode
+from app.trips.models import RouteDirection, TripPattern
 
 
 class StorageIntegrityError(RuntimeError):
     """Raised when private storage is absent, malformed, or insecure."""
+
+
+HISTORY_RETENTION = timedelta(hours=168)
 
 
 def format_storage_timestamp(value: datetime) -> str:
@@ -32,6 +35,13 @@ def parse_storage_timestamp(value: str) -> datetime:
     if format_storage_timestamp(parsed) != value:
         raise StorageIntegrityError("storage timestamp is invalid")
     return parsed
+
+
+def expected_history_expiry_timestamp(created_at: str) -> str:
+    """Derive the only allowed history expiry from its canonical creation time."""
+    return format_storage_timestamp(
+        parse_storage_timestamp(created_at) + HISTORY_RETENTION
+    )
 
 
 @dataclass(frozen=True)
@@ -60,6 +70,82 @@ class SessionRecord:
         _require_digest(self.csrf_hmac, "csrf_hmac")
         format_storage_timestamp(self.created_at)
         format_storage_timestamp(self.expires_at)
+
+
+@dataclass(frozen=True)
+class HistoryRecalculationDraft:
+    origin_site_id: str
+    origin_name: str
+    destination_name: str
+    destination_address: str
+    trip_pattern: TripPattern
+    starts_at: datetime
+    ends_at: datetime
+
+
+@dataclass(frozen=True)
+class HistoryRouteLegSummary:
+    direction: RouteDirection
+    mode: TravelMode
+    duration_seconds: int
+    distance_meters: int
+    mobility_cost_krw: int | None
+
+
+@dataclass(frozen=True)
+class HistorySummary:
+    classification: str
+    allowance_status: str
+    allowance_krw: int | None
+    route_legs: tuple[HistoryRouteLegSummary, ...]
+    rule_set_id: str | None
+    effective_from: str | None
+
+
+@dataclass(frozen=True)
+class HistoryMetadata:
+    id: str
+    user_id: int
+    created_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class HistoryListItem:
+    metadata: HistoryMetadata
+    origin_name: str
+    destination_name: str
+    trip_pattern: TripPattern
+    classification: str
+    allowance_status: str
+    allowance_krw: int | None
+
+
+@dataclass(frozen=True)
+class HistoryDetail:
+    metadata: HistoryMetadata
+    draft: HistoryRecalculationDraft
+    summary: HistorySummary
+
+
+@dataclass(frozen=True)
+class HistoryCursor:
+    created_at: datetime
+    history_id: str
+
+
+@dataclass(frozen=True)
+class HistoryPage:
+    items: tuple[HistoryListItem, ...]
+    next_cursor: HistoryCursor | None
+
+
+@dataclass(frozen=True)
+class CleanupCounts:
+    oauth_attempts: int
+    sessions: int
+    history: int
+    users: int
 
 
 @dataclass(frozen=True)
