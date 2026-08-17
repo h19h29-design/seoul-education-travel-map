@@ -4,11 +4,13 @@ version = "0.1.0"
 description = "서울교육기관 관내출장 지도"
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=46.0.0",
     "defusedxml>=0.7.1",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "orjson>=3.11.9",
     "pydantic-settings>=2.15.0",
+    "pyjwt>=2.10.1",
     "pyproj>=3.7.2",
     "pyshp>=3.1.6",
     "shapely>=2.1.2",

@@ -1,5 +1,7 @@
 import logging
+from base64 import urlsafe_b64encode
 from collections.abc import AsyncIterator
+from ipaddress import ip_network
 
 import httpx
 import pytest
@@ -159,13 +161,22 @@ def test_default_module_app_redacts_uvicorn_query_string() -> None:
 def test_production_uvicorn_access_log_redacts_query_and_keeps_path_and_status() -> (
     None
 ):
+    test_key = urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
     settings = Settings(
         environment="production",
         kakao_rest_api_key="rest-secret",
         seoul_transit_service_key="seoul-secret",
         opinet_cert_key="opinet-secret",
-        allowed_hosts=("travel.example.test",),
-        allowed_origins=("https://travel.example.test",),
+        allowed_hosts=("travel.h19h19.com",),
+        allowed_origins=("https://travel.h19h19.com",),
+        public_base_url="https://travel.h19h19.com",
+        user_database_path="/data/travel-map.sqlite3",
+        kakao_oidc_client_id="login-only-test-client",
+        kakao_oidc_client_secret="test-only-oidc-secret",
+        session_hmac_key=test_key,
+        kakao_subject_hmac_key=test_key,
+        data_encryption_key_v1=test_key,
+        trusted_proxy_cidrs=(ip_network("1.1.1.1/32"),),
     )
     logger = logging.getLogger("uvicorn.access")
     handler = _CollectingHandler()

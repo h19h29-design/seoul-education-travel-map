@@ -1,4 +1,6 @@
 import re
+from base64 import b64decode, b64encode
+from ipaddress import IPv4Network, IPv6Network, ip_network
 from math import isfinite
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -37,13 +39,21 @@ class _TupleNormalizingSettingsSource(PydanticBaseSettingsSource):
             "kakao_rest_api_key",
             "seoul_transit_service_key",
             "opinet_cert_key",
+            "public_base_url",
+            "user_database_path",
+            "kakao_oidc_client_id",
+            "kakao_oidc_client_secret",
+            "session_hmac_key",
+            "kakao_subject_hmac_key",
+            "data_encryption_key_v1",
+            "trusted_proxy_cidrs",
         ):
             value = values.get(name)
             if value == "" or (
                 type(value) is SecretStr and value.get_secret_value() == ""
             ):
                 values[name] = None
-        for name in ("allowed_hosts", "allowed_origins"):
+        for name in ("allowed_hosts", "allowed_origins", "trusted_proxy_cidrs"):
             value = values.get(name)
             if type(value) is list:
                 values[name] = tuple(value)
@@ -65,6 +75,14 @@ class Settings(BaseSettings):
     kakao_rest_api_key: SecretStr | None = None
     seoul_transit_service_key: SecretStr | None = None
     opinet_cert_key: SecretStr | None = None
+    public_base_url: str | None = None
+    user_database_path: str | None = None
+    kakao_oidc_client_id: str | None = None
+    kakao_oidc_client_secret: SecretStr | None = None
+    session_hmac_key: SecretStr | None = None
+    kakao_subject_hmac_key: SecretStr | None = None
+    data_encryption_key_v1: SecretStr | None = None
+    trusted_proxy_cidrs: tuple[IPv4Network | IPv6Network, ...] | None = None
     allowed_hosts: tuple[str, ...] = ("127.0.0.1", "localhost")
     allowed_origins: tuple[str, ...] = (
         "http://127.0.0.1:3000",
@@ -101,12 +119,68 @@ class Settings(BaseSettings):
         "kakao_rest_api_key",
         "seoul_transit_service_key",
         "opinet_cert_key",
+        "kakao_oidc_client_secret",
+        "session_hmac_key",
+        "kakao_subject_hmac_key",
+        "data_encryption_key_v1",
     )
     @classmethod
     def reject_blank_secret(cls, value: SecretStr | None) -> SecretStr | None:
         if value is not None and not value.get_secret_value().strip():
             raise ValueError("provider credentials must be nonblank")
         return value
+
+    @field_validator("public_base_url", "user_database_path", "kakao_oidc_client_id")
+    @classmethod
+    def validate_auth_storage_text(cls, value: str | None) -> str | None:
+        if value is not None and (not value.strip() or value != value.strip()):
+            raise ValueError(
+                "auth/storage text settings must be canonical nonblank strings"
+            )
+        return value
+
+    @field_validator(
+        "session_hmac_key",
+        "kakao_subject_hmac_key",
+        "data_encryption_key_v1",
+    )
+    @classmethod
+    def validate_base64url_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None:
+            _decode_base64url_32(value)
+        return value
+
+    @field_validator("trusted_proxy_cidrs", mode="before")
+    @classmethod
+    def validate_trusted_proxy_cidrs(
+        cls, value: object
+    ) -> tuple[IPv4Network | IPv6Network, ...] | None:
+        if value is None:
+            return None
+        if type(value) is not tuple or not value:
+            raise ValueError("trusted proxy CIDRs must be a nonempty exact tuple")
+        networks: list[IPv4Network | IPv6Network] = []
+        for raw_network in value:
+            try:
+                network = (
+                    raw_network
+                    if type(raw_network) in {IPv4Network, IPv6Network}
+                    else ip_network(raw_network, strict=True)
+                )
+            except ValueError:
+                raise ValueError(
+                    "trusted proxy CIDRs must be canonical networks"
+                ) from None
+            if (
+                type(network) not in {IPv4Network, IPv6Network}
+                or network.prefixlen != network.max_prefixlen
+                or not network.network_address.is_global
+            ):
+                raise ValueError("trusted proxy CIDRs must be exact global peers")
+            networks.append(network)
+        if len(networks) != len(set(networks)):
+            raise ValueError("trusted proxy CIDRs must be unique")
+        return tuple(networks)
 
     @field_validator("provider_timeout_seconds", mode="before")
     @classmethod
@@ -191,10 +265,47 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production(self) -> "Settings":
+        auth_storage_values = (
+            self.public_base_url,
+            self.user_database_path,
+            self.kakao_oidc_client_id,
+            self.kakao_oidc_client_secret,
+            self.session_hmac_key,
+            self.kakao_subject_hmac_key,
+            self.data_encryption_key_v1,
+            self.trusted_proxy_cidrs,
+        )
+        supplied_auth_storage_values = sum(
+            value is not None for value in auth_storage_values
+        )
+        if supplied_auth_storage_values not in {0, len(auth_storage_values)}:
+            raise ValueError(
+                "auth/storage settings must be supplied as one complete group"
+            )
+        if (
+            self.kakao_oidc_client_id is not None
+            and self.kakao_rest_api_key is not None
+            and self.kakao_oidc_client_id == self.kakao_rest_api_key.get_secret_value()
+        ):
+            raise ValueError(
+                "OIDC client ID must be distinct from the provider REST key"
+            )
+        if supplied_auth_storage_values:
+            if self.public_base_url != "https://travel.h19h19.com":
+                raise ValueError("PUBLIC_BASE_URL must be the canonical public origin")
+            if self.user_database_path != "/data/travel-map.sqlite3":
+                raise ValueError(
+                    "USER_DATABASE_PATH must use the mounted user-data path"
+                )
         if self.environment != "production":
             return self
         if not {"allowed_hosts", "allowed_origins"}.issubset(self.model_fields_set):
             raise ValueError("production host and origin allowlists must be explicit")
+        allowed_production_hosts = {"travel.h19h19.com", "127.0.0.1", "localhost"}
+        if "travel.h19h19.com" not in self.allowed_hosts or not set(
+            self.allowed_hosts
+        ).issubset(allowed_production_hosts):
+            raise ValueError("production allows only the canonical public host")
         missing = tuple(
             name
             for name, value in (
@@ -206,8 +317,16 @@ class Settings(BaseSettings):
         )
         if missing:
             raise ValueError("production provider credentials are incomplete")
+        if supplied_auth_storage_values != len(auth_storage_values):
+            raise ValueError("production auth/storage settings are incomplete")
         if any(urlsplit(origin).scheme != "https" for origin in self.allowed_origins):
             raise ValueError("production origins must use HTTPS")
+        if self.public_base_url not in self.allowed_origins:
+            raise ValueError("PUBLIC_BASE_URL must be listed in ALLOWED_ORIGINS")
+        if any(
+            origin != "https://travel.h19h19.com" for origin in self.allowed_origins
+        ):
+            raise ValueError("production allows only the canonical public origin")
         return self
 
 
@@ -226,3 +345,25 @@ def _is_canonical_host(value: str) -> bool:
         re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) is not None
         for label in labels
     )
+
+
+def _decode_base64url_32(secret: SecretStr) -> bytes:
+    """Decode one 256-bit base64url setting without retaining a mutable copy."""
+
+    encoded = secret.get_secret_value()
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", encoded) is None:
+        raise ValueError("key settings must be base64url")
+    try:
+        decoded = bytearray(b64decode(encoded + "=", altchars=b"-_", validate=True))
+    except ValueError:
+        raise ValueError("key settings must be base64url") from None
+    try:
+        if len(decoded) != 32 or (
+            b64encode(bytes(decoded), altchars=b"-_").decode("ascii").rstrip("=")
+            != encoded
+        ):
+            raise ValueError("key settings must decode to exactly 32 bytes")
+        return bytes(decoded)
+    finally:
+        decoded[:] = b"\x00" * len(decoded)
+        decoded.clear()
