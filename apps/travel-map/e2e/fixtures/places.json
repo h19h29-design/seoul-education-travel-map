@@ -7,6 +7,14 @@
       "lotAddress": "서울특별시 중구 태평로1가 31",
       "latitude": 37.5662952,
       "longitude": 126.9779451
+    },
+    {
+      "placeId": "fixture-lot-only",
+      "name": "서울역 지번 안내소",
+      "roadAddress": null,
+      "lotAddress": "서울특별시 용산구 동자동 43-205",
+      "latitude": 37.554648,
+      "longitude": 126.970708
     }
   ],
   "warnings": []

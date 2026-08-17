@@ -39,11 +39,16 @@ function loadScript(key) {
 }
 
 export class KakaoMapController {
-  constructor(element, statusElement, onMapClick) {
+  constructor(element, statusElement, onMapClick = null) {
     this.element = element;
     this.statusElement = statusElement;
     this.onMapClick = onMapClick;
     this.map = null;
+    this.originCandidate = null;
+    this.originCandidateMarker = null;
+    this.destinationCandidate = null;
+    this.destinationCandidateMarker = null;
+    this.activeRouteIds = new Map();
     this.routeLines = new Map();
     this.overlays = [];
     this.boundaries = [];
@@ -72,8 +77,10 @@ export class KakaoMapController {
       maps.event?.addListener?.(this.map, "click", async (event) => {
         const latitude = event.latLng.getLat();
         const longitude = event.latLng.getLng();
-        await this.onMapClick({ latitude, longitude });
+        await this.onMapClick?.({ latitude, longitude });
       });
+      this.renderOriginCandidate();
+      this.renderDestinationCandidate();
       return true;
     } catch {
       this.setStatus(messageForMapError());
@@ -88,6 +95,63 @@ export class KakaoMapController {
     this.element.dataset.activeRoutes = "";
   }
 
+  setClickHandler(handler) {
+    this.onMapClick = handler;
+  }
+
+  replaceCandidateMarker(property, point, title) {
+    this[property]?.setMap?.(null);
+    this[property] = null;
+    if (!this.map || !window.kakao?.maps || !point) return;
+    const marker = new window.kakao.maps.Marker({
+      map: this.map,
+      position: coordinate(point),
+      title,
+    });
+    this[property] = marker;
+    this.map.panTo?.(coordinate(point));
+  }
+
+  renderOriginCandidate() {
+    if (!this.originCandidate) return;
+    this.replaceCandidateMarker(
+      "originCandidateMarker",
+      this.originCandidate.coordinate,
+      this.originCandidate.displayName,
+    );
+  }
+
+  showOriginCandidate(placeOrSite) {
+    this.originCandidate = placeOrSite;
+    this.renderOriginCandidate();
+  }
+
+  clearOriginCandidate() {
+    this.originCandidate = null;
+    this.originCandidateMarker?.setMap?.(null);
+    this.originCandidateMarker = null;
+  }
+
+  renderDestinationCandidate() {
+    if (!this.destinationCandidate) return;
+    this.replaceCandidateMarker(
+      "destinationCandidateMarker",
+      this.destinationCandidate,
+      this.destinationCandidate.name,
+    );
+  }
+
+  showDestinationCandidate(place) {
+    this.destinationCandidate = place;
+    this.renderDestinationCandidate();
+  }
+
+  clearDestinationCandidate() {
+    this.destinationCandidate = null;
+    this.destinationCandidateMarker?.setMap?.(null);
+    this.destinationCandidateMarker = null;
+  }
+
   showRoutes({ origin, destination, routes, classificationPath }) {
     if (!this.map || !window.kakao?.maps) return;
     this.clearRouteOverlays();
@@ -95,12 +159,6 @@ export class KakaoMapController {
     const bounds = new maps.LatLngBounds();
     const addPoint = (point) => bounds.extend(coordinate(point));
     [origin.coordinate, destination].forEach(addPoint);
-    const makeMarker = (point, title) => {
-      const marker = new maps.Marker({ map: this.map, position: coordinate(point), title });
-      this.overlays.push(marker);
-    };
-    makeMarker(origin.coordinate, origin.name);
-    makeMarker(destination, destination.name);
     routes.forEach((route, index) => {
       const line = new maps.Polyline({
         map: this.map,
@@ -140,6 +198,21 @@ export class KakaoMapController {
       });
     });
     this.element.dataset.activeRoutes = routeIds.join(" ");
+    this.activeRouteIds.clear();
+    routeIds.forEach((routeId) => {
+      const separator = routeId.indexOf(":");
+      if (separator > 0) {
+        this.activeRouteIds.set(routeId.slice(0, separator), routeId);
+      }
+    });
+  }
+
+  setActiveRoute(direction, routeId) {
+    const key = routeId.startsWith(`${direction}:`)
+      ? routeId
+      : `${direction}:${routeId}`;
+    this.activeRouteIds.set(direction, key);
+    this.setActiveRoutes([...this.activeRouteIds.values()]);
   }
 
   async setBoundary(name, visible, fetchGeojson) {

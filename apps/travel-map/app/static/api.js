@@ -10,8 +10,8 @@ class ApiError extends Error {
 
 async function request(path, options = {}) {
   const response = await fetch(`${API_ROOT}${path}`, {
-    headers: { Accept: "application/json", ...options.headers },
     ...options,
+    headers: { Accept: "application/json", ...options.headers },
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
@@ -20,26 +20,30 @@ async function request(path, options = {}) {
   return payload;
 }
 
-function queryString(values) {
+function queryString(values, includeEmpty = new Set()) {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(values)) {
-    if (value) query.set(key, value);
+    if (value !== undefined && value !== null && (value !== "" || includeEmpty.has(key))) {
+      query.set(key, String(value));
+    }
   }
   return query.toString();
 }
 
 export const api = {
   bootstrap: () => request("/bootstrap"),
-  institutions: (filters) => request(`/institutions?${queryString({
+  institutionFacets: (options = {}) => request("/institutions/facets", options),
+  institutions: (filters, options = {}) => request(`/institutions?${queryString({
     q: filters.q,
-    limit: "20",
+    limit: filters.limit ?? 20,
+    offset: filters.offset ?? 0,
     institution_type: filters.institutionType,
     foundation_type: filters.foundationType,
     education_office: filters.educationOffice,
     district: filters.district,
-  })}`),
-  places: (query) => request(`/places?${queryString({ q: query })}`),
-  reversePlace: ({ latitude, longitude }) => request(`/places/reverse?${queryString({ latitude, longitude })}`),
+  }, new Set(["q"]))}`, options),
+  places: (query, options = {}) => request(`/places?${queryString({ q: query })}`, options),
+  reversePlace: ({ latitude, longitude }, options = {}) => request(`/places/reverse?${queryString({ latitude, longitude })}`, options),
   preview: (payload) => request("/trips/preview", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

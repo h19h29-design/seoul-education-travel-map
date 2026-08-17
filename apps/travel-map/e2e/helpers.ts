@@ -6,21 +6,37 @@ import type { Page, Route } from "@playwright/test";
 const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 
 export type MockApiOptions = {
-  institutions?: { items: Array<Record<string, string>> };
+  bootstrapStatus?: number;
+  facets?: object;
+  facetsHang?: boolean;
+  facetsStatus?: number;
+  institutions?: {
+    items: Array<Record<string, unknown>>;
+    total?: number;
+    nextOffset?: number | null;
+    snapshotId?: string;
+  };
+  places?: object;
   preview?: object;
   previewForPayload?: (payload: Record<string, unknown>) => object;
   reverse?: object;
 };
 
 type MapEvent = {
+  id?: number;
   kind: string;
   map?: "map" | null;
   options?: Record<string, unknown>;
+  point?: { latitude: number; longitude: number };
   type: string;
 };
 
 type MapState = {
-  created: Array<{ kind: string; options: Record<string, unknown> }>;
+  created: Array<{
+    id: number;
+    kind: string;
+    options: Record<string, unknown>;
+  }>;
   events: MapEvent[];
 };
 
@@ -28,9 +44,13 @@ export function readFixture<T extends object>(name: string): T {
   return JSON.parse(readFileSync(join(fixtureDir, name), "utf8")) as T;
 }
 
-async function json(route: Route, payload: object): Promise<void> {
+export async function fulfillJson(
+  route: Route,
+  payload: object,
+  status = 200,
+): Promise<void> {
   await route.fulfill({
-    status: 200,
+    status,
     contentType: "application/json",
     body: JSON.stringify(payload),
   });
@@ -42,13 +62,20 @@ export async function installMockApi(
 ): Promise<void> {
   await page.addInitScript(() => {
     const state = {
-      created: [] as Array<{ kind: string; options: Record<string, unknown> }>,
+      created: [] as Array<{
+        id: number;
+        kind: string;
+        options: Record<string, unknown>;
+      }>,
       events: [] as Array<{
+        id?: number;
         kind: string;
         map?: "map" | null;
         options?: Record<string, unknown>;
+        point?: { latitude: number; longitude: number };
         type: string;
       }>,
+      nextOverlayId: 1,
       clickHandler: null as ((event: { latLng: LatLngFake }) => Promise<void> | void) | null,
       async triggerClick(latitude: number, longitude: number): Promise<void> {
         await this.clickHandler?.({ latLng: new LatLngFake(latitude, longitude) });
@@ -59,18 +86,29 @@ export async function installMockApi(
       setBounds(): void {
         state.events.push({ kind: "Map", type: "setBounds" });
       }
+
+      panTo(point: LatLngFake): void {
+        state.events.push({
+          kind: "Map",
+          point: { latitude: point.lat, longitude: point.lng },
+          type: "panTo",
+        });
+      }
     }
 
     class OverlayFake {
+      id: number;
       kind: string;
 
       constructor(options: Record<string, unknown> = {}) {
+        this.id = state.nextOverlayId++;
         this.kind = this.constructor.name;
-        state.created.push({ kind: this.kind, options });
+        state.created.push({ id: this.id, kind: this.kind, options });
       }
 
       setMap(map: unknown): void {
         state.events.push({
+          id: this.id,
           kind: this.kind,
           map: map === null ? null : "map",
           type: "setMap",
@@ -78,7 +116,12 @@ export async function installMockApi(
       }
 
       setOptions(options: Record<string, unknown>): void {
-        state.events.push({ kind: this.kind, options, type: "setOptions" });
+        state.events.push({
+          id: this.id,
+          kind: this.kind,
+          options,
+          type: "setOptions",
+        });
       }
     }
 
@@ -132,36 +175,80 @@ export async function installMockApi(
       },
     });
   });
-  await page.route("**/api/v1/bootstrap", (route) =>
-    json(route, readFixture("bootstrap.json")),
-  );
-  await page.route("**/api/v1/institutions**", (route) => {
+  await page.route("**/api/v1/**", async (route) => {
     const requestUrl = new URL(route.request().url());
-    const payload = options.institutions ?? readFixture<{ items: Array<Record<string, string>> }>("institutions.json");
-    const items = payload.items.filter((item) => (
-      (!requestUrl.searchParams.get("institution_type") || item.institutionType === requestUrl.searchParams.get("institution_type"))
-      && (!requestUrl.searchParams.get("foundation_type") || item.foundationType === requestUrl.searchParams.get("foundation_type"))
-    ));
-    return json(route, { items });
-  });
-  await page.route("**/api/v1/places**", (route) =>
-    json(route, readFixture("places.json")),
-  );
-  await page.route("**/api/v1/places/reverse**", (route) =>
-    json(route, options.reverse ?? readFixture("reverse.json")),
-  );
-  await page.route("**/api/v1/geodata/seoul", (route) =>
-    json(route, readFixture("seoul.geojson")),
-  );
-  await page.route("**/api/v1/geodata/support", (route) =>
-    json(route, readFixture("support.geojson")),
-  );
-  await page.route("**/api/v1/trips/preview", (route) => {
-    const payload = JSON.parse(route.request().postData() || "{}") as Record<string, unknown>;
-    return json(
-      route,
-      options.previewForPayload?.(payload) ?? options.preview ?? readFixture("preview.json"),
-    );
+    const path = requestUrl.pathname;
+    if (path === "/api/v1/bootstrap") {
+      return fulfillJson(
+        route,
+        options.bootstrapStatus
+          ? { error: { code: "BOOTSTRAP_UNAVAILABLE" } }
+          : readFixture("bootstrap.json"),
+        options.bootstrapStatus ?? 200,
+      );
+    }
+    if (path === "/api/v1/institutions/facets") {
+      if (options.facetsHang) return;
+      return fulfillJson(
+        route,
+        options.facetsStatus
+          ? { error: { code: "FACETS_UNAVAILABLE" } }
+          : options.facets ?? readFixture("institution-facets.json"),
+        options.facetsStatus ?? 200,
+      );
+    }
+    if (path === "/api/v1/institutions") {
+      const payload = options.institutions ?? readFixture<{
+        items: Array<Record<string, unknown>>;
+        total: number;
+        nextOffset: number | null;
+        snapshotId: string;
+      }>("institutions.json");
+      const items = payload.items.filter((item) => (
+        (!requestUrl.searchParams.get("institution_type")
+          || item.institutionType === requestUrl.searchParams.get("institution_type"))
+        && (!requestUrl.searchParams.get("foundation_type")
+          || item.foundationType === requestUrl.searchParams.get("foundation_type"))
+        && (!requestUrl.searchParams.get("education_office")
+          || item.educationOffice === requestUrl.searchParams.get("education_office"))
+        && (!requestUrl.searchParams.get("district")
+          || item.district === requestUrl.searchParams.get("district"))
+      ));
+      return fulfillJson(route, {
+        items,
+        total: payload.total ?? items.length,
+        nextOffset: payload.nextOffset ?? null,
+        snapshotId: payload.snapshotId ?? "fixture-001",
+      });
+    }
+    if (path === "/api/v1/places/reverse") {
+      return fulfillJson(
+        route,
+        options.reverse ?? readFixture("reverse.json"),
+      );
+    }
+    if (path === "/api/v1/places") {
+      return fulfillJson(
+        route,
+        options.places ?? readFixture("places.json"),
+      );
+    }
+    if (path === "/api/v1/geodata/seoul") {
+      return fulfillJson(route, readFixture("seoul.geojson"));
+    }
+    if (path === "/api/v1/geodata/support") {
+      return fulfillJson(route, readFixture("support.geojson"));
+    }
+    if (path === "/api/v1/trips/preview") {
+      const payload = JSON.parse(route.request().postData() || "{}") as Record<string, unknown>;
+      return fulfillJson(
+        route,
+        options.previewForPayload?.(payload)
+          ?? options.preview
+          ?? readFixture("preview.json"),
+      );
+    }
+    return route.fallback();
   });
 }
 

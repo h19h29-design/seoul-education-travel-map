@@ -96,19 +96,25 @@ input::placeholder { color: #9aa4b3; }
 .search-filter-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; padding: 9px; border: 1px solid var(--line); border-radius: var(--radius); background: #fbfcff; }
 .search-filter-grid label { gap: 4px; color: var(--muted); font-size: 11px; }
 .search-filter-grid select { min-height: 32px; padding: 5px 7px; font-size: 12px; }
+.facet-feedback { display: grid; justify-items: start; gap: 5px; }
+.facet-status { min-height: 17px; margin: 0; color: var(--muted); font-size: 11px; }
 
 .field-search { position: relative; display: grid; gap: 6px; }
 .field-label-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .filter-toggle { border: 0; background: transparent; color: #2863bc; padding: 0; font-size: 12px; font-weight: 750; text-decoration: underline; text-underline-offset: 2px; }
 .field-note { min-height: 18px; margin: -1px 0 0; color: var(--muted); font-size: 12px; font-weight: 500; }
+.search-actions { min-height: 0; display: flex; flex-wrap: wrap; gap: 7px; }
+.secondary-action { min-height: 30px; border: 1px solid #9eb8e8; border-radius: 6px; color: #164fbc; background: #fff; padding: 4px 9px; font-size: 12px; font-weight: 750; }
 
 .suggestions {
-  position: absolute; z-index: 10; top: calc(100% - 18px); left: 0; right: 0; max-height: 225px; overflow: auto;
+  position: relative; z-index: 10; max-height: 225px; overflow: auto;
   margin: 0; padding: 4px; list-style: none; border: 1px solid #b9c9e4; border-radius: var(--radius); background: #fff; box-shadow: var(--shadow);
 }
 
-.suggestions [role="option"] { padding: 9px 10px; border-radius: 5px; color: #25334b; font-size: 13px; cursor: pointer; }
+.suggestions [role="option"] { display: grid; gap: 3px; padding: 9px 10px; border-radius: 5px; color: #25334b; font-size: 13px; cursor: pointer; }
 .suggestions [role="option"]:hover, .suggestions [aria-selected="true"] { background: var(--blue-weak); color: var(--navy); }
+.suggestion-primary { overflow-wrap: anywhere; font-size: 13px; }
+.suggestion-secondary { overflow-wrap: anywhere; color: var(--muted); font-size: 11px; }
 
 .date-time-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
 .date-time-grid label { font-size: 13px; }

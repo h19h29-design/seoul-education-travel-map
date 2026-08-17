@@ -1,4 +1,6 @@
 import { api, ApiError } from "./api.js";
+import { createDestinationPicker } from "./destination-picker.js";
+import { createInstitutionPicker } from "./institution-picker.js";
 import { KakaoMapController } from "./kakao-map.js";
 
 const $ = (selector) => document.querySelector(selector);
@@ -10,6 +12,11 @@ const controls = {
   destinationResults: $("#destination-results"),
   originNote: $("#origin-selection"),
   destinationNote: $("#destination-selection"),
+  originSearchRetry: $("#origin-search-retry"),
+  destinationSearchRetry: $("#destination-search-retry"),
+  originLoadMore: $("#origin-load-more"),
+  facetsStatus: $("#institution-facets-status"),
+  facetsRetry: $("#institution-facets-retry"),
   formError: $("#form-error"),
   results: $("#results"),
   routeList: $("#route-list"),
@@ -28,10 +35,9 @@ const state = {
   preview: null,
   activeRouteIds: {},
   sort: "time",
-  activeSuggestions: { origin: -1, destination: -1 },
 };
 
-const map = new KakaoMapController($("#map"), $("#map-status"), reverseDestination);
+const map = new KakaoMapController($("#map"), $("#map-status"));
 const modeName = { TRANSIT: "대중교통", CAR: "자동차", WALK: "도보" };
 const directionName = { OUTBOUND: "가는 길", RETURN: "돌아오는 길" };
 const bestName = {
@@ -39,22 +45,49 @@ const bestName = {
   shortestRouteId: "최단거리",
   cheapestRouteId: "최저비용",
 };
-const institutionTypeName = {
-  KINDERGARTEN: "유치원",
-  ELEMENTARY_SCHOOL: "초등학교",
-  MIDDLE_SCHOOL: "중학교",
-  HIGH_SCHOOL: "고등학교",
-};
-const foundationTypeName = {
-  NATIONAL: "국립",
-  PUBLIC: "공립",
-  PRIVATE: "사립",
-};
 
-function institutionDetails(item) {
-  return `${institutionTypeName[item.institutionType] || item.institutionType} · ${foundationTypeName[item.foundationType] || item.foundationType} · ${item.district} · ${item.roadAddress}`;
-}
+const institutionPicker = createInstitutionPicker({
+  api,
+  map,
+  elements: {
+    input: controls.origin,
+    listbox: controls.originResults,
+    status: controls.originNote,
+    retryButton: controls.originSearchRetry,
+    loadMoreButton: controls.originLoadMore,
+    facetsStatus: controls.facetsStatus,
+    facetsRetryButton: controls.facetsRetry,
+    filtersToggle: controls.filtersToggle,
+    filtersContainer: $("#institution-filters"),
+    filters: {
+      institutionType: $("#institution-type"),
+      foundationType: $("#foundation-type"),
+      educationOffice: $("#education-office"),
+      district: $("#district"),
+    },
+  },
+  onSelectionChange: (item) => {
+    state.origin = item;
+    updateCalculateAvailability();
+    setFormError();
+  },
+});
 
+const destinationPicker = createDestinationPicker({
+  api,
+  map,
+  elements: {
+    input: controls.destination,
+    listbox: controls.destinationResults,
+    status: controls.destinationNote,
+    retryButton: controls.destinationSearchRetry,
+  },
+  onSelectionChange: (item) => {
+    state.destination = item;
+    updateCalculateAvailability();
+    setFormError();
+  },
+});
 function formatMoney(value) {
   return value == null ? "비용 정보 없음" : `${new Intl.NumberFormat("ko-KR").format(value)}원`;
 }
@@ -95,139 +128,6 @@ function setDefaultDates() {
   }).format(new Date());
   $("#starts-date").value = date;
   $("#returns-date").value = date;
-}
-
-function optionText(item, kind) {
-  return kind === "origin"
-    ? `${item.displayName} · ${institutionDetails(item)}`
-    : `${item.name} · ${item.roadAddress || item.lotAddress}`;
-}
-
-function hideSuggestions(kind) {
-  const input = kind === "origin" ? controls.origin : controls.destination;
-  const list = kind === "origin" ? controls.originResults : controls.destinationResults;
-  list.hidden = true;
-  list.replaceChildren();
-  input.setAttribute("aria-expanded", "false");
-  input.removeAttribute("aria-activedescendant");
-  state.activeSuggestions[kind] = -1;
-}
-
-function renderSuggestions(kind, items) {
-  const input = kind === "origin" ? controls.origin : controls.destination;
-  const list = kind === "origin" ? controls.originResults : controls.destinationResults;
-  list.replaceChildren();
-  state.activeSuggestions[kind] = -1;
-  if (!items.length) {
-    hideSuggestions(kind);
-    return;
-  }
-  items.forEach((item, index) => {
-    const option = document.createElement("li");
-    option.id = `${kind}-option-${index}`;
-    option.setAttribute("role", "option");
-    option.tabIndex = -1;
-    option.dataset.index = String(index);
-    option.textContent = optionText(item, kind);
-    option.addEventListener("mousedown", (event) => event.preventDefault());
-    option.addEventListener("click", () => selectSuggestion(kind, item));
-    list.append(option);
-  });
-  list.hidden = false;
-  input.setAttribute("aria-expanded", "true");
-}
-
-function selectSuggestion(kind, item) {
-  if (kind === "origin") {
-    state.origin = item;
-    controls.origin.value = item.displayName;
-    controls.originNote.textContent = institutionDetails(item);
-  } else {
-    state.destination = item;
-    controls.destination.value = item.name;
-    controls.destinationNote.textContent = item.roadAddress || item.lotAddress;
-  }
-  hideSuggestions(kind);
-  updateCalculateAvailability();
-  setFormError();
-}
-
-function moveSuggestion(kind, increment) {
-  const list = kind === "origin" ? controls.originResults : controls.destinationResults;
-  const input = kind === "origin" ? controls.origin : controls.destination;
-  const options = [...list.querySelectorAll('[role="option"]')];
-  if (!options.length) return;
-  const index = (state.activeSuggestions[kind] + increment + options.length) % options.length;
-  state.activeSuggestions[kind] = index;
-  options.forEach((option, itemIndex) => option.setAttribute("aria-selected", String(itemIndex === index)));
-  input.setAttribute("aria-activedescendant", options[index].id);
-  options[index].scrollIntoView({ block: "nearest" });
-}
-
-function bindCombobox(kind, getItems) {
-  const input = kind === "origin" ? controls.origin : controls.destination;
-  let requestId = 0;
-  input.addEventListener("input", async () => {
-    const query = input.value.trim();
-    if (kind === "origin") state.origin = null;
-    else state.destination = null;
-    updateCalculateAvailability();
-    if (query.length < 2) return hideSuggestions(kind);
-    const currentRequest = ++requestId;
-    try {
-      const items = await getItems(query);
-      if (currentRequest === requestId) renderSuggestions(kind, items);
-    } catch (error) {
-      if (currentRequest === requestId) setFormError(errorMessage(error));
-    }
-  });
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      moveSuggestion(kind, 1);
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      moveSuggestion(kind, -1);
-    } else if (event.key === "Enter" && state.activeSuggestions[kind] >= 0) {
-      event.preventDefault();
-      const list = kind === "origin" ? controls.originResults : controls.destinationResults;
-      list.querySelectorAll('[role="option"]')[state.activeSuggestions[kind]]?.click();
-    } else if (event.key === "Escape") {
-      hideSuggestions(kind);
-    }
-  });
-  input.addEventListener("blur", () => window.setTimeout(() => hideSuggestions(kind), 120));
-}
-
-function originFilters() {
-  return {
-    institutionType: $("#institution-type").value,
-    foundationType: $("#foundation-type").value,
-    educationOffice: $("#education-office").value,
-    district: $("#district").value,
-  };
-}
-
-async function reverseDestination(point) {
-  state.destination = null;
-  controls.destination.value = "";
-  controls.destinationNote.textContent = "지도에서 선택한 위치의 주소를 확인하고 선택하세요.";
-  hideSuggestions("destination");
-  updateCalculateAvailability();
-  setFormError();
-  try {
-    const response = await api.reversePlace(point);
-    if (!response.item) {
-      setFormError("선택한 위치의 주소를 확인할 수 없습니다.");
-      return;
-    }
-    controls.destination.value = response.item.name;
-    renderSuggestions("destination", [response.item]);
-    controls.destinationNote.textContent = "지도에서 선택한 주소입니다. 목록에서 확인해 선택하세요.";
-    controls.destination.focus();
-  } catch (error) {
-    setFormError(errorMessage(error));
-  }
 }
 
 function requestPayload() {
@@ -464,20 +364,8 @@ function updatePreviousAllowanceControl() {
 
 async function initialize() {
   setDefaultDates();
-  bindCombobox("origin", async (query) => (await api.institutions({ q: query, ...originFilters() })).items);
-  bindCombobox("destination", async (query) => (await api.places(query)).items);
-  ["#institution-type", "#foundation-type", "#education-office", "#district"].forEach((selector) => {
-    $(selector).addEventListener("change", () => controls.origin.dispatchEvent(new Event("input")));
-  });
-  controls.filtersToggle.addEventListener("click", () => {
-    const filters = $("#institution-filters");
-    const expanded = controls.filtersToggle.getAttribute("aria-expanded") !== "true";
-    filters.hidden = !expanded;
-    controls.filtersToggle.setAttribute("aria-expanded", String(expanded));
-    controls.filtersToggle.textContent = expanded
-      ? "기관 검색 필터 닫기"
-      : "기관 검색 필터 열기";
-  });
+  institutionPicker.initialize();
+  destinationPicker.initialize();
   controls.form.addEventListener("submit", calculate);
   bindSortTabs();
   bindMapControls();
@@ -491,5 +379,10 @@ async function initialize() {
     map.setStatus("지도 설정을 확인하지 못했습니다. 입력과 경로 결과는 계속 사용할 수 있습니다.");
   }
 }
+
+window.addEventListener("pagehide", () => {
+  institutionPicker.destroy();
+  destinationPicker.destroy();
+}, { once: true });
 
 initialize();

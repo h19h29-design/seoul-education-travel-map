@@ -1,0 +1,21 @@
+{
+  "snapshotId": "fixture-001",
+  "institutionTypes": [
+    { "value": "KINDERGARTEN", "label": "유치원", "count": 4 },
+    { "value": "ELEMENTARY_SCHOOL", "label": "초등학교", "count": 7 },
+    { "value": "HIGH_SCHOOL", "label": "고등학교", "count": 3 }
+  ],
+  "foundationTypes": [
+    { "value": "NATIONAL", "label": "국립", "count": 1 },
+    { "value": "PUBLIC", "label": "공립", "count": 9 },
+    { "value": "PRIVATE", "label": "사립", "count": 4 }
+  ],
+  "educationOffices": [
+    { "value": "SEOUL_EDU_SUPPORT_JUNGBU", "label": "중부교육지원청", "count": 8 },
+    { "value": "SEOUL_EDU_SUPPORT_GANGNAM_SEOCHO", "label": "강남서초교육지원청", "count": 6 }
+  ],
+  "districts": [
+    { "value": "중구", "label": "중구", "count": 8 },
+    { "value": "강남구", "label": "강남구", "count": 6 }
+  ]
+}

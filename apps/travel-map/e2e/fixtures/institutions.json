@@ -3,14 +3,18 @@
     {
       "institutionId": "test-neis:B10:SEMWATER-ES",
       "siteId": "test-neis:B10:SEMWATER-ES:main",
-      "siteName": "샘물공립초등학교",
+      "siteName": "main",
       "officialName": "샘물공립초등학교",
       "displayName": "샘물공립초등학교",
       "institutionType": "ELEMENTARY_SCHOOL",
       "foundationType": "PUBLIC",
-      "educationOffice": "중부교육지원청",
+      "educationOffice": "SEOUL_EDU_SUPPORT_JUNGBU",
       "roadAddress": "서울특별시 중구 샘물로 12",
       "district": "중구",
+      "coordinate": {
+        "latitude": 37.56341,
+        "longitude": 126.98762
+      },
       "coordinateQuality": "ROOFTOP",
       "snapshotId": "fixture-001",
       "snapshotAsOf": "2026-08-10"
@@ -18,17 +22,24 @@
     {
       "institutionId": "test-neis:B10:SEMWATER-HS",
       "siteId": "test-neis:B10:SEMWATER-HS:main",
-      "siteName": "샘물사립고등학교",
+      "siteName": "main",
       "officialName": "샘물사립고등학교",
       "displayName": "샘물사립고등학교",
       "institutionType": "HIGH_SCHOOL",
       "foundationType": "PRIVATE",
-      "educationOffice": "강남서초교육지원청",
+      "educationOffice": "SEOUL_EDU_SUPPORT_GANGNAM_SEOCHO",
       "roadAddress": "서울특별시 강남구 샘물대로 48",
       "district": "강남구",
+      "coordinate": {
+        "latitude": 37.49794,
+        "longitude": 127.02761
+      },
       "coordinateQuality": "ROOFTOP",
       "snapshotId": "fixture-001",
       "snapshotAsOf": "2026-08-10"
     }
-  ]
+  ],
+  "total": 2,
+  "nextOffset": null,
+  "snapshotId": "fixture-001"
 }

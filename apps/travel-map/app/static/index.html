@@ -37,47 +37,48 @@
               </div>
               <input id="origin-search" name="origin" type="search" role="combobox" autocomplete="off" aria-autocomplete="list" aria-controls="origin-results" aria-expanded="false" placeholder="기관명을 입력하세요" />
               <ul id="origin-results" class="suggestions" role="listbox" aria-label="기관 검색 결과" hidden></ul>
-              <p id="origin-selection" class="field-note" aria-live="polite">기관명으로 검색해 선택하세요.</p>
+              <p id="origin-selection" class="field-note" role="status" aria-live="polite">기관명으로 검색해 선택하세요.</p>
+              <div class="search-actions">
+                <button id="origin-search-retry" class="secondary-action" type="button" hidden>기관 검색 다시 시도</button>
+                <button id="origin-load-more" class="secondary-action" type="button" hidden>기관 더 보기</button>
+              </div>
             </div>
 
             <div id="institution-filters" class="search-filter-grid" aria-label="기관 검색 필터" hidden>
               <label>기관유형
-                <select id="institution-type" name="institutionType">
+                <select id="institution-type" name="institutionType" disabled>
                   <option value="">전체</option>
-                  <option value="KINDERGARTEN">유치원</option>
-                  <option value="ELEMENTARY_SCHOOL">초등학교</option>
-                  <option value="MIDDLE_SCHOOL">중학교</option>
-                  <option value="HIGH_SCHOOL">고등학교</option>
                 </select>
               </label>
               <label>설립구분
-                <select id="foundation-type" name="foundationType">
+                <select id="foundation-type" name="foundationType" disabled>
                   <option value="">전체</option>
-                  <option value="NATIONAL">국립</option>
-                  <option value="PUBLIC">공립</option>
-                  <option value="PRIVATE">사립</option>
                 </select>
               </label>
               <label>교육지원청
-                <select id="education-office" name="educationOffice">
+                <select id="education-office" name="educationOffice" disabled>
                   <option value="">전체</option>
-                  <option value="중부교육지원청">중부교육지원청</option>
                 </select>
               </label>
               <label>자치구
-                <select id="district" name="district">
+                <select id="district" name="district" disabled>
                   <option value="">전체</option>
-                  <option value="중구">중구</option>
-                  <option value="강남구">강남구</option>
                 </select>
               </label>
+            </div>
+            <div class="facet-feedback">
+              <p id="institution-facets-status" class="facet-status" role="status" aria-live="polite">기관 필터를 준비하고 있습니다.</p>
+              <button id="institution-facets-retry" class="secondary-action facet-retry" type="button" hidden>기관 필터 다시 시도</button>
             </div>
 
             <div class="field-search">
               <label for="destination-search">출장지</label>
               <input id="destination-search" name="destination" type="search" role="combobox" autocomplete="off" aria-autocomplete="list" aria-controls="destination-results" aria-expanded="false" placeholder="목적지명 또는 주소를 입력하세요" />
               <ul id="destination-results" class="suggestions" role="listbox" aria-label="목적지 검색 결과" hidden></ul>
-              <p id="destination-selection" class="field-note" aria-live="polite">지도에서 위치를 선택한 뒤 주소를 확인할 수도 있습니다.</p>
+              <p id="destination-selection" class="field-note" role="status" aria-live="polite">지도에서 위치를 선택한 뒤 주소를 확인할 수도 있습니다.</p>
+              <div class="search-actions">
+                <button id="destination-search-retry" class="secondary-action" type="button" hidden>출장지 검색 다시 시도</button>
+              </div>
             </div>
 
             <div class="date-time-grid">
@@ -126,7 +127,7 @@
               <input id="previous-allowance" type="number" min="0" step="1000" value="0" inputmode="numeric" disabled />
             </label>
             <p id="form-error" class="form-error" role="alert" hidden></p>
-            <button id="calculate-button" class="primary-button" type="submit">▣ 경로 계산</button>
+            <button id="calculate-button" class="primary-button" type="submit" disabled>▣ 경로 계산</button>
           </form>
         </section>
 
