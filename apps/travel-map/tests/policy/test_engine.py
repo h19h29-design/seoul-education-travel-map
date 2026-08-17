@@ -271,7 +271,9 @@ def test_rule_effective_date_uses_the_korean_start_date(
 
 # Production break caught: accepting booleans, fractions, or numeric strings as
 # measured distance or prior allowance values.
-@pytest.mark.parametrize("field_name", ["round_trip_distance_m", "previous_allowance_krw"])
+@pytest.mark.parametrize(
+    "field_name", ["round_trip_distance_m", "previous_allowance_krw"]
+)
 @pytest.mark.parametrize("invalid_value", [True, 1.5, "3000"])
 def test_policy_input_rejects_non_integer_numeric_values(
     field_name: str,
@@ -285,7 +287,9 @@ def test_policy_input_rejects_non_integer_numeric_values(
 
 # Production break caught: letting negative distance misclassify a trip or a
 # negative prior payment increase the daily allowance ceiling.
-@pytest.mark.parametrize("field_name", ["round_trip_distance_m", "previous_allowance_krw"])
+@pytest.mark.parametrize(
+    "field_name", ["round_trip_distance_m", "previous_allowance_krw"]
+)
 def test_policy_input_rejects_negative_numeric_values(field_name: str) -> None:
     policy_input = replace(make_policy_input(), **{field_name: -1})
 

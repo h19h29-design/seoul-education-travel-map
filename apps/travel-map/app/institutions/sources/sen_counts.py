@@ -7,23 +7,17 @@ from pathlib import Path
 from app.institutions.sources.common import SourceDataError
 
 _PRELIMINARY_URL = (
-    "https://enews.sen.go.kr/uploads/img_smart//2026-06-08/"
-    "20260608075519432.png"
+    "https://enews.sen.go.kr/uploads/img_smart//2026-06-08/20260608075519432.png"
 )
 _PRELIMINARY_AS_OF = "2026-03-10"
-_PRELIMINARY_SHA256 = (
-    "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70"
-)
+_PRELIMINARY_SHA256 = "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70"
 _DETAILED_CORROBORATING_URL = (
-    "https://www.sen.go.kr/www/information/statistics/"
-    "statistics_2/statistics_2025.jsp"
+    "https://www.sen.go.kr/www/information/statistics/statistics_2/statistics_2025.jsp"
 )
 _DETAILED_CORROBORATING_SHA256 = (
     "8d3791e2ebf84799c7af53be0d662a4eaeb922bab3e85f0c82fe08793b1bd26b"
 )
-_NORMALIZED_SHA256 = (
-    "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332"
-)
+_NORMALIZED_SHA256 = "36158d45a3b8c7e8a083e6d78f63fee706618f69eb49d8624877aef07e3a9332"
 _LICENSE_NAME = "KOGL_TYPE_1_ATTRIBUTION"
 _ATTRIBUTION = "Source: Seoul Metropolitan Office of Education school statistics"
 _REPORTED_POPULATION = (
@@ -155,21 +149,17 @@ def load_reviewed_school_counts(path: Path) -> ReviewedSchoolCounts:
         or metadata["normalized_sha256"] != normalized_sha256
         or metadata["license_name"] != _LICENSE_NAME
         or metadata["attribution"] != _ATTRIBUTION
-        or metadata["detailed_corroborating_url"]
-        != _DETAILED_CORROBORATING_URL
+        or metadata["detailed_corroborating_url"] != _DETAILED_CORROBORATING_URL
         or metadata["detailed_corroborating_raw_sha256"]
         != _DETAILED_CORROBORATING_SHA256
         or metadata["preliminary_table_source_url"] != _PRELIMINARY_URL
-        or metadata["preliminary_table_source_raw_sha256"]
-        != _PRELIMINARY_SHA256
-        or metadata["misc_school_composition"]
-        != _CATEGORY_COMPOSITION["MISC_SCHOOL"]
+        or metadata["preliminary_table_source_raw_sha256"] != _PRELIMINARY_SHA256
+        or metadata["misc_school_composition"] != _CATEGORY_COMPOSITION["MISC_SCHOOL"]
         or metadata["reported_total_count"] != "2092"
         or metadata["reported_total_population"] != _REPORTED_POPULATION
         or metadata["reported_total_evidence_url"] != _PRELIMINARY_URL
         or metadata["reported_total_evidence_as_of"] != _PRELIMINARY_AS_OF
-        or metadata["reported_total_evidence_raw_sha256"]
-        != _PRELIMINARY_SHA256
+        or metadata["reported_total_evidence_raw_sha256"] != _PRELIMINARY_SHA256
         or metadata["reported_total_evidence_status"] != "PRELIMINARY_2026"
         or metadata["reported_total_used_for_gate"] != "false"
         or any(
@@ -212,11 +202,12 @@ def load_reviewed_school_counts(path: Path) -> ReviewedSchoolCounts:
         )
         expected = _EXPECTED_ROWS[institution_type]
         if (
-            (count, evidence.source_url, evidence.source_as_of,
-             evidence.source_sha256, evidence.status)
-            != expected
-            or _SHA256.fullmatch(evidence.source_sha256) is None
-        ):
+            count,
+            evidence.source_url,
+            evidence.source_as_of,
+            evidence.source_sha256,
+            evidence.status,
+        ) != expected or _SHA256.fullmatch(evidence.source_sha256) is None:
             raise SourceDataError("SEN school count evidence is not reviewed")
         counts[institution_type] = count
         category_evidence[institution_type] = evidence

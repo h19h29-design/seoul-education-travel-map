@@ -110,7 +110,9 @@ class InstitutionStore:
                     item=item,
                     normalized_name=_normalize(institution.official_name),
                     terms=terms,
-                    initial_terms=_deduplicate(_initial_consonants(term) for term in terms),
+                    initial_terms=_deduplicate(
+                        _initial_consonants(term) for term in terms
+                    ),
                 )
             )
         return cls(active_sites=active_sites, records=tuple(records))
@@ -187,8 +189,7 @@ def _matches_filters(
         (institution_type is None or institution.institution_type == institution_type)
         and (foundation_type is None or institution.foundation_type == foundation_type)
         and (
-            education_office is None
-            or institution.education_office == education_office
+            education_office is None or institution.education_office == education_office
         )
         and (district is None or site.district == district)
     )

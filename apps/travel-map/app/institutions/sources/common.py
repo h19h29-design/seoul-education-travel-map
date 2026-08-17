@@ -212,8 +212,7 @@ async def get_bytes_with_retry(
             return bytes(body)
         except (httpx.RequestError, httpx.HTTPStatusError) as exc:
             if attempt == 0 and (
-                isinstance(exc, httpx.RequestError)
-                or exc.response.status_code >= 500
+                isinstance(exc, httpx.RequestError) or exc.response.status_code >= 500
             ):
                 continue
             raise SourceDataError(f"{source_label} request failed") from None
@@ -256,8 +255,7 @@ async def _get_json_with_retry_impl(
             return value, raw
         except (httpx.RequestError, httpx.HTTPStatusError) as exc:
             if attempt == 0 and (
-                isinstance(exc, httpx.RequestError)
-                or exc.response.status_code >= 500
+                isinstance(exc, httpx.RequestError) or exc.response.status_code >= 500
             ):
                 continue
             raise SourceDataError(f"{source_label} request failed") from None

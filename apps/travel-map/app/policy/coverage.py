@@ -58,7 +58,9 @@ class CoverageService:
         )
 
     @classmethod
-    def from_resources(cls, root: str | Path, *, verify_source: bool) -> "CoverageService":
+    def from_resources(
+        cls, root: str | Path, *, verify_source: bool
+    ) -> "CoverageService":
         """Load only normalized outputs whose reviewed manifest is intact."""
 
         verified = verify_geodata_resources(root, verify_source=verify_source)

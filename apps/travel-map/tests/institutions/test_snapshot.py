@@ -89,9 +89,9 @@ def test_school_count_reconciliation_accepts_only_reviewed_camel_case_shape() ->
         REVIEWED_SCHOOL_COUNT_RECONCILIATION
     )
 
-    assert parsed.profile_sha256 == REVIEWED_SCHOOL_COUNT_RECONCILIATION[
-        "profileSha256"
-    ]
+    assert (
+        parsed.profile_sha256 == REVIEWED_SCHOOL_COUNT_RECONCILIATION["profileSha256"]
+    )
 
 
 # Production break caught: an internal snake_case spelling bypassing the exact
@@ -365,7 +365,9 @@ def test_snapshot_manifest_rejects_duplicate_top_level_key(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    with pytest.raises(SnapshotIntegrityError, match="duplicate JSON key: schemaVersion"):
+    with pytest.raises(
+        SnapshotIntegrityError, match="duplicate JSON key: schemaVersion"
+    ):
         verify_snapshot(fixture)
 
 
@@ -565,12 +567,8 @@ def test_snapshot_rejects_unsorted_source_observation_date_count_keys(
     write_manifest(fixture, manifest)
     manifest_path = fixture / "fixture-001" / "manifest.json"
     manifest_text = manifest_path.read_text(encoding="utf-8")
-    canonical = (
-        '"sourceObservationDateCounts":{"2026-07-31":1,"2026-08-01":9}'
-    )
-    unsorted = (
-        '"sourceObservationDateCounts":{"2026-08-01":9,"2026-07-31":1}'
-    )
+    canonical = '"sourceObservationDateCounts":{"2026-07-31":1,"2026-08-01":9}'
+    unsorted = '"sourceObservationDateCounts":{"2026-08-01":9,"2026-07-31":1}'
     assert canonical in manifest_text
     manifest_path.write_text(
         manifest_text.replace(canonical, unsorted, 1),
@@ -697,10 +695,7 @@ def test_snapshot_rejects_duplicate_site_ids(tmp_path: Path) -> None:
         (
             "institutions.jsonl",
             '"institutionId":"test-neis:B10:SEMWATER-KG"',
-            (
-                '"institutionId":"unsafe","institutionId":'
-                '"test-neis:B10:SEMWATER-KG"'
-            ),
+            ('"institutionId":"unsafe","institutionId":"test-neis:B10:SEMWATER-KG"'),
             "institutionId",
         ),
         (
@@ -1390,9 +1385,7 @@ def test_snapshot_accepts_reciprocal_lineage_declarations(tmp_path: Path) -> Non
     verified = verify_snapshot(fixture)
 
     assert verified.institutions[0].merged_into == "test-neis:B10:SEMWATER-ES"
-    assert verified.institutions[1].supersedes == (
-        "test-neis:B10:SEMWATER-KG",
-    )
+    assert verified.institutions[1].supersedes == ("test-neis:B10:SEMWATER-KG",)
 
 
 # Production break caught: overlooking a genuine directed cycle when mergedInto and
@@ -1448,9 +1441,7 @@ def fixture_jsonl_record(filename: str, record_index: int) -> dict[str, Any]:
 
 def read_manifest(snapshot_root: Path) -> dict[str, Any]:
     return json.loads(
-        (snapshot_root / "fixture-001" / "manifest.json").read_text(
-            encoding="utf-8"
-        )
+        (snapshot_root / "fixture-001" / "manifest.json").read_text(encoding="utf-8")
     )
 
 
@@ -1473,7 +1464,9 @@ def change_jsonl_record(
     value: object,
 ) -> None:
     path = snapshot_root / "fixture-001" / filename
-    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    records = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
     records[record_index][field_name] = value
     path.write_text(
         "".join(

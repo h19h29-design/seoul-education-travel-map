@@ -94,9 +94,7 @@ class StandardSchoolLocationSource:
         )
         digest = hashlib.sha256(raw).hexdigest()
         if digest != PINNED_SHA256:
-            raise SourceDataError(
-                "official school-location attachment SHA-256 changed"
-            )
+            raise SourceDataError("official school-location attachment SHA-256 changed")
         locations = parse_standard_school_locations(
             raw,
             expected_seoul_count=PINNED_SEOUL_COUNT,
@@ -148,8 +146,12 @@ def parse_standard_school_locations(
         if _required(row, "\uc6b4\uc601\uc0c1\ud0dc") != "\uc6b4\uc601":
             raise SourceDataError("Seoul school-location row is not operating")
         try:
-            institution_type = _TYPE_MAP[_required(row, "\ud559\uad50\uae09\uad6c\ubd84")]
-            foundation_type = _FOUNDATION_MAP[_required(row, "\uc124\ub9bd\ud615\ud0dc")]
+            institution_type = _TYPE_MAP[
+                _required(row, "\ud559\uad50\uae09\uad6c\ubd84")
+            ]
+            foundation_type = _FOUNDATION_MAP[
+                _required(row, "\uc124\ub9bd\ud615\ud0dc")
+            ]
             latitude = float(_required(row, "\uc704\ub3c4"))
             longitude = float(_required(row, "\uacbd\ub3c4"))
             source_as_of = _source_date_as_iso(
@@ -160,7 +162,9 @@ def parse_standard_school_locations(
                 "official school-location row contains an unsupported value"
             ) from exc
         if not (33.0 <= latitude <= 39.5 and 124.0 <= longitude <= 132.0):
-            raise SourceDataError("official school-location coordinate is outside Korea")
+            raise SourceDataError(
+                "official school-location coordinate is outside Korea"
+            )
         locations.append(
             StandardSchoolLocation(
                 school_id=_required(row, "\ud559\uad50ID"),
@@ -241,9 +245,7 @@ def enrich_neis_coordinates(
 def _required(row: dict[str, str | None], name: str) -> str:
     value = row.get(name)
     if value is None or not value.strip():
-        raise SourceDataError(
-            f"official school-location field {name} must be nonblank"
-        )
+        raise SourceDataError(f"official school-location field {name} must be nonblank")
     return value.strip()
 
 

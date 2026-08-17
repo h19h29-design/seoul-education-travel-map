@@ -90,7 +90,9 @@ def build_production_dependencies(settings: Settings) -> AppDependencies:
     return AppDependencies(
         settings=settings,
         institutions=InstitutionStore.load(snapshot_root),
-        coverage=CoverageService.from_resources(resources / "geodata", verify_source=False),
+        coverage=CoverageService.from_resources(
+            resources / "geodata", verify_source=False
+        ),
         policy=PolicyEngine(
             RuleRepository.from_directory(resources / "rules", require_hashes=True)
         ),

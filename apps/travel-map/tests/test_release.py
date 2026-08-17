@@ -133,7 +133,9 @@ def test_rule_manifest_rejects_tampered_rule_payload(tmp_path: Path) -> None:
 
 # Production break caught: an unpinned rule index can parse a reviewed-looking
 # payload but leaves its exact policy bytes unbound during release startup.
-def test_production_rule_preflight_requires_a_hash_for_every_rule(tmp_path: Path) -> None:
+def test_production_rule_preflight_requires_a_hash_for_every_rule(
+    tmp_path: Path,
+) -> None:
     rules_root = tmp_path / "rules"
     shutil.copytree(ROOT / "resources/rules", rules_root)
     index_path = rules_root / "index.json"
@@ -393,7 +395,9 @@ def test_release_context_allowlists_only_production_app_files(tmp_path: Path) ->
     assert (context_root / ".dockerignore").is_file()
     assert (staged_app / "main.py").is_file()
     assert (staged_app / "static/index.html").is_file()
-    assert all(not (staged_app / relative_path).exists() for relative_path in malicious_paths)
+    assert all(
+        not (staged_app / relative_path).exists() for relative_path in malicious_paths
+    )
     assert all(
         path.suffix == ".py" or path.relative_to(staged_app).parts[0] == "static"
         for path in staged_app.rglob("*")
@@ -428,7 +432,9 @@ def test_release_context_omits_every_hidden_application_path(tmp_path: Path) -> 
     staged_app = context_root / "app"
     assert (staged_app / "main.py").is_file()
     assert (staged_app / "static/index.html").is_file()
-    assert all(not (staged_app / relative_path).exists() for relative_path in hidden_paths)
+    assert all(
+        not (staged_app / relative_path).exists() for relative_path in hidden_paths
+    )
     assert all(
         not any(part.startswith(".") for part in path.relative_to(staged_app).parts)
         for path in staged_app.rglob("*")

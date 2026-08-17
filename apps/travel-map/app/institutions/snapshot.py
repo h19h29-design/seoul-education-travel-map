@@ -159,10 +159,7 @@ def verify_snapshot(snapshot_root: Path) -> VerifiedSnapshot:
             "current.json must contain exactly the snapshotId field"
         )
     snapshot_id = current["snapshotId"]
-    if (
-        type(snapshot_id) is not str
-        or _SAFE_SNAPSHOT_ID.fullmatch(snapshot_id) is None
-    ):
+    if type(snapshot_id) is not str or _SAFE_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
         raise SnapshotIntegrityError("current snapshotId must be a safe slug")
 
     return _verify_snapshot_directory(root, snapshot_id)
@@ -244,7 +241,9 @@ def _resolve_snapshot_directory(root: Path, snapshot_id: str) -> Path:
     try:
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise SnapshotIntegrityError("selected snapshot directory does not exist") from exc
+        raise SnapshotIntegrityError(
+            "selected snapshot directory does not exist"
+        ) from exc
     if not resolved.is_relative_to(root) or not resolved.is_dir():
         raise SnapshotIntegrityError(
             "snapshot directory must remain inside the snapshot root"
@@ -378,13 +377,10 @@ def _parse_jsonl(
             raise SnapshotIntegrityError(
                 f"{label} line {line_number} must contain a JSON object"
             )
-        expected_fields = (
-            _INSTITUTION_FIELDS if model is Institution else _SITE_FIELDS
-        )
+        expected_fields = _INSTITUTION_FIELDS if model is Institution else _SITE_FIELDS
         if set(decoded) != expected_fields:
             raise SnapshotIntegrityError(
-                f"{label} line {line_number} fields must exactly match "
-                "schema version 1"
+                f"{label} line {line_number} fields must exactly match schema version 1"
             )
         try:
             records.append(model.model_validate_json(line))
@@ -432,8 +428,7 @@ def _verify_records(
     if len(sites) != manifest.site_count:
         raise SnapshotIntegrityError("siteCount does not match sites.jsonl row count")
     quarantined_count = sum(
-        institution.status.value == "REVIEW_REQUIRED"
-        for institution in institutions
+        institution.status.value == "REVIEW_REQUIRED" for institution in institutions
     )
     if manifest.quarantined_count != quarantined_count:
         raise SnapshotIntegrityError(
@@ -616,9 +611,7 @@ def _verify_lineage(
         for target in outgoing_targets:
             incoming[target] += 1
     ready = deque(
-        institution_id
-        for institution_id, count in incoming.items()
-        if count == 0
+        institution_id for institution_id, count in incoming.items() if count == 0
     )
     visited = 0
     while ready:
@@ -654,7 +647,9 @@ def _verify_source_counts(
         declared[source.source] = source.row_count
     actual = Counter(item.source for item in institutions)
     if declared.keys() != actual.keys():
-        raise SnapshotIntegrityError("manifest sources do not match institution sources")
+        raise SnapshotIntegrityError(
+            "manifest sources do not match institution sources"
+        )
     for source_name, row_count in declared.items():
         if row_count != actual[source_name]:
             raise SnapshotIntegrityError(
@@ -706,13 +701,11 @@ def _verify_source_counts(
                     "unclassified provenance is reserved for NEIS"
                 )
             continue
-        if (
-            sum(source.unclassified_school_kind_counts.values())
-            != len(unclassified_rows)
-            or not _matches_pinned_unclassified_policy(
-                source.unclassified_school_kind_counts,
-                source.unclassified_school_policy_sha256,
-            )
+        if sum(source.unclassified_school_kind_counts.values()) != len(
+            unclassified_rows
+        ) or not _matches_pinned_unclassified_policy(
+            source.unclassified_school_kind_counts,
+            source.unclassified_school_policy_sha256,
         ):
             raise SnapshotIntegrityError(
                 "unclassified provenance does not match reviewed policy"
@@ -751,9 +744,7 @@ def _verify_school_count_reconciliation(
             if institution.source == source_name
             and institution.status is not InstitutionStatus.MISSING_FROM_SOURCE
         ]
-        actual = dict(
-            sorted(Counter(row.institution_type for row in current).items())
-        )
+        actual = dict(sorted(Counter(row.institution_type for row in current).items()))
         if actual != expected:
             raise SnapshotIntegrityError(
                 "persisted normalized population does not match reconciliation"

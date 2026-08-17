@@ -416,17 +416,13 @@ def bind_school_count_population_profile(
                 and item.fetched_row_count == profile.neis_fetched_row_count
                 and type(item.row_count) is int
                 and item.row_count == profile.neis_normalized_row_count
-                and _is_canonical_positive_counts(
-                    item.source_observation_date_counts
-                )
+                and _is_canonical_positive_counts(item.source_observation_date_counts)
                 and _is_canonical_positive_counts(
                     item.normalized_observation_date_counts
                 )
                 and sum(count for _, count in item.source_observation_date_counts)
                 == profile.neis_fetched_row_count
-                and sum(
-                    count for _, count in item.normalized_observation_date_counts
-                )
+                and sum(count for _, count in item.normalized_observation_date_counts)
                 == profile.neis_normalized_row_count
                 and _is_exact_population_counts(
                     item.unclassified_school_kind_counts,
@@ -450,8 +446,7 @@ def bind_school_count_population_profile(
                 and type(item.source_as_of) is str
                 and item.source_as_of == profile.kindergarten_source_as_of
                 and type(item.fetched_row_count) is int
-                and item.fetched_row_count
-                == profile.kindergarten_fetched_row_count
+                and item.fetched_row_count == profile.kindergarten_fetched_row_count
                 and type(item.row_count) is int
                 and item.row_count == profile.kindergarten_fetched_row_count
                 and _is_exact_population_counts(
@@ -475,9 +470,7 @@ def bind_school_count_population_profile(
             raise SnapshotQualityError(_POPULATION_MISMATCH)
         bound[source] = replace(
             item,
-            source_population_role_counts=tuple(
-                profile.role_counts(source).items()
-            ),
+            source_population_role_counts=tuple(profile.role_counts(source).items()),
             source_population_profile_sha256=profile.sha256,
         )
     return bound
@@ -493,8 +486,7 @@ def reconcile_selectable_school_counts(
 ) -> dict[str, object]:
     _require_reviewed_population_profile(population_profile)
     if (
-        population_profile.unclassified_policy_sha256
-        != unclassified_policy.sha256
+        population_profile.unclassified_policy_sha256 != unclassified_policy.sha256
         or set(source_provenance).issuperset(_POPULATION_SOURCES) is False
     ):
         raise SnapshotQualityError(
@@ -507,8 +499,7 @@ def reconcile_selectable_school_counts(
         if (
             provenance.source != source
             or type(provenance.source_population_profile_sha256) is not str
-            or provenance.source_population_profile_sha256
-            != population_profile.sha256
+            or provenance.source_population_profile_sha256 != population_profile.sha256
             or not _is_exact_population_counts(
                 provenance.source_population_role_counts,
                 role_counts,
@@ -518,9 +509,7 @@ def reconcile_selectable_school_counts(
                 population_profile.source_category_counts(source),
             )
         ):
-            raise SnapshotQualityError(
-                "source population profile binding is invalid"
-            )
+            raise SnapshotQualityError("source population profile binding is invalid")
         fetched_count = cast(int, provenance.fetched_row_count)
         sources[source] = {
             "fetchedCount": fetched_count,
@@ -535,8 +524,7 @@ def reconcile_selectable_school_counts(
             for expected in benchmark.counts.values()
         )
         or set(benchmark.counts) != _SCHOOL_COUNT_CATEGORIES
-        or set(benchmark.counts)
-        != set(dict(population_profile.approved_variances))
+        or set(benchmark.counts) != set(dict(population_profile.approved_variances))
         or set(benchmark.counts) != set(benchmark.category_evidence)
         or set(benchmark.counts) != set(benchmark.category_composition)
         or any(
@@ -551,8 +539,7 @@ def reconcile_selectable_school_counts(
         )
 
     profile_rows = {
-        (row.source, row.source_category): row
-        for row in population_profile.rows
+        (row.source, row.source_category): row for row in population_profile.rows
     }
     normalized_category_counts: Counter[tuple[str, str]] = Counter()
     source_drift = False
@@ -570,8 +557,7 @@ def reconcile_selectable_school_counts(
             if (
                 record.institution_type != "KINDERGARTEN"
                 or record.source_kind_label is not None
-                or record.source_as_of
-                != population_profile.kindergarten_source_as_of
+                or record.source_as_of != population_profile.kindergarten_source_as_of
             ):
                 source_drift = True
                 continue
@@ -579,23 +565,22 @@ def reconcile_selectable_school_counts(
         else:
             source_drift = True
     for row in population_profile.rows:
-        expected = 0 if row.reconciliation_role == "NONSELECTABLE" else row.observed_count
+        expected = (
+            0 if row.reconciliation_role == "NONSELECTABLE" else row.observed_count
+        )
         if normalized_category_counts[(row.source, row.source_category)] != expected:
             source_drift = True
-    if (
-        dict(
-            sorted(
-                Counter(
-                    record.source_kind_label
-                    for record in records
-                    if record.source == "NEIS"
-                    and record.institution_type == "UNCLASSIFIED_SCHOOL"
-                    and record.source_kind_label is not None
-                ).items()
-            )
+    if dict(
+        sorted(
+            Counter(
+                record.source_kind_label
+                for record in records
+                if record.source == "NEIS"
+                and record.institution_type == "UNCLASSIFIED_SCHOOL"
+                and record.source_kind_label is not None
+            ).items()
         )
-        != dict(unclassified_policy.counts)
-    ):
+    ) != dict(unclassified_policy.counts):
         source_drift = True
     actual_counts: Counter[str] = Counter()
     for row in population_profile.rows:
@@ -617,7 +602,9 @@ def reconcile_selectable_school_counts(
             "status": (
                 "SOURCE_DRIFT"
                 if source_drift
-                else "MATCHED" if delta == 0 else "REVIEWED_VARIANCE"
+                else "MATCHED"
+                if delta == 0
+                else "REVIEWED_VARIANCE"
             ),
         }
     return {
@@ -656,8 +643,7 @@ def _validate_bound_school_count_reconciliation(
             provenance.source != source_name
             or provenance.fetched_row_count != summary.fetched_count
             or provenance.row_count != summary.normalized_count
-            or provenance.source_population_profile_sha256
-            != parsed.profile_sha256
+            or provenance.source_population_profile_sha256 != parsed.profile_sha256
             or not _is_exact_population_counts(
                 provenance.source_population_role_counts,
                 summary.role_counts,
@@ -704,9 +690,7 @@ def build_sync_preflight_audit(
             ready_institutions += 1
         for site in record.additional_sites:
             if is_unclassified or site.latitude is None:
-                quarantined_site_ids.append(
-                    f"{record.institution_id}:{site.site_code}"
-                )
+                quarantined_site_ids.append(f"{record.institution_id}:{site.site_code}")
     source_counts = {
         source: {
             "fetched": provenance.fetched_row_count,
@@ -730,9 +714,7 @@ def build_sync_preflight_audit(
         "districtCounts": district_counts,
         "statusCounts": {
             "PRECHECK_READY_INSTITUTION": ready_institutions,
-            "PRECHECK_REVIEW_REQUIRED_INSTITUTION": (
-                len(records) - ready_institutions
-            ),
+            "PRECHECK_REVIEW_REQUIRED_INSTITUTION": (len(records) - ready_institutions),
         },
         "quarantinedInstitutionIds": sorted(quarantined_institution_ids),
         "quarantinedSiteIds": sorted(quarantined_site_ids),
@@ -745,9 +727,7 @@ def emit_sync_preflight_audit(audit: Mapping[str, object]) -> None:
         raise SnapshotQualityError("sync preflight audit is invalid")
     print(json.dumps(dict(audit), ensure_ascii=False, sort_keys=True), flush=True)
     if audit.get("passed") is not True:
-        raise SnapshotQualityError(
-            "official school count reconciliation failed"
-        )
+        raise SnapshotQualityError("official school count reconciliation failed")
 
 
 def _is_exact_string_int_mapping(
@@ -759,9 +739,7 @@ def _is_exact_string_int_mapping(
         type(value) is dict
         and (allowed_keys is None or set(value).issubset(allowed_keys))
         and all(
-            type(key) is str
-            and type(count) is int
-            and count >= 0
+            type(key) is str and type(count) is int and count >= 0
             for key, count in value.items()
         )
     )
@@ -846,15 +824,12 @@ def _is_safe_reconciliation(
             return False
         validated_categories.append(category)
     statuses = {category["status"] for category in validated_categories}
-    return (
-        (value["passed"] is False and statuses == {"SOURCE_DRIFT"})
-        or (
-            value["passed"] is True
-            and "SOURCE_DRIFT" not in statuses
-            and all(
-                (category["deltaCount"] == 0) == (category["status"] == "MATCHED")
-                for category in validated_categories
-            )
+    return (value["passed"] is False and statuses == {"SOURCE_DRIFT"}) or (
+        value["passed"] is True
+        and "SOURCE_DRIFT" not in statuses
+        and all(
+            (category["deltaCount"] == 0) == (category["status"] == "MATCHED")
+            for category in validated_categories
         )
     )
 
@@ -894,10 +869,13 @@ def _is_safe_sync_preflight_audit(audit: Mapping[str, object]) -> bool:
             "PRECHECK_REVIEW_REQUIRED_INSTITUTION",
         }
     )
-    if not _is_exact_string_int_mapping(
-        status_counts,
-        allowed_keys=expected_statuses,
-    ) or set(status_counts) != expected_statuses:
+    if (
+        not _is_exact_string_int_mapping(
+            status_counts,
+            allowed_keys=expected_statuses,
+        )
+        or set(status_counts) != expected_statuses
+    ):
         return False
     source_counts = audit["sourceCounts"]
     if (
@@ -907,13 +885,10 @@ def _is_safe_sync_preflight_audit(audit: Mapping[str, object]) -> bool:
     ):
         return False
     for counts in source_counts.values():
-        if (
-            not _has_exact_fields(
-                counts,
-                frozenset({"fetched", "normalized", "preserved", "output"}),
-            )
-            or any(type(count) is not int or count < 0 for count in counts.values())
-        ):
+        if not _has_exact_fields(
+            counts,
+            frozenset({"fetched", "normalized", "preserved", "output"}),
+        ) or any(type(count) is not int or count < 0 for count in counts.values()):
             return False
     return all(
         type(identifiers) is list
@@ -964,9 +939,7 @@ async def geocode_missing_records(
                     coordinate_quality="GEOCODED",
                 )
             )
-        geocoded.append(
-            replace(updated, additional_sites=tuple(additional_sites))
-        )
+        geocoded.append(replace(updated, additional_sites=tuple(additional_sites)))
     return tuple(geocoded)
 
 
@@ -1014,10 +987,7 @@ def build_candidate_snapshot(
     expected_sources = record_sources
     if set(source_provenance) != expected_sources:
         raise SnapshotQualityError("source provenance does not match record sources")
-    if any(
-        key != provenance.source
-        for key, provenance in source_provenance.items()
-    ):
+    if any(key != provenance.source for key, provenance in source_provenance.items()):
         raise SnapshotQualityError("source provenance name mismatch")
     current_by_source: dict[str, list[SourceInstitutionRecord]] = defaultdict(list)
     for record in records:
@@ -1059,8 +1029,7 @@ def build_candidate_snapshot(
             snapshot_id,
         )
         previous_active = sum(
-            item.status is InstitutionStatus.ACTIVE
-            for item in previous.institutions
+            item.status is InstitutionStatus.ACTIVE for item in previous.institutions
         )
         current_active = sum(
             item.status is InstitutionStatus.ACTIVE for item in institutions
@@ -1073,15 +1042,11 @@ def build_candidate_snapshot(
     if output_sources != PRODUCTION_INSTITUTION_SOURCES:
         raise SnapshotQualityError(_PRODUCTION_SOURCE_SET_MISMATCH)
     if previous is not None:
-        previous_sources = {
-            item.source: item for item in previous.manifest.sources
-        }
+        previous_sources = {item.source: item for item in previous.manifest.sources}
         for source_name in output_sources - set(effective_source_provenance):
             prior = previous_sources.get(source_name)
             if prior is None:
-                raise SnapshotQualityError(
-                    "preserved source provenance is unavailable"
-                )
+                raise SnapshotQualityError("preserved source provenance is unavailable")
             effective_source_provenance[source_name] = SourceProvenance(
                 source=prior.source,
                 endpoint=prior.endpoint,
@@ -1106,9 +1071,7 @@ def build_candidate_snapshot(
                 unclassified_school_policy_sha256=(
                     prior.unclassified_school_policy_sha256
                 ),
-                source_category_counts=tuple(
-                    prior.source_category_counts.items()
-                ),
+                source_category_counts=tuple(prior.source_category_counts.items()),
                 source_population_role_counts=tuple(
                     prior.source_population_role_counts.items()
                 ),
@@ -1133,31 +1096,29 @@ def build_candidate_snapshot(
         previous_enrichments = {
             item.source: item for item in previous.manifest.enrichments
         }
-        for enrichment_source in (
-            required_enrichments - set(effective_enrichment_provenance)
+        for enrichment_source in required_enrichments - set(
+            effective_enrichment_provenance
         ):
             prior_enrichment = previous_enrichments.get(enrichment_source)
             if prior_enrichment is None:
                 raise SnapshotQualityError(
                     "preserved enrichment provenance is unavailable"
                 )
-            effective_enrichment_provenance[enrichment_source] = (
-                EnrichmentProvenance(
-                    source=prior_enrichment.source,
-                    endpoint=prior_enrichment.endpoint,
-                    license_name=prior_enrichment.license_name,
-                    attribution=prior_enrichment.attribution,
-                    fetched_at=prior_enrichment.fetched_at,
-                    source_as_of=prior_enrichment.source_as_of,
-                    raw_sha256=prior_enrichment.raw_sha256,
-                    normalized_sha256=prior_enrichment.source_normalized_sha256,
-                    request_region_code=prior_enrichment.request_region_code,
-                    request_timing=prior_enrichment.request_timing,
-                    page_count=prior_enrichment.page_count,
-                    fetched_row_count=prior_enrichment.fetched_row_count,
-                    matched_row_count=0,
-                    matched_normalized_sha256=None,
-                )
+            effective_enrichment_provenance[enrichment_source] = EnrichmentProvenance(
+                source=prior_enrichment.source,
+                endpoint=prior_enrichment.endpoint,
+                license_name=prior_enrichment.license_name,
+                attribution=prior_enrichment.attribution,
+                fetched_at=prior_enrichment.fetched_at,
+                source_as_of=prior_enrichment.source_as_of,
+                raw_sha256=prior_enrichment.raw_sha256,
+                normalized_sha256=prior_enrichment.source_normalized_sha256,
+                request_region_code=prior_enrichment.request_region_code,
+                request_timing=prior_enrichment.request_timing,
+                page_count=prior_enrichment.page_count,
+                fetched_row_count=prior_enrichment.fetched_row_count,
+                matched_row_count=0,
+                matched_normalized_sha256=None,
             )
 
     if current_coordinate_rate < 0.98:
@@ -1177,10 +1138,7 @@ def build_candidate_snapshot(
                 for item in effective_source_provenance.values()
                 for source_date, _ in item.source_observation_date_counts
             ]
-            + [
-                item.source_as_of
-                for item in effective_enrichment_provenance.values()
-            ]
+            + [item.source_as_of for item in effective_enrichment_provenance.values()]
         ),
         default=now[:10],
     )
@@ -1311,12 +1269,8 @@ def _review_packet_from_loaded_candidate(
         "preservedObservationDateCounts": preserved_observation_counts,
         "unclassifiedSchoolKindCounts": {},
         "unclassifiedSchoolPolicySha256": None,
-        "institutionTypeCounts": dict(
-            cast(dict[str, int], manifest["countsByType"])
-        ),
-        "foundationCounts": dict(
-            cast(dict[str, int], manifest["countsByFoundation"])
-        ),
+        "institutionTypeCounts": dict(cast(dict[str, int], manifest["countsByType"])),
+        "foundationCounts": dict(cast(dict[str, int], manifest["countsByFoundation"])),
         "districtCounts": district_counts,
         "statusCounts": dict(cast(dict[str, int], manifest["countsByStatus"])),
         "coordinateQualityCounts": dict(
@@ -1337,21 +1291,13 @@ def _review_packet_from_loaded_candidate(
         "sitesSha256": manifest["sitesSha256"],
         "candidateManifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "sourceProvenanceSha256": _manifest_section_sha256(manifest["sources"]),
-        "enrichmentProvenanceSha256": _manifest_section_sha256(
-            manifest["enrichments"]
-        ),
+        "enrichmentProvenanceSha256": _manifest_section_sha256(manifest["enrichments"]),
     }
     reconciliation = cast(dict[str, object], manifest["schoolCountReconciliation"])
     packet["schoolCountReconciliation"] = reconciliation
-    packet["schoolCountReconciliationSha256"] = _manifest_section_sha256(
-        reconciliation
-    )
+    packet["schoolCountReconciliationSha256"] = _manifest_section_sha256(reconciliation)
     neis_entry = next(
-        (
-            entry
-            for entry in source_entries
-            if entry["source"] == "NEIS"
-        ),
+        (entry for entry in source_entries if entry["source"] == "NEIS"),
         None,
     )
     if neis_entry is not None:
@@ -1602,9 +1548,7 @@ def _promote_snapshot_locked(
         elif phase == "APPROVAL_PREPARED":
             approved_manifest["approved"] = True
             approved_manifest["approvedAt"] = transaction.get("approvedAt")
-            approved_manifest["approvedByRole"] = transaction.get(
-                "approvedByRole"
-            )
+            approved_manifest["approvedByRole"] = transaction.get("approvedByRole")
         else:
             raise SnapshotQualityError("build transaction approval phase is invalid")
         if transaction.get("approvedManifestSha256") != _manifest_section_sha256(
@@ -1645,9 +1589,7 @@ def _promote_snapshot_locked(
                 "published build transaction pointer is invalid"
             ) from exc
         if verified.manifest.snapshot_id != snapshot_id:
-            raise SnapshotQualityError(
-                "published build transaction pointer is invalid"
-            )
+            raise SnapshotQualityError("published build transaction pointer is invalid")
         return
     if phase == "VERIFIED":
         transaction = _advance_build_transaction(
@@ -1699,9 +1641,7 @@ def _validated_snapshot_file(path: Path, parent: Path, label: str) -> Path:
     except (OSError, RuntimeError) as exc:
         raise SnapshotQualityError(f"candidate {label} is missing") from exc
     if resolved.parent != parent or not resolved.is_file():
-        raise SnapshotQualityError(
-            f"candidate {label} must be a regular snapshot file"
-        )
+        raise SnapshotQualityError(f"candidate {label} must be a regular snapshot file")
     return resolved
 
 
@@ -1829,7 +1769,9 @@ def _status_from_coordinate_and_coverage(
 
 def _is_seoul_address(address: str) -> bool:
     normalized = " ".join(address.split())
-    return normalized.startswith(("\uc11c\uc6b8\ud2b9\ubcc4\uc2dc ", "\uc11c\uc6b8\uc2dc "))
+    return normalized.startswith(
+        ("\uc11c\uc6b8\ud2b9\ubcc4\uc2dc ", "\uc11c\uc6b8\uc2dc ")
+    )
 
 
 def _validate_source_record(record: SourceInstitutionRecord) -> None:
@@ -1845,7 +1787,9 @@ def _validate_source_record(record: SourceInstitutionRecord) -> None:
         if record.source != "NEIS" or not record.source_kind_label:
             raise SnapshotQualityError("unclassified school source label is invalid")
     elif record.source != "NEIS" and record.source_kind_label is not None:
-        raise SnapshotQualityError("source kind label is reserved for unclassified schools")
+        raise SnapshotQualityError(
+            "source kind label is reserved for unclassified schools"
+        )
     if record.foundation_type not in _ALLOWED_FOUNDATION_TYPES:
         raise SnapshotQualityError("unsupported foundation type")
     if record.coordinate_quality not in _ALLOWED_COORDINATE_QUALITIES:
@@ -1855,7 +1799,9 @@ def _validate_source_record(record: SourceInstitutionRecord) -> None:
     if has_latitude != has_longitude:
         raise SnapshotQualityError("source coordinate pair is incomplete")
     if has_latitude == (record.coordinate_quality == "MISSING"):
-        raise SnapshotQualityError("source coordinate quality does not match coordinates")
+        raise SnapshotQualityError(
+            "source coordinate quality does not match coordinates"
+        )
     if not record.site_name.strip():
         raise SnapshotQualityError("source main site name must be nonblank")
     site_codes: set[str] = set()
@@ -1923,12 +1869,8 @@ def _validate_source_provenance(
     if provenance.source_as_of != source_as_of_for(
         provenance.source_observation_date_counts
     ):
-        raise SnapshotQualityError(
-            "source provenance source_as_of is not canonical"
-        )
-    expected_population_categories = _REVIEWED_SOURCE_CATEGORY_COUNTS.get(
-        source_name
-    )
+        raise SnapshotQualityError("source provenance source_as_of is not canonical")
+    expected_population_categories = _REVIEWED_SOURCE_CATEGORY_COUNTS.get(source_name)
     if expected_population_categories is None:
         if (
             provenance.source_category_counts
@@ -2009,10 +1951,7 @@ def _validate_source_provenance(
         and fetched_row_count != provenance.row_count + 1
     ):
         raise SnapshotQualityError("source provenance count is invalid")
-    if (
-        source_name == "NEIS"
-        and checked_fetched_row_count - provenance.row_count > 50
-    ):
+    if source_name == "NEIS" and checked_fetched_row_count - provenance.row_count > 50:
         raise SnapshotQualityError("source provenance count is invalid")
     try:
         fetched_at = datetime.fromisoformat(
@@ -2091,7 +2030,8 @@ def _record_before_enrichment(
             longitude=None,
             coordinate_quality="MISSING",
         )
-        if site.coordinate_quality in {
+        if site.coordinate_quality
+        in {
             "OFFICIAL_STANDARD_COORDINATE",
             "GEOCODED",
         }
@@ -2168,12 +2108,10 @@ def _validate_enrichment_provenance(
     if standard is not None and (
         standard.endpoint != STANDARD_LOCATION_ENDPOINT
         or standard.license_name != "PUBLIC_DATA_NO_USE_RESTRICTION"
-        or standard.attribution
-        != "Korea Education Facilities Safety Authority"
+        or standard.attribution != "Korea Education Facilities Safety Authority"
         or standard.source_as_of != STANDARD_LOCATION_SOURCE_AS_OF
         or standard.raw_sha256 != STANDARD_LOCATION_RAW_SHA256
-        or standard.normalized_sha256
-        != _STANDARD_LOCATION_NORMALIZED_SHA256
+        or standard.normalized_sha256 != _STANDARD_LOCATION_NORMALIZED_SHA256
         or standard.request_region_code != "7010000"
         or standard.request_timing is not None
         or standard.page_count != 1
@@ -2217,9 +2155,7 @@ def _validate_enrichment_provenance(
         except ValueError as exc:
             raise SnapshotQualityError("enrichment provenance date is invalid") from exc
         if fetched_at.tzinfo is None or source_date.date() > fetched_at.date():
-            raise SnapshotQualityError(
-                "enrichment provenance chronology is invalid"
-            )
+            raise SnapshotQualityError("enrichment provenance chronology is invalid")
 
 
 def _geocoded_records_sha256(
@@ -2471,9 +2407,7 @@ def _candidate_manifest(
                 "unclassifiedSchoolPolicySha256": (
                     provenance.unclassified_school_policy_sha256
                 ),
-                "sourceCategoryCounts": dict(
-                    provenance.source_category_counts
-                ),
+                "sourceCategoryCounts": dict(provenance.source_category_counts),
                 "sourcePopulationRoleCounts": dict(
                     provenance.source_population_role_counts
                 ),
@@ -2521,9 +2455,7 @@ def _candidate_manifest(
     enrichment_entries: list[dict[str, object]] = []
     for item in enrichment_provenance:
         quality = enrichment_qualities[item.source]
-        matched_sites = [
-            site for site in sites if site.coordinate_quality == quality
-        ]
+        matched_sites = [site for site in sites if site.coordinate_quality == quality]
         current_matched_count = sum(
             site.status is not InstitutionStatus.MISSING_FROM_SOURCE
             and institutions_by_id[site.institution_id].status
@@ -2566,8 +2498,7 @@ def _candidate_manifest(
         "institutionCount": len(institutions),
         "siteCount": len(sites),
         "quarantinedCount": sum(
-            item.status is InstitutionStatus.REVIEW_REQUIRED
-            for item in institutions
+            item.status is InstitutionStatus.REVIEW_REQUIRED for item in institutions
         ),
         "possibleMatchCount": len(possible_matches),
         "possibleMatches": possible_matches,
@@ -2596,10 +2527,7 @@ def _candidate_manifest(
 
 
 def _jsonl_bytes(models: list[Institution] | list[InstitutionSite]) -> bytes:
-    lines = [
-        item.model_dump_json(by_alias=True)
-        for item in models
-    ]
+    lines = [item.model_dump_json(by_alias=True) for item in models]
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -2705,9 +2633,7 @@ def _create_build_transaction(
         "issues": list(issues),
         "manifestSha256": _manifest_section_sha256(manifest),
         "sourcesSha256": _manifest_section_sha256(manifest.get("sources")),
-        "enrichmentsSha256": _manifest_section_sha256(
-            manifest.get("enrichments")
-        ),
+        "enrichmentsSha256": _manifest_section_sha256(manifest.get("enrichments")),
         "institutionsSha256": manifest.get("institutionsSha256"),
         "sitesSha256": manifest.get("sitesSha256"),
         "previousSnapshotId": diff.get("previousSnapshotId"),
@@ -2917,9 +2843,7 @@ def _advance_build_transaction(
     updated = dict(transaction)
     updated["phase"] = phase
     if approved_manifest is not None:
-        updated["approvedManifestSha256"] = _manifest_section_sha256(
-            approved_manifest
-        )
+        updated["approvedManifestSha256"] = _manifest_section_sha256(approved_manifest)
         updated["approvedAt"] = approved_manifest.get("approvedAt")
         updated["approvedByRole"] = approved_manifest.get("approvedByRole")
     updated.pop("signature", None)
@@ -2943,11 +2867,9 @@ def _transaction_attests_manifest(
         != _manifest_section_sha256(unapproved.get("sources"))
         or transaction.get("enrichmentsSha256")
         != _manifest_section_sha256(unapproved.get("enrichments"))
-        or transaction.get("institutionsSha256")
-        != unapproved.get("institutionsSha256")
+        or transaction.get("institutionsSha256") != unapproved.get("institutionsSha256")
         or transaction.get("sitesSha256") != unapproved.get("sitesSha256")
-        or transaction.get("previousSnapshotId")
-        != diff.get("previousSnapshotId")
+        or transaction.get("previousSnapshotId") != diff.get("previousSnapshotId")
     ):
         raise SnapshotQualityError("build transaction attestation mismatch")
     if manifest.get("approved") is True and (
@@ -3026,9 +2948,7 @@ def _parse_candidate_jsonl(
         try:
             decoded = _strict_json_loads(line)
             if type(decoded) is not dict:
-                raise SnapshotQualityError(
-                    f"candidate {label} row is not an object"
-                )
+                raise SnapshotQualityError(f"candidate {label} row is not an object")
             expected_fields = (
                 _INSTITUTION_FIELDS if model is Institution else _SITE_FIELDS
             )
@@ -3160,9 +3080,7 @@ def _recheck_source_provenance(
         preserved_counts = tuple(preserved_counts_value.items())
         fetched_row_count_value = entry.get("fetchedRowCount")
         checked_fetched_row_count = (
-            fetched_row_count_value
-            if type(fetched_row_count_value) is int
-            else -1
+            fetched_row_count_value if type(fetched_row_count_value) is int else -1
         )
         try:
             validate_observation_date_counts(
@@ -3201,13 +3119,12 @@ def _recheck_source_provenance(
                 "candidate source observation dates do not match persisted rows"
             )
         source_normalized_rows = current_rows if current_rows else rows
-        source_normalized_matches = (
-            entry.get("sourceNormalizedSha256")
-            == _normalized_persisted_source_sha256(
-                source_normalized_rows,
-                sites_by_parent,
-                before_enrichment=True,
-            )
+        source_normalized_matches = entry.get(
+            "sourceNormalizedSha256"
+        ) == _normalized_persisted_source_sha256(
+            source_normalized_rows,
+            sites_by_parent,
+            before_enrichment=True,
         )
         if (
             entry.get("normalizedRowCount") != current_count
@@ -3296,29 +3213,21 @@ def _recheck_production_source_provenance(
                     "candidate source provenance timing/count is invalid"
                 )
         elif timing is not None:
-            raise SnapshotQualityError(
-                "candidate source provenance timing is invalid"
-            )
+            raise SnapshotQualityError("candidate source provenance timing is invalid")
         if source == "NEIS" and entry["fetchedRowCount"] == 5:
             raise SnapshotQualityError("candidate source provenance is a sample")
         if (
             source == "NEIS"
             and current_count > 0
-            and not current_count
-            <= entry["fetchedRowCount"]
-            <= current_count + 50
+            and not current_count <= entry["fetchedRowCount"] <= current_count + 50
         ):
-            raise SnapshotQualityError(
-                "candidate source provenance count is invalid"
-            )
+            raise SnapshotQualityError("candidate source provenance count is invalid")
         if (
             source == "SEN_REVIEWED_CSV"
             and current_count > 0
             and entry["fetchedRowCount"] != current_count + 1
         ):
-            raise SnapshotQualityError(
-                "candidate source provenance count is invalid"
-            )
+            raise SnapshotQualityError("candidate source provenance count is invalid")
 
 
 def _recheck_school_count_reconciliation(
@@ -3327,18 +3236,14 @@ def _recheck_school_count_reconciliation(
 ) -> None:
     reconciliation_value = manifest.get("schoolCountReconciliation")
     try:
-        reconciliation = SchoolCountReconciliation.model_validate(
-            reconciliation_value
-        )
+        reconciliation = SchoolCountReconciliation.model_validate(reconciliation_value)
     except ValidationError as exc:
         raise SnapshotQualityError(
             "candidate school count reconciliation is invalid"
         ) from exc
     source_entries = manifest.get("sources")
     if type(source_entries) is not list:
-        raise SnapshotQualityError(
-            "candidate school count reconciliation is invalid"
-        )
+        raise SnapshotQualityError("candidate school count reconciliation is invalid")
     source_names = {
         entry.get("source") for entry in source_entries if type(entry) is dict
     }
@@ -3404,7 +3309,9 @@ def _persisted_unclassified_provenance_matches(
     if (
         list(declared_counts) != sorted(declared_counts)
         or any(type(label) is not str or not label.strip() for label in declared_counts)
-        or any(type(count) is not int or count <= 0 for count in declared_counts.values())
+        or any(
+            type(count) is not int or count <= 0 for count in declared_counts.values()
+        )
     ):
         return False
     if source != "NEIS":
@@ -3466,24 +3373,19 @@ def _recheck_enrichment_provenance(
     geocoded_count = sum(
         site.coordinate_quality == "GEOCODED" for site in current_sites
     )
-    geocoded_total = sum(
-        site.coordinate_quality == "GEOCODED" for site in sites
-    )
+    geocoded_total = sum(site.coordinate_quality == "GEOCODED" for site in sites)
     geocoded_preserved = geocoded_total - geocoded_count
     if official_total and "OFFICIAL_STANDARD_SCHOOL_LOCATION" not in by_source:
         raise SnapshotQualityError(
             "candidate enrichment provenance is missing official locations"
         )
     if geocoded_total and "KAKAO_LOCAL_GEOCODING" not in by_source:
-        raise SnapshotQualityError(
-            "candidate enrichment provenance is missing Kakao"
-        )
+        raise SnapshotQualityError("candidate enrichment provenance is missing Kakao")
     standard = by_source.pop("OFFICIAL_STANDARD_SCHOOL_LOCATION", None)
     if standard is not None and (
         standard.get("endpoint") != STANDARD_LOCATION_ENDPOINT
         or standard.get("licenseName") != "PUBLIC_DATA_NO_USE_RESTRICTION"
-        or standard.get("attribution")
-        != "Korea Education Facilities Safety Authority"
+        or standard.get("attribution") != "Korea Education Facilities Safety Authority"
         or standard.get("sourceAsOf") != STANDARD_LOCATION_SOURCE_AS_OF
         or standard.get("rawSha256") != STANDARD_LOCATION_RAW_SHA256
         or standard.get("sourceNormalizedSha256")
@@ -3501,16 +3403,13 @@ def _recheck_enrichment_provenance(
         or standard.get("preservedMatchedRowCount") != official_preserved
         or standard.get("rowCount") != official_total
     ):
-        raise SnapshotQualityError(
-            "candidate enrichment provenance is invalid"
-        )
+        raise SnapshotQualityError("candidate enrichment provenance is invalid")
     kakao = by_source.pop("KAKAO_LOCAL_GEOCODING", None)
     kakao_page_count = kakao.get("pageCount") if kakao is not None else None
     kakao_raw_sha256 = kakao.get("rawSha256") if kakao is not None else None
     kakao_source_normalized_matches = kakao is not None and (
         geocoded_count == 0
-        or kakao.get("sourceNormalizedSha256")
-        == _geocoded_sites_sha256(current_sites)
+        or kakao.get("sourceNormalizedSha256") == _geocoded_sites_sha256(current_sites)
     )
     if kakao is not None and (
         kakao.get("endpoint") != _KAKAO_ENDPOINT
@@ -3525,8 +3424,7 @@ def _recheck_enrichment_provenance(
         or kakao.get("preservedMatchedRowCount") != geocoded_preserved
         or kakao.get("rowCount") != geocoded_total
         or not kakao_source_normalized_matches
-        or kakao.get("normalizedSha256")
-        != _enrichment_sites_sha256(sites, "GEOCODED")
+        or kakao.get("normalizedSha256") != _enrichment_sites_sha256(sites, "GEOCODED")
         or type(kakao_raw_sha256) is not str
         or _SHA256.fullmatch(kakao_raw_sha256) is None
     ):
@@ -3597,11 +3495,7 @@ def _normalized_persisted_source_sha256(
                 site_name=main.site_name,
                 additional_sites=tuple(
                     sorted(
-                        (
-                            site
-                            for site in source_sites
-                            if site.site_code != "main"
-                        ),
+                        (site for site in source_sites if site.site_code != "main"),
                         key=lambda item: item.site_code,
                     )
                 ),
@@ -3767,8 +3661,7 @@ def _recheck_promotion_quality(
                 "unclassified institution must remain pending official classification"
             )
     if any(
-        site.coordinate_quality not in _ALLOWED_COORDINATE_QUALITIES
-        for site in sites
+        site.coordinate_quality not in _ALLOWED_COORDINATE_QUALITIES for site in sites
     ):
         raise SnapshotQualityError("unsupported coordinate quality")
     for site in sites:
@@ -3819,13 +3712,10 @@ def _recheck_promotion_quality(
         if institution.status is InstitutionStatus.ACTIVE
     ]
     active_site_parents = {
-        site.institution_id
-        for site in sites
-        if site.status is InstitutionStatus.ACTIVE
+        site.institution_id for site in sites if site.status is InstitutionStatus.ACTIVE
     }
     if any(
-        institution.institution_id not in active_site_parents
-        for institution in active
+        institution.institution_id not in active_site_parents for institution in active
     ):
         raise SnapshotQualityError("active candidate institution has no active site")
     sites_by_parent: dict[str, list[InstitutionSite]] = defaultdict(list)
@@ -3836,8 +3726,7 @@ def _recheck_promotion_quality(
         if parent_sites and (
             sum(site.is_default for site in parent_sites) != 1
             or not any(
-                site.is_default
-                and site.site_id == f"{institution.institution_id}:main"
+                site.is_default and site.site_id == f"{institution.institution_id}:main"
                 for site in parent_sites
             )
         ):
@@ -3862,9 +3751,7 @@ def _recheck_promotion_quality(
         if institution.institution_type != "UNCLASSIFIED_SCHOOL"
     ]
     coordinate_rate = (
-        len(selectable_active) / len(selectable_current)
-        if selectable_current
-        else 1.0
+        len(selectable_active) / len(selectable_current) if selectable_current else 1.0
     )
     if coordinate_rate < 0.98:
         raise SnapshotQualityError(
@@ -3879,9 +3766,7 @@ def _recheck_promotion_quality(
         try:
             verified_current = verify_snapshot(root)
         except (OSError, ValueError) as exc:
-            raise SnapshotQualityError(
-                "current snapshot cannot be verified"
-            ) from exc
+            raise SnapshotQualityError("current snapshot cannot be verified") from exc
     if (
         verified_current is not None
         and verified_current.manifest.snapshot_id == manifest.get("snapshotId")
@@ -3890,16 +3775,12 @@ def _recheck_promotion_quality(
     previous_snapshot_id = diff.get("previousSnapshotId")
     if previous_snapshot_id is None:
         if verified_current is not None:
-            raise SnapshotQualityError(
-                "candidate previous snapshot ID is missing"
-            )
+            raise SnapshotQualityError("candidate previous snapshot ID is missing")
         return
     if type(previous_snapshot_id) is not str:
         raise SnapshotQualityError("candidate previous snapshot ID is invalid")
     if verified_current is None:
-        raise SnapshotQualityError(
-            "candidate previous snapshot cannot be verified"
-        )
+        raise SnapshotQualityError("candidate previous snapshot cannot be verified")
     previous = verified_current
     if previous.manifest.snapshot_id != previous_snapshot_id:
         raise SnapshotQualityError("candidate previous snapshot ID mismatch")
@@ -3932,12 +3813,15 @@ def _validate_persisted_institution(institution: Institution) -> None:
 
 
 def _write_json(path: Path, value: object, *, durable: bool = False) -> None:
-    payload = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ) + "\n"
+    payload = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     with path.open("w", encoding="utf-8") as stream:
         stream.write(payload)
         if durable:

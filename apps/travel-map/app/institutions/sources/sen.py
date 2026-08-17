@@ -54,15 +54,11 @@ _PINNED_RECORDS_SHA256 = (
 _DIRECTORY_RAW_SHA256 = (
     "9f202202edc653b09b4debb5a0ff939cf9fcdc64dd58174b28f8d009bb1b7424"
 )
-_MAIN_SITE_SOURCE_URL = (
-    "https://gslib.sen.go.kr/gslib/html.do?menu_idx=52"
-)
+_MAIN_SITE_SOURCE_URL = "https://gslib.sen.go.kr/gslib/html.do?menu_idx=52"
 _MAIN_SITE_RAW_SHA256 = (
     "312ca8f63086188dabcb272ed3a2bfdfdb0d2c360f010cdc1fb59e6ff90288e7"
 )
-_BRANCH_SITE_SOURCE_URL = (
-    "https://gylib.sen.go.kr/gylib/html.do?menu_idx=43"
-)
+_BRANCH_SITE_SOURCE_URL = "https://gylib.sen.go.kr/gylib/html.do?menu_idx=43"
 _BRANCH_SITE_RAW_SHA256 = (
     "b3036767d04ef37b77d72c617ca21b052b83682eeab6f19ecb15a8a0aa54dd49"
 )
@@ -94,7 +90,9 @@ class SenCsvSource:
             raise SourceDataError("SEN CSV is not the reviewed official resource")
         actual_counts = Counter(record.institution_type for record in records)
         if actual_counts != Counter(self._expected_type_counts):
-            raise SourceDataError("SEN CSV organization totals do not match official counts")
+            raise SourceDataError(
+                "SEN CSV organization totals do not match official counts"
+            )
         raw_counts = observation_date_counts(
             metadata["source_as_of"] for _ in range(fetched_row_count)
         )
@@ -171,8 +169,7 @@ def _parse_sen_csv(
         or metadata["main_site_source_url"] != _MAIN_SITE_SOURCE_URL
         or metadata["main_site_source_raw_sha256"] != _MAIN_SITE_RAW_SHA256
         or metadata["branch_site_source_url"] != _BRANCH_SITE_SOURCE_URL
-        or metadata["branch_site_source_raw_sha256"]
-        != _BRANCH_SITE_RAW_SHA256
+        or metadata["branch_site_source_raw_sha256"] != _BRANCH_SITE_RAW_SHA256
         or metadata["site_sources_checked_at"] != "2026-08-11"
         or metadata["source_sha256"] != _combined_source_sha256()
     ):

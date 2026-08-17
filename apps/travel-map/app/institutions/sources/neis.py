@@ -131,7 +131,9 @@ class NeisSource:
             raw_labels = tuple(_required_school_kind_label(row) for row in raw_rows)
             raw_school_kind_counts.update(raw_labels)
             if len(raw_rows) > self._page_size:
-                raise SourceDataError("NEIS returned more rows than requested page size")
+                raise SourceDataError(
+                    "NEIS returned more rows than requested page size"
+                )
             if raw_row_count + len(raw_rows) > declared_total:
                 raise SourceDataError("NEIS returned more rows than list_total_count")
             if (
@@ -145,8 +147,7 @@ class NeisSource:
             if cumulative_raw_bytes > _MAX_CUMULATIVE_BYTES:
                 raise SourceDataError("NEIS cumulative response size exceeds limit")
             page_ids = tuple(
-                _required_string_from_object(row, "SD_SCHUL_CODE")
-                for row in raw_rows
+                _required_string_from_object(row, "SD_SCHUL_CODE") for row in raw_rows
             )
             if page_ids in seen_page_ids:
                 raise SourceDataError("NEIS returned a repeated page")
@@ -336,9 +337,7 @@ def _required_school_kind_label(row: object) -> str:
         or value != value.strip()
         or not unicodedata.is_normalized("NFC", value)
     ):
-        raise SourceDataError(
-            "NEIS school kind label must be a nonblank exact string"
-        )
+        raise SourceDataError("NEIS school kind label must be a nonblank exact string")
     return value
 
 

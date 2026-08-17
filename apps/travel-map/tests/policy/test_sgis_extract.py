@@ -64,7 +64,10 @@ def test_official_extractor_rejects_structurally_valid_wrong_hash_archive(
     )
 
     assert completed.returncode != 0
-    assert "archive SHA-256 does not match the pinned official SGIS file" in completed.stderr
+    assert (
+        "archive SHA-256 does not match the pinned official SGIS file"
+        in completed.stderr
+    )
     assert not output.exists()
 
 

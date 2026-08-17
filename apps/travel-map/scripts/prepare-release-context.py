@@ -66,9 +66,7 @@ def stage_release_context(
 
     resources = source / "resources"
     verified_snapshot = verify_snapshot(resources / "institution-snapshots")
-    source_names = {
-        source.source for source in verified_snapshot.manifest.sources
-    }
+    source_names = {source.source for source in verified_snapshot.manifest.sources}
     is_test_fixture = (
         verified_snapshot.manifest.approved_by_role == "TEST_FIXTURE_REVIEWER"
         and len(verified_snapshot.manifest.sources) == 1
@@ -92,7 +90,12 @@ def stage_release_context(
 
     destination.mkdir(mode=0o700, parents=True)
     try:
-        for relative_path in (".dockerignore", "Dockerfile", "pyproject.toml", "uv.lock"):
+        for relative_path in (
+            ".dockerignore",
+            "Dockerfile",
+            "pyproject.toml",
+            "uv.lock",
+        ):
             _copy_file(source, destination, relative_path)
         _copy_application(source, destination)
         _copy_rules(source, destination)
@@ -195,7 +198,9 @@ def _copy_application(source_root: Path, destination: Path) -> None:
     for candidate in sorted(app_root.rglob("*")):
         if candidate.is_symlink() or not _is_within(candidate, source_root):
             raise ValueError("release context symlink is invalid: app")
-        if not candidate.is_file() or not _is_allowed_application_file(candidate, app_root):
+        if not candidate.is_file() or not _is_allowed_application_file(
+            candidate, app_root
+        ):
             continue
         relative_path = candidate.relative_to(app_root)
         target = target_root / relative_path

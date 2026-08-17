@@ -100,9 +100,7 @@ class RuleRepository:
                 )
             source_refs = payload["sourceRefs"]
             if not isinstance(source_refs, list):
-                raise TypeError(
-                    "source_refs must contain only non-blank HTTP(S) URLs"
-                )
+                raise TypeError("source_refs must contain only non-blank HTTP(S) URLs")
             rules.append(
                 RuleSet(
                     rule_set_id=payload["ruleSetId"],
@@ -169,8 +167,7 @@ class RuleRepository:
             )
         if rule.official_vehicle_deduction_krw > rule.under_four_hours_krw:
             raise ValueError(
-                "official_vehicle_deduction_krw must not exceed "
-                "under_four_hours_krw"
+                "official_vehicle_deduction_krw must not exceed under_four_hours_krw"
             )
         if type(rule.source_refs) is not tuple:
             raise TypeError("source_refs must be a tuple")
@@ -178,9 +175,7 @@ class RuleRepository:
             raise ValueError("source_refs must not be empty")
         for source_ref in rule.source_refs:
             if type(source_ref) is not str or not source_ref.strip():
-                raise ValueError(
-                    "source_refs must contain only non-blank HTTP(S) URLs"
-                )
+                raise ValueError("source_refs must contain only non-blank HTTP(S) URLs")
             parsed = urlsplit(source_ref)
             if (
                 source_ref != source_ref.strip()
@@ -188,6 +183,4 @@ class RuleRepository:
                 or parsed.scheme not in {"http", "https"}
                 or not parsed.hostname
             ):
-                raise ValueError(
-                    "source_refs must contain only non-blank HTTP(S) URLs"
-                )
+                raise ValueError("source_refs must contain only non-blank HTTP(S) URLs")

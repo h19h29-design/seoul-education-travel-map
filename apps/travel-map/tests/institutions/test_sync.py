@@ -232,9 +232,7 @@ def test_candidate_requires_every_exact_production_source(
         profile=profile,
     )
     bound = {
-        source: item
-        for source, item in fully_bound.items()
-        if source != removed_source
+        source: item for source, item in fully_bound.items() if source != removed_source
     }
     reconciliation = reconcile_selectable_school_counts(
         tuple(
@@ -399,7 +397,6 @@ def test_final_approval_replays_population_and_reconciliation_before_pointer_wri
         sync_module._validate_unapproved_manifest_schema(tampered)
     assert (pointer.read_bytes() if pointer.exists() else None) == original_pointer
 
-
     sync_module._write_json(manifest_path, original_manifest)
     resign_candidate(candidate, tmp_path)
 
@@ -412,8 +409,7 @@ def test_final_approval_replays_population_and_reconciliation_before_pointer_wri
     elementary = next(
         row
         for row in persisted
-        if row["source"] == "NEIS"
-        and row["institutionType"] == "ELEMENTARY_SCHOOL"
+        if row["source"] == "NEIS" and row["institutionType"] == "ELEMENTARY_SCHOOL"
     )
     elementary["institutionType"] = "MIDDLE_SCHOOL"
     changed_institutions = [
@@ -440,9 +436,7 @@ def test_final_approval_replays_population_and_reconciliation_before_pointer_wri
     neis_entry = next(
         entry for entry in tampered_manifest["sources"] if entry["source"] == "NEIS"
     )
-    neis_rows = [
-        row for row in changed_institutions if row.source == "NEIS"
-    ]
+    neis_rows = [row for row in changed_institutions if row.source == "NEIS"]
     neis_entry["sourceNormalizedSha256"] = (
         sync_module._normalized_persisted_source_sha256(
             neis_rows,
@@ -606,8 +600,8 @@ def test_test_fixture_source_hash_tampering_fails_before_pointer_mutation(
     forged_packet["candidateManifestSha256"] = hashlib.sha256(
         manifest_path.read_bytes()
     ).hexdigest()
-    forged_packet["sourceProvenanceSha256"] = (
-        sync_module._manifest_section_sha256(manifest["sources"])
+    forged_packet["sourceProvenanceSha256"] = sync_module._manifest_section_sha256(
+        manifest["sources"]
     )
     forged_packet.pop("reviewDigest")
     forged_review_digest = sync_module._manifest_section_sha256(forged_packet)
@@ -639,7 +633,10 @@ def test_test_fixture_source_hash_tampering_fails_before_pointer_mutation(
         ("MISC_SCHOOL,BENCHMARK,MISC_SCHOOL", "HIGH_SCHOOL,BENCHMARK,MISC_SCHOOL"),
         ("KINDERGARTEN,BENCHMARK,KINDERGARTEN", "KINDERGARTEN,BENCHMARK,MISC_SCHOOL"),
         ("kindergarten_timing=20261", "kindergarten_timing=20262"),
-        ("kindergarten_source_as_of=2026-04-01", "kindergarten_source_as_of=2026-04-02"),
+        (
+            "kindergarten_source_as_of=2026-04-01",
+            "kindergarten_source_as_of=2026-04-02",
+        ),
         (
             "benchmark_raw_sha256=6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70",
             "benchmark_raw_sha256=" + "0" * 64,
@@ -656,7 +653,10 @@ def test_test_fixture_source_hash_tampering_fails_before_pointer_mutation(
             "NEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL\n",
             "NEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL\nNEIS,특수학교,32,SPECIAL_SCHOOL,BENCHMARK,SPECIAL_SCHOOL\n",
         ),
-        ("# reviewer_role=data-steward", "# reviewer_role=data-steward\n# unreviewed=1"),
+        (
+            "# reviewer_role=data-steward",
+            "# reviewer_role=data-steward\n# unreviewed=1",
+        ),
         (
             "source,source_category,observed_count,normalized_type,reconciliation_role,benchmark_type",
             "source,source_category,observed_count,normalized_type,reconciliation_role,benchmark_type,extra",
@@ -698,9 +698,7 @@ def test_school_count_population_profile_rejects_crlf_normalized_resource(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "profile.csv"
-    content = (
-        SOURCE_RESOURCES / "school-count-population-profile.csv"
-    ).read_bytes()
+    content = (SOURCE_RESOURCES / "school-count-population-profile.csv").read_bytes()
     path.write_bytes(content.replace(b"\n", b"\r\n"))
 
     with pytest.raises(SourceDataError, match="LF|SHA-256"):
@@ -736,7 +734,9 @@ def test_school_count_population_profile_rejects_oversized_resource_before_decod
         )
 
 
-def test_school_count_population_profile_rejects_subclass_spoofs_and_contract_drift() -> None:
+def test_school_count_population_profile_rejects_subclass_spoofs_and_contract_drift() -> (
+    None
+):
     profile = load_school_count_population_profile(
         SOURCE_RESOURCES / "school-count-population-profile.csv",
         unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
@@ -851,8 +851,7 @@ def _contains_secret(
         )
     if isinstance(value, (list, tuple, set, frozenset)):
         return any(
-            _contains_secret(item, secret, seen=seen, depth=depth + 1)
-            for item in value
+            _contains_secret(item, secret, seen=seen, depth=depth + 1) for item in value
         )
     if isinstance(value, httpx.Request):
         return _contains_secret(
@@ -1155,9 +1154,11 @@ def test_neis_unclassified_policy_rejects_malformed_rehashed_resource(
     new: str,
 ) -> None:
     path = tmp_path / "policy.csv"
-    body = (SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv").read_text(
-        encoding="utf-8"
-    ).replace(old, new, 1)
+    body = (
+        (SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv")
+        .read_text(encoding="utf-8")
+        .replace(old, new, 1)
+    )
     path.write_text(body, encoding="utf-8")
     monkeypatch.setattr(
         neis_classification_module,
@@ -1447,9 +1448,9 @@ def test_kindergarten_region_resource_is_bound_to_reviewed_content(
     old: str,
     new: str,
 ) -> None:
-    source_text = (
-        SOURCE_RESOURCES / "kindergarten-region-codes.csv"
-    ).read_text(encoding="utf-8")
+    source_text = (SOURCE_RESOURCES / "kindergarten-region-codes.csv").read_text(
+        encoding="utf-8"
+    )
     path = tmp_path / "tampered-regions.csv"
     path.write_text(source_text.replace(old, new), encoding="utf-8")
 
@@ -1532,9 +1533,7 @@ def test_sen_multisite_parser_rejects_duplicate_or_second_default(
         for line in changed.splitlines()
         if line.strip() and not line.startswith("# ")
     ]
-    digest = hashlib.sha256(
-        ("\n".join(data_lines) + "\n").encode("utf-8")
-    ).hexdigest()
+    digest = hashlib.sha256(("\n".join(data_lines) + "\n").encode("utf-8")).hexdigest()
     changed = changed.replace(
         "c2b7e84c476175586b9f3764f54ee008fc35cb7831b4a8a0186ded9b608aac50",
         digest,
@@ -1571,14 +1570,10 @@ def test_unresolved_sen_main_and_branch_are_both_persisted_for_review(
         .splitlines()
     ]
     gangseo = next(
-        item
-        for item in institutions
-        if item["institutionId"] == "sen:gangseo-library"
+        item for item in institutions if item["institutionId"] == "sen:gangseo-library"
     )
     gangseo_sites = [
-        item
-        for item in sites
-        if item["institutionId"] == "sen:gangseo-library"
+        item for item in sites if item["institutionId"] == "sen:gangseo-library"
     ]
     assert gangseo["status"] == "REVIEW_REQUIRED"
     assert {item["siteId"] for item in gangseo_sites} == {
@@ -1636,8 +1631,7 @@ def test_reviewed_sen_multisite_survives_snapshot_and_store(
     )
     records = geocoded_sen + population_records
     geocoded_count = sum(
-        record.coordinate_quality == "GEOCODED"
-        for record in records
+        record.coordinate_quality == "GEOCODED" for record in records
     ) + sum(
         site.coordinate_quality == "GEOCODED"
         for record in records
@@ -1750,23 +1744,13 @@ def test_reviewed_school_count_resource_is_official_and_pinned() -> None:
         "SPECIAL_SCHOOL": 32,
         "MISC_SCHOOL": 18,
     }
-    assert benchmark.category_evidence["KINDERGARTEN"].source_as_of == (
-        "2026-03-10"
-    )
-    assert (
-        benchmark.category_evidence["KINDERGARTEN"].status
-        == "PRELIMINARY_2026"
-    )
+    assert benchmark.category_evidence["KINDERGARTEN"].source_as_of == ("2026-03-10")
+    assert benchmark.category_evidence["KINDERGARTEN"].status == "PRELIMINARY_2026"
     assert benchmark.category_evidence["ELEMENTARY_SCHOOL"].source_as_of == (
         "2026-03-10"
     )
-    assert (
-        benchmark.category_evidence["ELEMENTARY_SCHOOL"].status
-        == "PRELIMINARY_2026"
-    )
-    assert benchmark.category_composition["MISC_SCHOOL"] == (
-        "각종학교17+고등기술학교1"
-    )
+    assert benchmark.category_evidence["ELEMENTARY_SCHOOL"].status == "PRELIMINARY_2026"
+    assert benchmark.category_composition["MISC_SCHOOL"] == ("각종학교17+고등기술학교1")
     assert benchmark.reported_totals == (
         ReportedSchoolTotal(
             expected_count=2_092,
@@ -1782,8 +1766,7 @@ def test_reviewed_school_count_resource_is_official_and_pinned() -> None:
                 ),
                 source_as_of="2026-03-10",
                 source_sha256=(
-                    "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a170"
-                    "5db508afeee15e70"
+                    "6279b1bc08a593c96b119220ecbfc6cc4884d7e64125a1705db508afeee15e70"
                 ),
                 status="PRELIMINARY_2026",
             ),
@@ -1882,9 +1865,9 @@ def test_population_reconciliation_uses_exact_reviewed_signed_variances() -> Non
         "QUARANTINED": 18,
         "SUPPLEMENTARY": 23,
     }
-    assert reconciliation["sources"]["KINDERGARTEN_INFO"][
-        "roleCounts"
-    ] == {"BENCHMARK": 706}
+    assert reconciliation["sources"]["KINDERGARTEN_INFO"]["roleCounts"] == {
+        "BENCHMARK": 706
+    }
     assert set(reconciliation) == {
         "profileStatus",
         "profileSha256",
@@ -1912,9 +1895,7 @@ def test_parsed_neis_population_reconciles_the_exact_reviewed_aggregates() -> No
         unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
     kindergarten = tuple(
-        record
-        for record in fixture_records
-        if record.source == "KINDERGARTEN_INFO"
+        record for record in fixture_records if record.source == "KINDERGARTEN_INFO"
     )
     records = (*parsed_neis, *kindergarten)
     bound = sync_module.bind_school_count_population_profile(
@@ -2067,20 +2048,25 @@ def test_supplementary_population_remains_in_records_but_outside_benchmark() -> 
         unclassified_policy=REVIEWED_NEIS_UNCLASSIFIED_POLICY,
     )
 
-    assert sum(
-        record.source_kind_label in {
-            "방송통신고등학교",
-            "방송통신중학교",
-        }
-        for record in records
-    ) == 6
+    assert (
+        sum(
+            record.source_kind_label
+            in {
+                "방송통신고등학교",
+                "방송통신중학교",
+            }
+            for record in records
+        )
+        == 6
+    )
     assert sum(record.source_kind_label == "외국인학교" for record in records) == 17
     assert reconciliation["categories"]["HIGH_SCHOOL"]["actualCount"] == 319
     assert reconciliation["categories"]["MIDDLE_SCHOOL"]["actualCount"] == 390
     assert reconciliation["categories"]["MISC_SCHOOL"]["actualCount"] == 22
-    assert sum(
-        record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records
-    ) == 18
+    assert (
+        sum(record.institution_type == "UNCLASSIFIED_SCHOOL" for record in records)
+        == 18
+    )
     assert "UNCLASSIFIED_SCHOOL" not in reconciliation["categories"]
 
 
@@ -2210,11 +2196,7 @@ def test_unclassified_reconciliation_keeps_official_counts_and_forces_status(
             ),
         )
         for index, label in enumerate(
-            (
-                label
-                for label, count in policy.counts
-                for _ in range(count)
-            ),
+            (label for label, count in policy.counts for _ in range(count)),
             start=1,
         )
     )
@@ -2393,9 +2375,7 @@ def test_unclassified_provenance_tampering_fails_before_pointer_mutation(
     )
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    source = next(
-        item for item in manifest["sources"] if item["source"] == "NEIS"
-    )
+    source = next(item for item in manifest["sources"] if item["source"] == "NEIS")
     source[field_name] = value
     sync_module._write_json(manifest_path, manifest)
     resign_candidate(candidate, tmp_path)
@@ -2477,7 +2457,9 @@ def test_unclassified_active_record_tampering_fails_before_pointer_mutation(
     row["status"] = "ACTIVE"
     rows[rows.index(row)] = row
     row_bytes = (
-        "\n".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in rows)
+        "\n".join(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":")) for item in rows
+        )
         + "\n"
     ).encode("utf-8")
     rows_path.write_bytes(row_bytes)
@@ -2507,11 +2489,7 @@ def test_unclassified_active_record_tampering_fails_before_pointer_mutation(
 def test_mixed_vintage_neis_candidate_keeps_row_dates_and_manifest_histogram(
     tmp_path: Path,
 ) -> None:
-    normalized_dates = (
-        ["2026-04-23"] * 1_412
-        + ["2026-05-17"]
-        + ["2026-06-07"]
-    )
+    normalized_dates = ["2026-04-23"] * 1_412 + ["2026-05-17"] + ["2026-06-07"]
 
     candidate = build_reviewed_population_candidate(
         previous=None,
@@ -2570,11 +2548,7 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
         "token_bytes",
         lambda size: b"test-secret".ljust(size, b"!")[:size],
     )
-    normalized_dates = (
-        ["2026-04-23"] * 1_412
-        + ["2026-05-17"]
-        + ["2026-06-07"]
-    )
+    normalized_dates = ["2026-04-23"] * 1_412 + ["2026-05-17"] + ["2026-06-07"]
     build_reviewed_population_candidate(
         previous=None,
         output_root=tmp_path,
@@ -2606,12 +2580,12 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
         "snapshotAsOf",
         "previousSnapshotId",
         "sourceCounts",
-            "sourceObservationDateCounts",
-            "normalizedObservationDateCounts",
-            "preservedObservationDateCounts",
-            "unclassifiedSchoolKindCounts",
-            "unclassifiedSchoolPolicySha256",
-            "institutionTypeCounts",
+        "sourceObservationDateCounts",
+        "normalizedObservationDateCounts",
+        "preservedObservationDateCounts",
+        "unclassifiedSchoolKindCounts",
+        "unclassifiedSchoolPolicySha256",
+        "institutionTypeCounts",
         "foundationCounts",
         "districtCounts",
         "statusCounts",
@@ -2641,14 +2615,17 @@ def test_review_packet_is_deterministic_and_only_contains_safe_aggregates(
     assert isinstance(first["reviewDigest"], str)
     assert re.fullmatch(r"[0-9a-f]{64}", first["reviewDigest"])
     digest_body = {key: value for key, value in first.items() if key != "reviewDigest"}
-    assert first["reviewDigest"] == hashlib.sha256(
-        json.dumps(
-            digest_body,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    assert (
+        first["reviewDigest"]
+        == hashlib.sha256(
+            json.dumps(
+                digest_body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     assert len(first["districtCounts"]) == 25
     assert not (tmp_path / ".promotion.lock").exists()
     serialized = json.dumps(first, ensure_ascii=False, sort_keys=True)
@@ -2687,7 +2664,7 @@ def test_approval_requires_exact_digest_role_and_unchanged_candidate(
         sync_module.approve_candidate_snapshot(
             snapshot_id=candidate.snapshot_id,
             review_digest="A" * 64,
-                reviewer_role="data-steward",
+            reviewer_role="data-steward",
             snapshot_root=tmp_path,
             coverage=TEST_COVERAGE,
         )
@@ -2814,9 +2791,7 @@ def test_approval_rejects_candidate_changed_after_review_without_pointer_change(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["createdAt"] = "2026-08-13T12:00:00Z"
     sync_module._write_json(manifest_path, manifest)
-    transaction_path = (
-        tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
-    )
+    transaction_path = tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
     transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
     transaction["manifestSha256"] = sync_module._manifest_section_sha256(manifest)
     transaction.pop("signature")
@@ -2852,22 +2827,28 @@ def test_same_digest_published_retry_is_idempotent(tmp_path: Path) -> None:
     review_digest = packet["reviewDigest"]
     assert isinstance(review_digest, str)
 
-    assert sync_module.approve_candidate_snapshot(
-        snapshot_id=candidate.snapshot_id,
-        review_digest=review_digest,
-        reviewer_role="data-steward",
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    ) == review_digest
+    assert (
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=review_digest,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+        == review_digest
+    )
     pointer_before = (tmp_path / "current.json").read_bytes()
 
-    assert sync_module.approve_candidate_snapshot(
-        snapshot_id=candidate.snapshot_id,
-        review_digest=review_digest,
-        reviewer_role="data-steward",
-        snapshot_root=tmp_path,
-        coverage=TEST_COVERAGE,
-    ) == review_digest
+    assert (
+        sync_module.approve_candidate_snapshot(
+            snapshot_id=candidate.snapshot_id,
+            review_digest=review_digest,
+            reviewer_role="data-steward",
+            snapshot_root=tmp_path,
+            coverage=TEST_COVERAGE,
+        )
+        == review_digest
+    )
     assert (tmp_path / "current.json").read_bytes() == pointer_before
 
 
@@ -3084,9 +3065,7 @@ async def test_population_profile_cli_reconciliation_failure_flushes_before_clea
         record for record in drifted_records if record.source == "NEIS"
     )
     kindergarten_records = tuple(
-        record
-        for record in drifted_records
-        if record.source == "KINDERGARTEN_INFO"
+        record for record in drifted_records if record.source == "KINDERGARTEN_INFO"
     )
     cleared_holders: list[str] = []
 
@@ -3216,7 +3195,9 @@ def test_sync_cli_defaults_to_reviewed_population_profile_and_neis_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     script_path = Path("apps/travel-map/scripts/sync-institutions.py")
-    spec = importlib.util.spec_from_file_location("sync_institutions_cli_args", script_path)
+    spec = importlib.util.spec_from_file_location(
+        "sync_institutions_cli_args", script_path
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -3258,9 +3239,7 @@ async def test_population_profile_cli_stops_at_candidate_review_without_promotio
     candidate_kwargs: dict[str, object] = {}
     reconciliation = {
         "passed": True,
-        "unclassifiedSchoolKindCounts": dict(
-            REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
-        ),
+        "unclassifiedSchoolKindCounts": dict(REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts),
     }
 
     class FakeAsyncClient:
@@ -3371,10 +3350,9 @@ async def test_population_profile_cli_stops_at_candidate_review_without_promotio
     monkeypatch.setattr(module, "SenCsvSource", FakeSenSource)
     monkeypatch.setattr(module, "KakaoLocalClient", FakeKakaoClient)
     monkeypatch.setattr(module, "geocode_missing_records", identity_records)
+
     def load_policy(path: Path) -> NeisUnclassifiedPolicy:
-        assert path == (
-            SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv"
-        )
+        assert path == (SOURCE_RESOURCES / "neis-unclassified-school-kinds.csv")
         observed_order.append("load-unclassified-policy")
         return REVIEWED_NEIS_UNCLASSIFIED_POLICY
 
@@ -3428,6 +3406,7 @@ async def test_population_profile_cli_stops_at_candidate_review_without_promotio
         fake_build_candidate_snapshot,
     )
     monkeypatch.setattr(module, "promote_snapshot", forbidden_promotion, raising=False)
+
     def reconcile(
         *_args: object,
         unclassified_policy: NeisUnclassifiedPolicy,
@@ -3494,8 +3473,7 @@ async def test_population_profile_cli_stops_at_candidate_review_without_promotio
         REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
     )
     assert lines[-1] == (
-        '{"snapshotId":"candidate-only-cli",'
-        '"status":"CANDIDATE_REVIEW_REQUIRED"}'
+        '{"snapshotId":"candidate-only-cli","status":"CANDIDATE_REVIEW_REQUIRED"}'
     )
     assert (snapshot_root / ".candidate-only-cli.candidate").is_dir()
     assert not (snapshot_root / "current.json").exists()
@@ -3571,9 +3549,7 @@ def test_keyless_official_school_csv_only_enriches_matching_neis_identity() -> N
     )
     neis = SourceInstitutionRecord(
         **{
-            **source_record(
-                institution_id="neis:B10:7010001"
-            ).__dict__,
+            **source_record(institution_id="neis:B10:7010001").__dict__,
             "latitude": None,
             "longitude": None,
             "coordinate_quality": "MISSING",
@@ -3609,9 +3585,7 @@ async def test_neis_source_requires_real_key_and_paginates_to_declared_total() -
             ),
         )
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         source = NeisSource(
             api_key="test-key",
             client=client,
@@ -3623,7 +3597,9 @@ async def test_neis_source_requires_real_key_and_paginates_to_declared_total() -
     assert len(result.records) == 20
     assert result.provenance.page_count == 2
     assert [request.url.params["pIndex"] for request in requests] == ["1", "2"]
-    assert all(request.url.params["ATPT_OFCDC_SC_CODE"] == "B10" for request in requests)
+    assert all(
+        request.url.params["ATPT_OFCDC_SC_CODE"] == "B10" for request in requests
+    )
 
     with pytest.raises(SourceDataError, match="NEIS_API_KEY"):
         NeisSource(
@@ -3644,9 +3620,7 @@ async def test_neis_source_rejects_keyless_sample_and_redacts_invalid_key() -> N
             json={"RESULT": {"CODE": "ERROR-290", "MESSAGE": secret}},
         )
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError) as raised:
             await NeisSource(
                 api_key=secret,
@@ -3664,9 +3638,7 @@ async def test_source_http_failure_traceback_does_not_retain_api_key() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, text="forbidden")
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError) as raised:
             await NeisSource(
                 api_key=secret,
@@ -3690,9 +3662,7 @@ async def test_unexpected_transport_failure_does_not_retain_api_key() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         raise RuntimeError("transport exploded")
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError, match="NEIS request failed") as raised:
             await NeisSource(
                 api_key=secret,
@@ -3713,9 +3683,7 @@ async def test_kindergarten_http_failure_traceback_does_not_retain_api_key(
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, text="forbidden")
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError) as raised:
             await KindergartenSource(
                 api_key=secret,
@@ -3734,9 +3702,7 @@ async def test_kakao_http_failure_traceback_does_not_retain_api_key() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, text="forbidden")
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         kakao = KakaoLocalClient(api_key=secret, client=client)
         with pytest.raises(SourceDataError) as raised:
             await kakao.geocode("서울특별시 종로구 송월길 48")
@@ -3751,9 +3717,7 @@ async def test_shared_http_boundary_scrubs_secret_parameters_and_headers() -> No
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, text="forbidden")
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError) as raised:
             await get_json_with_retry(
                 client=client,
@@ -3787,9 +3751,7 @@ async def test_successful_source_fetches_clear_api_keys(tmp_path: Path) -> None:
         row["kinderCode"] = f"K{request.url.params['sggCode']}"
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(neis_handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(neis_handler)) as client:
         neis = NeisSource(
             api_key=neis_secret,
             client=client,
@@ -3822,9 +3784,7 @@ async def test_kindergarten_source_category_counts_reports_total_raw_category(
         row["kinderCode"] = f"K{request.url.params['sggCode']}"
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await KindergartenSource(
             api_key="test-key",
             client=client,
@@ -3855,9 +3815,7 @@ async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
         sections[1]["row"][-1]["LOAD_DTM"] = "20260607"
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await NeisSource(
             api_key="test-key",
             client=client,
@@ -3874,9 +3832,7 @@ async def test_neis_pagination_counts_explicitly_excluded_source_rows() -> None:
         ("2026-04-23", 19),
         ("2026-06-07", 1),
     )
-    assert result.provenance.normalized_observation_date_counts == (
-        ("2026-04-23", 19),
-    )
+    assert result.provenance.normalized_observation_date_counts == (("2026-04-23", 19),)
 
 
 @pytest.mark.asyncio
@@ -3900,9 +3856,7 @@ async def test_neis_collects_raw_school_kind_histogram_before_filtering(
             ),
         )
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await NeisSource(
             api_key="test-key",
             client=client,
@@ -3945,13 +3899,13 @@ async def test_neis_fetch_records_raw_and_normalized_mixed_vintage_histograms() 
             row["LOAD_DTM"] = (
                 "20260517"
                 if source_index == 1
-                else "20260607" if source_index == 21 else "20260423"
+                else "20260607"
+                if source_index == 21
+                else "20260423"
             )
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await NeisSource(
             api_key="test-key",
             client=client,
@@ -3993,9 +3947,7 @@ async def test_neis_source_preserves_different_date_on_excluded_only_page() -> N
             )
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await NeisSource(
             api_key="test-key",
             client=client,
@@ -4008,9 +3960,7 @@ async def test_neis_source_preserves_different_date_on_excluded_only_page() -> N
         ("2026-08-09", 1),
         ("2026-08-10", 19),
     )
-    assert result.provenance.normalized_observation_date_counts == (
-        ("2026-08-10", 19),
-    )
+    assert result.provenance.normalized_observation_date_counts == (("2026-08-10", 19),)
 
 
 @pytest.mark.asyncio
@@ -4025,14 +3975,11 @@ async def test_neis_source_rejects_five_row_sample_success_shape() -> None:
         first = sections[1]["row"][0]
         sections[0]["head"][0]["list_total_count"] = 5
         sections[1]["row"] = [
-            {**first, "SD_SCHUL_CODE": f"701000{index}"}
-            for index in range(1, 6)
+            {**first, "SD_SCHUL_CODE": f"701000{index}"} for index in range(1, 6)
         ]
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError, match="sample"):
             await NeisSource(
                 api_key="test-key",
@@ -4065,9 +4012,7 @@ async def test_neis_source_bounds_declared_total_before_second_request(
         sections[0]["head"][0]["list_total_count"] = declared_total
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError, match=message):
             await NeisSource(
                 api_key="test-key",
@@ -4090,9 +4035,7 @@ async def test_neis_source_rejects_oversized_response_before_retention(
         payload["padding"] = "x" * 500
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError, match="response size"):
             await NeisSource(
                 api_key="test-key",
@@ -4118,9 +4061,7 @@ async def test_neis_response_stream_stops_after_byte_limit(
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=CountingStream())
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError, match="response size"):
             await NeisSource(
                 api_key="test-key",
@@ -4145,9 +4086,7 @@ async def test_neis_source_rejects_more_rows_than_requested_page_size() -> None:
         ]
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError, match="page size"):
             await NeisSource(
                 api_key="test-key",
@@ -4174,9 +4113,7 @@ async def test_neis_source_bounds_actual_page_counter(
         sections[1]["row"][0]["SD_SCHUL_CODE"] = f"701{page:04d}"
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError, match="page limit|short page"):
             await NeisSource(
                 api_key="test-key",
@@ -4200,9 +4137,7 @@ async def test_kindergarten_source_requires_key_and_detects_repeated_page(
         payload["pageCnt"] = 1
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         source = KindergartenSource(
             api_key="test-key",
             client=client,
@@ -4233,9 +4168,7 @@ async def test_kindergarten_source_rejects_mismatched_response_echo(
         payload["sggList"] = "99999"
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         source = KindergartenSource(
             api_key="test-key",
             client=client,
@@ -4261,9 +4194,7 @@ async def test_kindergarten_source_bounds_pagination_without_total(
         row["kinderCode"] = f"K{page:08d}"
         return httpx.Response(200, json=payload)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         source = KindergartenSource(
             api_key="test-key",
             client=client,
@@ -4287,9 +4218,7 @@ async def test_kindergarten_source_bounds_cumulative_response_bytes(
         requests.append(request)
         return httpx.Response(200, json=kindergarten_payload())
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         source = KindergartenSource(
             api_key="test-key",
             client=client,
@@ -4319,9 +4248,7 @@ async def test_standard_school_source_stops_stream_at_byte_ceiling(
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=CountingStream())
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(SourceDataError, match="response size"):
             await StandardSchoolLocationSource(client=client).fetch()
 
@@ -4342,9 +4269,7 @@ async def test_kakao_geocoder_bounds_paid_requests_and_cumulative_bytes(
         requests += 1
         return httpx.Response(200, json={"documents": []})
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         kakao = KakaoLocalClient(api_key="test-key", client=client)
         assert await kakao.geocode(address) is None
         with pytest.raises(SourceDataError, match="request limit"):
@@ -4362,9 +4287,7 @@ async def test_kakao_geocoder_does_not_retain_unbounded_raw_bodies(
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"documents": [], "padding": "x" * 200})
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         kakao = KakaoLocalClient(api_key="test-key", client=client)
         with pytest.raises(SourceDataError, match="cumulative response size"):
             await kakao.geocode("서울특별시 종로구 송월길 48")
@@ -4400,9 +4323,7 @@ def test_kakao_road_address_canonicalization_is_limited_to_seoul_prefix(
 
 
 @pytest.mark.asyncio
-async def test_kakao_geocoder_accepts_one_seoul_prefix_alias_without_fallback() -> (
-    None
-):
+async def test_kakao_geocoder_accepts_one_seoul_prefix_alias_without_fallback() -> None:
     requested = "서울특별시  종로구 송월길 48"
     seen: list[httpx.Request] = []
 
@@ -4416,17 +4337,13 @@ async def test_kakao_geocoder_accepts_one_seoul_prefix_alias_without_fallback() 
                     {
                         "x": "126.9680",
                         "y": "37.5710",
-                        "road_address": {
-                            "address_name": "서울 종로구 송월길 48"
-                        },
+                        "road_address": {"address_name": "서울 종로구 송월길 48"},
                     }
                 ]
             },
         )
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as http:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = KakaoLocalClient(api_key="test-key", client=http)
         result = await client.geocode(requested)
         provenance = client.provenance()
@@ -4462,9 +4379,7 @@ async def test_kakao_geocode_accepts_one_exact_road_address_and_redacts_key() ->
             },
         )
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         kakao = KakaoLocalClient(api_key=secret, client=client)
         result = await kakao.geocode(address)
         provenance = kakao.provenance()
@@ -4508,9 +4423,7 @@ async def test_missing_coordinate_is_filled_only_by_exact_kakao_result() -> None
             "coordinate_quality": "MISSING",
         }
     )
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler)
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         kakao = KakaoLocalClient(api_key="test-key", client=client)
         records = await geocode_missing_records((missing,), kakao)
 
@@ -4602,9 +4515,7 @@ def test_source_record_persists_official_branch_as_second_site(
         if institution.institution_type != "UNCLASSIFIED_SCHOOL"
     )
     official_sites = tuple(
-        site
-        for site in verified.sites
-        if site.institution_id == "neis:B10:7010001"
+        site for site in verified.sites if site.institution_id == "neis:B10:7010001"
     )
 
     assert len(official_institutions) == 1
@@ -4661,10 +4572,7 @@ def test_manifest_persists_cross_source_possible_match_pairs(
     promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     verified = verify_snapshot(tmp_path)
 
-    assert {
-        item.institution_id
-        for item in verified.institutions
-    } >= {
+    assert {item.institution_id for item in verified.institutions} >= {
         "neis:B10:0000707",
         "sen:headquarters",
     }
@@ -4868,9 +4776,7 @@ def test_preserved_enriched_site_does_not_require_current_enrichment_match(
         output_root=tmp_path,
         snapshot_id="enriched-before-missing",
         coverage=TEST_COVERAGE,
-        enrichment_provenance=(
-            standard_enrichment_provenance(matched_row_count=1),
-        ),
+        enrichment_provenance=(standard_enrichment_provenance(matched_row_count=1),),
     )
     promote_snapshot(initial, tmp_path, coverage=TEST_COVERAGE)
     replacement = source_record(institution_id="neis:B10:7010002")
@@ -5108,9 +5014,11 @@ def test_namesake_across_sources_is_not_merged(tmp_path: Path) -> None:
         include_reviewed_sen=True,
         cross_source_match=True,
     )
-    rows = (candidate.candidate_path / "institutions.jsonl").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    rows = (
+        (candidate.candidate_path / "institutions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
     manifest = json.loads(
         (candidate.candidate_path / "manifest.json").read_text(encoding="utf-8")
     )
@@ -5120,10 +5028,7 @@ def test_namesake_across_sources_is_not_merged(tmp_path: Path) -> None:
     assert (
         "neis:B10:0000707",
         "sen:headquarters",
-    ) in {
-        tuple(match["institutionIds"])
-        for match in manifest["possibleMatches"]
-    }
+    ) in {tuple(match["institutionIds"]) for match in manifest["possibleMatches"]}
 
 
 def test_promotion_rechecks_hash_before_pointer_change(tmp_path: Path) -> None:
@@ -5407,12 +5312,10 @@ def test_promotion_rejects_unsorted_observation_date_keys_before_pointer_change(
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest_text = manifest_path.read_text(encoding="utf-8")
     canonical = (
-        '"sourceObservationDateCounts":{"2026-04-23":2,'
-        '"2026-05-17":1,"2026-06-07":1}'
+        '"sourceObservationDateCounts":{"2026-04-23":2,"2026-05-17":1,"2026-06-07":1}'
     )
     unsorted = (
-        '"sourceObservationDateCounts":{"2026-06-07":1,'
-        '"2026-04-23":2,"2026-05-17":1}'
+        '"sourceObservationDateCounts":{"2026-06-07":1,"2026-04-23":2,"2026-05-17":1}'
     )
     assert canonical in manifest_text
     manifest_path.write_text(
@@ -5588,9 +5491,7 @@ def test_promotion_rejects_missing_or_tampered_build_transaction(
         snapshot_id=f"{mutation}-transaction",
         coverage=TEST_COVERAGE,
     )
-    receipt_path = (
-        tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
-    )
+    receipt_path = tmp_path / ".sync-transactions" / f"{candidate.snapshot_id}.json"
     if mutation == "missing":
         receipt_path.unlink()
     else:
@@ -5622,12 +5523,8 @@ def test_build_transaction_cannot_be_copied_between_output_roots(
         snapshot_id="copied-transaction",
         coverage=TEST_COVERAGE,
     )
-    first_receipt = (
-        first_root / ".sync-transactions" / "copied-transaction.json"
-    )
-    second_receipt = (
-        second_root / ".sync-transactions" / "copied-transaction.json"
-    )
+    first_receipt = first_root / ".sync-transactions" / "copied-transaction.json"
+    second_receipt = second_root / ".sync-transactions" / "copied-transaction.json"
     second_receipt.write_bytes(first_receipt.read_bytes())
 
     with pytest.raises(SnapshotQualityError, match="transaction attestation"):
@@ -5651,9 +5548,7 @@ def test_standard_enrichment_binds_selected_site_mapping(
         output_root=tmp_path,
         snapshot_id="standard-selected-mapping",
         coverage=TEST_COVERAGE,
-        enrichment_provenance=(
-            standard_enrichment_provenance(matched_row_count=1),
-        ),
+        enrichment_provenance=(standard_enrichment_provenance(matched_row_count=1),),
     )
     sites_path = candidate.candidate_path / "sites.jsonl"
     _, site_bytes = replace_jsonl_record(
@@ -5755,9 +5650,7 @@ def test_promotion_replays_enrichment_provenance_from_persisted_rows(
         output_root=tmp_path,
         snapshot_id="promotion-enrichment",
         coverage=TEST_COVERAGE,
-        enrichment_provenance=(
-            standard_enrichment_provenance(matched_row_count=1),
-        ),
+        enrichment_provenance=(standard_enrichment_provenance(matched_row_count=1),),
     )
     manifest_path = candidate.candidate_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -5834,9 +5727,7 @@ def test_candidate_rejects_untrusted_standard_enrichment(
         }
     )
     valid = standard_enrichment_provenance(matched_row_count=1)
-    invalid = EnrichmentProvenance(
-        **{**valid.__dict__, field_name: value}
-    )
+    invalid = EnrichmentProvenance(**{**valid.__dict__, field_name: value})
 
     with pytest.raises(SnapshotQualityError, match="enrichment"):
         build_explicit_test_fixture_candidate(
@@ -6000,11 +5891,7 @@ def test_restart_after_pointer_fsync_before_published_phase_is_idempotent(
     with pytest.raises(OSError, match="before published receipt"):
         promote_snapshot(candidate, tmp_path, coverage=TEST_COVERAGE)
     pointer_before = (tmp_path / "current.json").read_bytes()
-    receipt_path = (
-        tmp_path
-        / ".sync-transactions"
-        / "pointer-written-before-phase.json"
-    )
+    receipt_path = tmp_path / ".sync-transactions" / "pointer-written-before-phase.json"
     assert json.loads(receipt_path.read_text(encoding="utf-8"))["phase"] == (
         "POINTER_PREPARED"
     )
@@ -6698,9 +6585,7 @@ def build_reviewed_population_candidate(
             ),
         )
     population_records = tuple(
-        record
-        for record in records
-        if record.source in {"NEIS", "KINDERGARTEN_INFO"}
+        record for record in records if record.source in {"NEIS", "KINDERGARTEN_INFO"}
     )
     bound = sync_module.bind_school_count_population_profile(
         provenance,
@@ -6747,10 +6632,7 @@ def build_explicit_test_fixture_candidate(
     if candidate_path.exists() or final_path.exists():
         raise SnapshotQualityError("snapshot ID already exists")
 
-    fixture_records = tuple(
-        replace(record, source="TEST_NEIS")
-        for record in records
-    )
+    fixture_records = tuple(replace(record, source="TEST_NEIS") for record in records)
     sync_module._validate_enrichment_provenance(
         fixture_records,
         enrichment_provenance,
@@ -6768,8 +6650,7 @@ def build_explicit_test_fixture_candidate(
     ]
     coordinate_rate = (
         sum(
-            institution.status is InstitutionStatus.ACTIVE
-            for institution in selectable
+            institution.status is InstitutionStatus.ACTIVE for institution in selectable
         )
         / len(selectable)
         if selectable
@@ -6783,12 +6664,10 @@ def build_explicit_test_fixture_candidate(
             snapshot_id,
         )
         previous_active = sum(
-            item.status is InstitutionStatus.ACTIVE
-            for item in previous.institutions
+            item.status is InstitutionStatus.ACTIVE for item in previous.institutions
         )
         current_active = sum(
-            item.status is InstitutionStatus.ACTIVE
-            for item in institutions
+            item.status is InstitutionStatus.ACTIVE for item in institutions
         )
         if previous_active and current_active < previous_active * 0.9:
             issues.append("record count drop exceeds 10 percent")
@@ -6804,9 +6683,7 @@ def build_explicit_test_fixture_candidate(
     observation_counts = observation_date_counts(
         record.source_as_of for record in fixture_records
     )
-    effective_enrichment = {
-        item.source: item for item in enrichment_provenance
-    }
+    effective_enrichment = {item.source: item for item in enrichment_provenance}
     if previous is not None:
         required_enrichments = {
             {
@@ -6814,8 +6691,7 @@ def build_explicit_test_fixture_candidate(
                 "GEOCODED": "KAKAO_LOCAL_GEOCODING",
             }[site.coordinate_quality]
             for site in sites
-            if site.coordinate_quality
-            in {"OFFICIAL_STANDARD_COORDINATE", "GEOCODED"}
+            if site.coordinate_quality in {"OFFICIAL_STANDARD_COORDINATE", "GEOCODED"}
         }
         previous_enrichments = {
             item.source: item for item in previous.manifest.enrichments
@@ -6877,8 +6753,7 @@ def build_explicit_test_fixture_candidate(
         source_provenance={"TEST_NEIS": provenance},
         source_records=fixture_records,
         enrichment_provenance=tuple(
-            effective_enrichment[source]
-            for source in sorted(effective_enrichment)
+            effective_enrichment[source] for source in sorted(effective_enrichment)
         ),
         school_count_reconciliation={},
     )
@@ -6964,9 +6839,7 @@ def promote_snapshot(
         if candidate.candidate_path.exists()
         else output_root / candidate.snapshot_id
     )
-    manifest = json.loads(
-        (snapshot_path / "manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((snapshot_path / "manifest.json").read_text(encoding="utf-8"))
     reviewer_role = (
         "TEST_FIXTURE_REVIEWER"
         if manifest["schoolCountReconciliation"] is None
@@ -7171,17 +7044,17 @@ def remove_unclassified_rows(
     )
     source = manifest["sources"][0]
     source["normalizedObservationDateCounts"] = dict(
-        observation_date_counts(institution.source_as_of for institution in institutions)
+        observation_date_counts(
+            institution.source_as_of for institution in institutions
+        )
     )
     source["normalizedRowCount"] = len(institutions)
     source["preservedRowCount"] = 0
     source["rowCount"] = len(institutions)
-    source["sourceNormalizedSha256"] = (
-        sync_module._normalized_persisted_source_sha256(
-            institutions,
-            sites_by_parent,
-            before_enrichment=True,
-        )
+    source["sourceNormalizedSha256"] = sync_module._normalized_persisted_source_sha256(
+        institutions,
+        sites_by_parent,
+        before_enrichment=True,
     )
     source["normalizedSha256"] = sync_module._normalized_persisted_source_sha256(
         institutions,
@@ -7263,9 +7136,7 @@ def source_provenance_for(
                 else len(source_records)
             ),
             request_region_code=regions[source],
-            request_timing=(
-                "20261" if source == "KINDERGARTEN_INFO" else None
-            ),
+            request_timing=("20261" if source == "KINDERGARTEN_INFO" else None),
             normalized_sha256=normalized_records_sha256(
                 [_before_enrichment(record) for record in source_records]
             ),
@@ -7286,8 +7157,7 @@ def source_provenance_for(
                 PINNED_POLICY_SHA256
                 if source == "NEIS"
                 and any(
-                    record.source_kind_label is not None
-                    for record in source_records
+                    record.source_kind_label is not None for record in source_records
                 )
                 else None
             ),
@@ -7349,7 +7219,8 @@ def _before_enrichment(
                 longitude=None,
                 coordinate_quality="MISSING",
             )
-            if site.coordinate_quality in {
+            if site.coordinate_quality
+            in {
                 "OFFICIAL_STANDARD_COORDINATE",
                 "GEOCODED",
             }
@@ -7419,9 +7290,7 @@ def records_for_type_counts(
     for institution_type, count in counts.items():
         for _ in range(count):
             source = (
-                "KINDERGARTEN_INFO"
-                if institution_type == "KINDERGARTEN"
-                else "NEIS"
+                "KINDERGARTEN_INFO" if institution_type == "KINDERGARTEN" else "NEIS"
             )
             institution_id = (
                 f"kindergarten:{sequence:07d}"
@@ -7430,9 +7299,7 @@ def records_for_type_counts(
             )
             records.append(
                 replace(
-                    source_record(
-                        institution_id=institution_id
-                    ),
+                    source_record(institution_id=institution_id),
                     institution_type=institution_type,
                     source=source,
                 )

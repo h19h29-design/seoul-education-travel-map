@@ -59,7 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sen-csv",
         type=Path,
-        default=Path("apps/travel-map/resources/institution-sources/sen-institutions.csv"),
+        default=Path(
+            "apps/travel-map/resources/institution-sources/sen-institutions.csv"
+        ),
     )
     parser.add_argument(
         "--region-codes",
@@ -73,8 +75,7 @@ def parse_args() -> argparse.Namespace:
         "--school-counts",
         type=Path,
         default=Path(
-            "apps/travel-map/resources/institution-sources/"
-            "sen-annual-school-counts.csv"
+            "apps/travel-map/resources/institution-sources/sen-annual-school-counts.csv"
         ),
     )
     parser.add_argument(
@@ -110,9 +111,7 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run(args: argparse.Namespace, keys: dict[str, str]) -> None:
-    credential_holders: list[
-        NeisSource | KindergartenSource | KakaoLocalClient
-    ] = []
+    credential_holders: list[NeisSource | KindergartenSource | KakaoLocalClient] = []
     try:
         await _run_with_keys(args, keys, credential_holders)
     finally:
@@ -125,9 +124,7 @@ async def run(args: argparse.Namespace, keys: dict[str, str]) -> None:
 async def _run_with_keys(
     args: argparse.Namespace,
     keys: dict[str, str],
-    credential_holders: list[
-        NeisSource | KindergartenSource | KakaoLocalClient
-    ],
+    credential_holders: list[NeisSource | KindergartenSource | KakaoLocalClient],
 ) -> None:
     policy = load_neis_unclassified_policy(args.neis_unclassified_policy)
     population_profile = load_school_count_population_profile(
@@ -164,9 +161,7 @@ async def _run_with_keys(
             neis_result.records,
             standard_result.locations,
         )
-        all_records = (
-            neis_records + kindergarten_result.records + sen_result.records
-        )
+        all_records = neis_records + kindergarten_result.records + sen_result.records
         source_provenance = bind_school_count_population_profile(
             {
                 item.source: item
@@ -265,9 +260,7 @@ def main() -> int:
     except EnvironmentFileError:
         print("invalid environment file", file=sys.stderr)
         return 2
-    missing = [
-        name for name in _REQUIRED_KEYS if not os.environ.get(name, "").strip()
-    ]
+    missing = [name for name in _REQUIRED_KEYS if not os.environ.get(name, "").strip()]
     if missing:
         print(
             "missing required environment keys: " + ", ".join(missing),

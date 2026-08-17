@@ -18,9 +18,7 @@ from app.institutions.sources.common import (
 )
 
 _ENDPOINT = "https://e-childschoolinfo.moe.go.kr/api/notice/basicInfo2.do"
-_REGION_SOURCE_URL = (
-    "https://e-childschoolinfo.moe.go.kr/openApi/sidoSigunguCode.do"
-)
+_REGION_SOURCE_URL = "https://e-childschoolinfo.moe.go.kr/openApi/sidoSigunguCode.do"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PINNED_REGION_RAW_SHA256 = (
     "94bb20b042c7b4bde170b8264c7116076e07dc98f8d97132841bc8f6c91e8925"
@@ -56,9 +54,7 @@ class KindergartenSource:
         if re.fullmatch(r"\d{4}[12]", timing) is None:
             raise SourceDataError("kindergarten disclosure timing is invalid")
         if page_size < 1 or page_size > 100:
-            raise SourceDataError(
-                "kindergarten page size must be between 1 and 100"
-            )
+            raise SourceDataError("kindergarten page size must be between 1 and 100")
         self._api_key = api_key
         self._client = client
         self._regions_path = Path(region_codes_path)
@@ -73,9 +69,7 @@ class KindergartenSource:
             failure = str(exc)
         finally:
             self.clear_credentials()
-        raise SourceDataError(
-            failure or "kindergarten source validation failed"
-        )
+        raise SourceDataError(failure or "kindergarten source validation failed")
 
     def clear_credentials(self) -> None:
         self._api_key = ""
@@ -235,22 +229,16 @@ def parse_kindergarten_region_codes(
         or expected_count == 25
         and normalized_digest != _PINNED_REGION_NORMALIZED_SHA256
     ):
-        raise SourceDataError(
-            "kindergarten region normalized resource is not reviewed"
-        )
+        raise SourceDataError("kindergarten region normalized resource is not reviewed")
     if re.fullmatch(r"\d{4}[12]", metadata["timing"]) is None:
         raise SourceDataError("kindergarten region timing is invalid")
     if (
         metadata["source_as_of"] != "2026-08-10"
         or metadata["license_name"] != "PUBLIC_DATA_PORTAL_TERMS"
-        or metadata["attribution"]
-        != "Source: Ministry of Education Kindergarten Info"
+        or metadata["attribution"] != "Source: Ministry of Education Kindergarten Info"
     ):
         raise SourceDataError("kindergarten region provenance is not reviewed")
-    if (
-        expected_timing is not None
-        and metadata["timing"] != expected_timing
-    ):
+    if expected_timing is not None and metadata["timing"] != expected_timing:
         raise SourceDataError(
             "kindergarten region timing does not match requested timing"
         )
@@ -296,9 +284,7 @@ def _parse_row(row: object, source_as_of: str) -> SourceInstitutionRecord:
         source="KINDERGARTEN_INFO",
         source_region_code="11",
         source_as_of=source_as_of,
-        coordinate_quality=(
-            "SOURCE_COORDINATE" if latitude is not None else "MISSING"
-        ),
+        coordinate_quality=("SOURCE_COORDINATE" if latitude is not None else "MISSING"),
     )
 
 
@@ -382,6 +368,4 @@ def _validate_response_echo(
         name not in payload or str(payload[name]) != value
         for name, value in expected.items()
     ):
-        raise SourceDataError(
-            "kindergarten response echo does not match the request"
-        )
+        raise SourceDataError("kindergarten response echo does not match the request")

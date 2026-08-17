@@ -262,9 +262,7 @@ def read_provenance(payload: dict[str, Any]) -> dict[str, Any]:
         type(source_layer_feature_count) is not int
         or source_layer_feature_count != SOURCE_LAYER_FEATURE_COUNT
     ):
-        raise ValueError(
-            "source provenance sourceLayerFeatureCount must be integer 17"
-        )
+        raise ValueError("source provenance sourceLayerFeatureCount must be integer 17")
     validated = dict(provenance)
     validated["collectedAt"] = normalize_provenance_collected_at(
         provenance.get("collectedAt")

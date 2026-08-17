@@ -94,9 +94,7 @@ def extract_seoul(
 ) -> None:
     archive_sha256 = sha256(archive_path)
     if archive_sha256 != OFFICIAL_ARCHIVE_SHA256:
-        raise ValueError(
-            "archive SHA-256 does not match the pinned official SGIS file"
-        )
+        raise ValueError("archive SHA-256 does not match the pinned official SGIS file")
     extracted = read_sgis_geometry_without_official_provenance(archive_path)
     payload = {
         "type": "FeatureCollection",

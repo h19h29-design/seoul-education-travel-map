@@ -9,6 +9,8 @@ import pytest
 from app.institutions.store import InstitutionStore, UnknownSiteError
 
 SNAPSHOT_ROOT = Path("apps/travel-map/tests/fixtures/institutions/snapshot")
+
+
 def load_store_with_verified_unclassified_school(tmp_path: Path) -> InstitutionStore:
     snapshot_root = tmp_path / "verified-unclassified"
     shutil.copytree(SNAPSHOT_ROOT, snapshot_root)
@@ -40,13 +42,10 @@ def load_store_with_verified_unclassified_school(tmp_path: Path) -> InstitutionS
     institution_path.write_bytes(institution_bytes)
     site_path = snapshot / "sites.jsonl"
     sites = [
-        json.loads(line)
-        for line in site_path.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in site_path.read_text(encoding="utf-8").splitlines()
     ]
     next(
-        item
-        for item in sites
-        if item["siteId"] == "test-neis:B10:REVIEW-PARENT:main"
+        item for item in sites if item["siteId"] == "test-neis:B10:REVIEW-PARENT:main"
     )["status"] = "REVIEW_REQUIRED"
     site_bytes = (
         "\n".join(
@@ -101,9 +100,9 @@ def test_search_keeps_same_official_name_in_two_districts_separate() -> None:
         ("은평구", "test-neis:B10:HANBIT-EUNPYEONG"),
         ("강남구", "test-neis:B10:HANBIT-GANGNAM"),
     ]
-    assert [item.district for item in store.search(query="한빛", district="강남구")] == [
-        "강남구"
-    ]
+    assert [
+        item.district for item in store.search(query="한빛", district="강남구")
+    ] == ["강남구"]
 
 
 # Production break caught: returning one origin for a multi-site institution or
@@ -219,9 +218,7 @@ def test_search_indexes_aliases_without_merging_institutions() -> None:
 
     results = store.search(query="샘물부설유치원", limit=20)
 
-    assert [item.institution_id for item in results] == [
-        "test-neis:B10:SEMWATER-KG"
-    ]
+    assert [item.institution_id for item in results] == ["test-neis:B10:SEMWATER-KG"]
 
 
 # Production break caught: failing Korean initial-consonant lookup.

@@ -15,7 +15,9 @@ def test_institutions_search_returns_public_camel_case_records(client) -> None:
     assert "site_id" not in body["items"][0]
 
 
-def test_institutions_search_applies_normalized_type_and_foundation_filters(client) -> None:
+def test_institutions_search_applies_normalized_type_and_foundation_filters(
+    client,
+) -> None:
     response = client.get(
         "/api/v1/institutions",
         params={

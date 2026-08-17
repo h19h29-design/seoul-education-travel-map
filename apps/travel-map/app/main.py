@@ -220,9 +220,13 @@ def create_app(
     @app.middleware("http")
     async def browser_security_headers(request: Request, call_next: object) -> object:
         response = await call_next(request)  # type: ignore[operator]
-        response.headers.setdefault("Content-Security-Policy", _PUBLIC_CONTENT_SECURITY_POLICY)
+        response.headers.setdefault(
+            "Content-Security-Policy", _PUBLIC_CONTENT_SECURITY_POLICY
+        )
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(
+            "Referrer-Policy", "strict-origin-when-cross-origin"
+        )
         response.headers.setdefault(
             "Permissions-Policy", "geolocation=(), camera=(), microphone=()"
         )

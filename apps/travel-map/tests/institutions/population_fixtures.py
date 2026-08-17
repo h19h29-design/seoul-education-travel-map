@@ -109,9 +109,7 @@ def reviewed_population_fixture() -> tuple[
             fetched_row_count=1_415,
             request_region_code="B10",
             normalized_sha256=normalized_records_sha256(neis_records),
-            unclassified_school_kind_counts=(
-                REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts
-            ),
+            unclassified_school_kind_counts=(REVIEWED_NEIS_UNCLASSIFIED_POLICY.counts),
             unclassified_school_policy_sha256=(
                 REVIEWED_NEIS_UNCLASSIFIED_POLICY.sha256
             ),
@@ -122,9 +120,7 @@ def reviewed_population_fixture() -> tuple[
         ),
         "KINDERGARTEN_INFO": SourceProvenance(
             source="KINDERGARTEN_INFO",
-            endpoint=(
-                "https://e-childschoolinfo.moe.go.kr/api/notice/basicInfo2.do"
-            ),
+            endpoint=("https://e-childschoolinfo.moe.go.kr/api/notice/basicInfo2.do"),
             license_name="PUBLIC_DATA_PORTAL_TERMS",
             attribution="Ministry of Education Kindergarten Info",
             source_as_of="2026-04-01",
@@ -152,9 +148,7 @@ def reviewed_production_fixture() -> tuple[
 ]:
     """Return the exact three-source production candidate input contract."""
 
-    profile, benchmark, population_records, provenance = (
-        reviewed_population_fixture()
-    )
+    profile, benchmark, population_records, provenance = reviewed_population_fixture()
     sen = SenCsvSource(
         SOURCE_RESOURCES / "sen-institutions.csv",
         expected_type_counts={

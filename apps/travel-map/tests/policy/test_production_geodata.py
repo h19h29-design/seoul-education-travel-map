@@ -74,9 +74,7 @@ def test_production_manifest_hashes_and_scope_match_shipped_artifacts() -> None:
 # Production break caught: shipping an inscribed provider polygon that omits
 # destinations within the nominal 12 km support distance near convex corners.
 def test_production_provider_polygon_conservatively_covers_nominal_buffer() -> None:
-    to_projected = Transformer.from_crs(
-        "OGC:CRS84", "EPSG:5179", always_xy=True
-    )
+    to_projected = Transformer.from_crs("OGC:CRS84", "EPSG:5179", always_xy=True)
     seoul_payload = json.loads(SEOUL_PATH.read_text(encoding="utf-8"))
     support_payload = json.loads(SUPPORT_PATH.read_text(encoding="utf-8"))
     seoul_projected = transform(

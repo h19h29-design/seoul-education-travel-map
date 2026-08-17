@@ -78,7 +78,9 @@ async def test_opinet_requires_certkey_uses_official_codes_and_caches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_opinet_accepts_its_documented_json_payload_when_labeled_text_html() -> None:
+async def test_opinet_accepts_its_documented_json_payload_when_labeled_text_html() -> (
+    None
+):
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,

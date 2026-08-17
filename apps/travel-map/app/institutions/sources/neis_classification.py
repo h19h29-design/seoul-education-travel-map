@@ -107,7 +107,9 @@ def load_neis_unclassified_policy(path: Path) -> NeisUnclassifiedPolicy:
         try:
             count = int(count_text)
         except ValueError:
-            raise SourceDataError("NEIS unclassified policy counts are invalid") from None
+            raise SourceDataError(
+                "NEIS unclassified policy counts are invalid"
+            ) from None
         if type(count) is not int or count <= 0 or str(count) != count_text:
             raise SourceDataError("NEIS unclassified policy counts are invalid")
         counts.append((label, count))

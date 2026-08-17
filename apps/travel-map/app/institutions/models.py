@@ -129,12 +129,16 @@ class Institution(_StrictSnapshotModel):
 
     @field_validator("education_office", "effective_to", "merged_into")
     @classmethod
-    def optional_strings_are_nonblank_when_present(cls, value: str | None) -> str | None:
+    def optional_strings_are_nonblank_when_present(
+        cls, value: str | None
+    ) -> str | None:
         return None if value is None else _require_nonblank(value)
 
     @field_validator("aliases", "supersedes")
     @classmethod
-    def string_tuples_contain_no_blanks(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+    def string_tuples_contain_no_blanks(
+        cls, values: tuple[str, ...]
+    ) -> tuple[str, ...]:
         if any(not value.strip() for value in values):
             raise ValueError("string tuple values must be nonblank")
         return values
@@ -226,7 +230,9 @@ class InstitutionSite(_StrictSnapshotModel):
 
     @field_validator("effective_to")
     @classmethod
-    def optional_strings_are_nonblank_when_present(cls, value: str | None) -> str | None:
+    def optional_strings_are_nonblank_when_present(
+        cls, value: str | None
+    ) -> str | None:
         return None if value is None else _require_nonblank(value)
 
     @field_validator("site_id")
@@ -316,9 +322,7 @@ class SchoolCountCategoryResult(_StrictManifestContractModel):
     def delta_and_status_match(self) -> Self:
         if self.actual_count - self.expected_count != self.delta_count:
             raise ValueError("school count delta is inconsistent")
-        expected_status = (
-            "MATCHED" if self.delta_count == 0 else "REVIEWED_VARIANCE"
-        )
+        expected_status = "MATCHED" if self.delta_count == 0 else "REVIEWED_VARIANCE"
         if self.status != expected_status:
             raise ValueError("school count status is inconsistent")
         return self
@@ -380,11 +384,15 @@ class SchoolCountReconciliation(_StrictManifestContractModel):
                 raise ValueError("school count source summary is not reviewed")
         for category, expected in _SCHOOL_COUNT_CATEGORY_RESULTS.items():
             result = self.categories.get(category)
-            if result is None or (
-                result.expected_count,
-                result.actual_count,
-                result.delta_count,
-            ) != expected:
+            if (
+                result is None
+                or (
+                    result.expected_count,
+                    result.actual_count,
+                    result.delta_count,
+                )
+                != expected
+            ):
                 raise ValueError("school count category result is not reviewed")
         return self
 
@@ -448,7 +456,9 @@ class SourceSnapshotInfo(_StrictManifestContractModel):
             or any(type(name) is not str or not name.strip() for name in values)
             or any(type(count) is not int or count <= 0 for count in values.values())
         ):
-            raise ValueError("unclassifiedSchoolKindCounts must be sorted positive counts")
+            raise ValueError(
+                "unclassifiedSchoolKindCounts must be sorted positive counts"
+            )
         return values
 
     @field_validator("unclassified_school_policy_sha256")
@@ -520,9 +530,10 @@ class SourceSnapshotInfo(_StrictManifestContractModel):
                 "and must be null for mixed dates"
             )
         fetched_date = _parse_rfc3339_timestamp(self.fetched_at).date()
-        if self.source_as_of is not None and _parse_iso_date(
-            self.source_as_of
-        ) > fetched_date:
+        if (
+            self.source_as_of is not None
+            and _parse_iso_date(self.source_as_of) > fetched_date
+        ):
             raise ValueError("sourceAsOf must not be later than fetchedAt date")
         observation_dates = {
             *self.source_observation_date_counts,
@@ -530,9 +541,7 @@ class SourceSnapshotInfo(_StrictManifestContractModel):
             *self.preserved_observation_date_counts,
         }
         if any(_parse_iso_date(value) > fetched_date for value in observation_dates):
-            raise ValueError(
-                "observation dates must not be later than fetchedAt date"
-            )
+            raise ValueError("observation dates must not be later than fetchedAt date")
         if self.page_count <= 0 or self.fetched_row_count <= 0:
             raise ValueError("source page/fetched counts must be positive")
         if self.normalized_row_count > self.fetched_row_count:
@@ -542,9 +551,7 @@ class SourceSnapshotInfo(_StrictManifestContractModel):
                 "normalizedRowCount + preservedRowCount must equal rowCount"
             )
         if sum(self.source_observation_date_counts.values()) != self.fetched_row_count:
-            raise ValueError(
-                "sourceObservationDateCounts must sum to fetchedRowCount"
-            )
+            raise ValueError("sourceObservationDateCounts must sum to fetchedRowCount")
         if (
             sum(self.normalized_observation_date_counts.values())
             != self.normalized_row_count
@@ -659,9 +666,10 @@ class EnrichmentSnapshotInfo(_StrictSnapshotModel):
             raise ValueError(
                 "matchedRowCount + preservedMatchedRowCount must equal rowCount"
             )
-        if _parse_iso_date(self.source_as_of) > _parse_rfc3339_timestamp(
-            self.fetched_at
-        ).date():
+        if (
+            _parse_iso_date(self.source_as_of)
+            > _parse_rfc3339_timestamp(self.fetched_at).date()
+        ):
             raise ValueError("sourceAsOf must not be later than fetchedAt date")
         return self
 
@@ -747,7 +755,9 @@ class SnapshotManifest(_StrictManifestContractModel):
         "coordinate_quality_counts",
     )
     @classmethod
-    def count_map_is_strict_and_nonnegative(cls, values: dict[str, int]) -> dict[str, int]:
+    def count_map_is_strict_and_nonnegative(
+        cls, values: dict[str, int]
+    ) -> dict[str, int]:
         if any(not key.strip() for key in values):
             raise ValueError("count-map keys must be nonblank")
         if any(value < 0 for value in values.values()):
@@ -793,7 +803,10 @@ class SnapshotManifest(_StrictManifestContractModel):
         if production_contract:
             assert self.school_count_reconciliation is not None
             manifest_sources = {source.source: source for source in self.sources}
-            for source_name, summary in self.school_count_reconciliation.sources.items():
+            for (
+                source_name,
+                summary,
+            ) in self.school_count_reconciliation.sources.items():
                 source = manifest_sources.get(source_name)
                 if (
                     source is None

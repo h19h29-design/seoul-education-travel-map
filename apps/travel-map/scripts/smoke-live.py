@@ -102,7 +102,9 @@ def _emit(report: dict[str, object]) -> None:
 
 
 def _has_runtime_credentials(settings: Settings) -> bool:
-    return all(getattr(settings, field) is not None for field in _RUNTIME_CREDENTIAL_FIELDS)
+    return all(
+        getattr(settings, field) is not None for field in _RUNTIME_CREDENTIAL_FIELDS
+    )
 
 
 def _case_report(
@@ -223,11 +225,10 @@ def _validate_case(
     if case.expect_local:
         mode_count = len({route.mode for route in response.routes})
         if response.classification != "LOCAL" or mode_count < 2:
-            raise SmokeExpectationError("public local case did not meet route expectations")
-    if (
-        case.expect_no_allowance_amount
-        and response.allowance.amount_krw is not None
-    ):
+            raise SmokeExpectationError(
+                "public local case did not meet route expectations"
+            )
+    if case.expect_no_allowance_amount and response.allowance.amount_krw is not None:
         raise SmokeExpectationError("nonpublic case exposed an allowance amount")
 
 

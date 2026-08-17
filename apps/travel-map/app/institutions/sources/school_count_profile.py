@@ -66,7 +66,14 @@ _APPROVED_VARIANCES: Final = (
     ("SPECIAL_SCHOOL", 0),
 )
 _REVIEWED_ROWS: Final = (
-    ("KINDERGARTEN_INFO", "KINDERGARTEN_TOTAL", 706, "KINDERGARTEN", "BENCHMARK", "KINDERGARTEN"),
+    (
+        "KINDERGARTEN_INFO",
+        "KINDERGARTEN_TOTAL",
+        706,
+        "KINDERGARTEN",
+        "BENCHMARK",
+        "KINDERGARTEN",
+    ),
     ("NEIS", "각종학교(고)", 13, "MISC_SCHOOL", "BENCHMARK", "MISC_SCHOOL"),
     ("NEIS", "각종학교(중)", 7, "MISC_SCHOOL", "BENCHMARK", "MISC_SCHOOL"),
     ("NEIS", "각종학교(초)", 1, "MISC_SCHOOL", "BENCHMARK", "MISC_SCHOOL"),
@@ -183,7 +190,9 @@ class SchoolCountPopulationProfile:
             or tuple(_row_values(row) for row in self.rows) != _REVIEWED_ROWS
             or any(values[name] != expected[name] for name in _CANONICAL_FIELD_NAMES)
         ):
-            raise ValueError("school count population profile is not the reviewed contract")
+            raise ValueError(
+                "school count population profile is not the reviewed contract"
+            )
 
     def source_category_counts(self, source: str) -> dict[str, int]:
         return {
@@ -219,7 +228,9 @@ def load_school_count_population_profile(
     except UnicodeDecodeError:
         raise SourceDataError("school count population profile must be UTF-8") from None
     if b"\r" in content:
-        raise SourceDataError("school count population profile must use exact LF newlines")
+        raise SourceDataError(
+            "school count population profile must use exact LF newlines"
+        )
     if not content.endswith(b"\n"):
         raise SourceDataError("school count population profile must end with LF")
     lines = text[:-1].split("\n")
@@ -275,7 +286,11 @@ def _parse_metadata(lines: list[str]) -> tuple[dict[str, str], list[str]]:
         if not line.startswith("# "):
             break
         key, separator, value = line[2:].partition("=")
-        if not separator or not _is_canonical_string(key) or not _is_canonical_string(value):
+        if (
+            not separator
+            or not _is_canonical_string(key)
+            or not _is_canonical_string(value)
+        ):
             raise SourceDataError("school count population profile metadata is invalid")
         if key in metadata:
             raise SourceDataError("school count population profile metadata is invalid")
@@ -296,7 +311,9 @@ def _parse_rows(data_lines: list[str]) -> tuple[SchoolPopulationRow, ...]:
             not _is_canonical_string(value) for value in fields if value
         ):
             raise SourceDataError("school count population profile rows are invalid")
-        source, source_category, count_text, normalized_type, role, benchmark_type = fields
+        source, source_category, count_text, normalized_type, role, benchmark_type = (
+            fields
+        )
         try:
             count = _parse_int(count_text)
             row = SchoolPopulationRow(
@@ -308,11 +325,15 @@ def _parse_rows(data_lines: list[str]) -> tuple[SchoolPopulationRow, ...]:
                 benchmark_type=benchmark_type or None,
             )
         except ValueError:
-            raise SourceDataError("school count population profile rows are invalid") from None
+            raise SourceDataError(
+                "school count population profile rows are invalid"
+            ) from None
         rows.append(row)
     keys = [(row.source, row.source_category) for row in rows]
     if keys != sorted(keys) or len(keys) != len(set(keys)):
-        raise SourceDataError("school count population profile rows are not sorted and unique")
+        raise SourceDataError(
+            "school count population profile rows are not sorted and unique"
+        )
     return tuple(rows)
 
 
@@ -340,32 +361,48 @@ def _validate_quarantine_rows(
         if row.source == "NEIS" and row.reconciliation_role == "QUARANTINED"
     )
     if quarantine != policy.counts:
-        raise SourceDataError("school count population profile quarantine rows are invalid")
+        raise SourceDataError(
+            "school count population profile quarantine rows are invalid"
+        )
 
 
 def _read_profile_bytes(resource: Path) -> bytes:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:
-        raise SourceDataError("school count population profile requires no-follow support")
+        raise SourceDataError(
+            "school count population profile requires no-follow support"
+        )
     try:
         descriptor = os.open(resource, os.O_RDONLY | no_follow)
     except OSError as exc:
         if exc.errno == errno.ELOOP:
-            raise SourceDataError("school count population profile must not be a symlink") from None
-        raise SourceDataError("school count population profile cannot be read") from None
+            raise SourceDataError(
+                "school count population profile must not be a symlink"
+            ) from None
+        raise SourceDataError(
+            "school count population profile cannot be read"
+        ) from None
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
-            raise SourceDataError("school count population profile must be a regular file")
+            raise SourceDataError(
+                "school count population profile must be a regular file"
+            )
         if before.st_size > _MAX_PROFILE_BYTES:
-            raise SourceDataError("school count population profile exceeds the size limit")
+            raise SourceDataError(
+                "school count population profile exceeds the size limit"
+            )
         content = _read_exactly(descriptor, before.st_size)
         after = os.fstat(descriptor)
         if after.st_size != before.st_size:
-            raise SourceDataError("school count population profile changed while reading")
+            raise SourceDataError(
+                "school count population profile changed while reading"
+            )
         return content
     except OSError:
-        raise SourceDataError("school count population profile cannot be read") from None
+        raise SourceDataError(
+            "school count population profile cannot be read"
+        ) from None
     finally:
         os.close(descriptor)
 
@@ -376,7 +413,9 @@ def _read_exactly(descriptor: int, size: int) -> bytes:
     while remaining:
         chunk = os.read(descriptor, remaining)
         if not chunk:
-            raise SourceDataError("school count population profile changed while reading")
+            raise SourceDataError(
+                "school count population profile changed while reading"
+            )
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -404,7 +443,9 @@ def _is_canonical_string(value: object) -> bool:
 
 
 def _is_sha256(value: str) -> bool:
-    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
 
 
 def _is_canonical_variances(value: object) -> bool:
@@ -418,10 +459,14 @@ def _is_canonical_variances(value: object) -> bool:
 
 
 def _is_canonical_rows(value: object) -> bool:
-    return type(value) is tuple and all(type(row) is SchoolPopulationRow for row in value)
+    return type(value) is tuple and all(
+        type(row) is SchoolPopulationRow for row in value
+    )
 
 
-def _row_values(row: SchoolPopulationRow) -> tuple[str, str, int, str | None, str, str | None]:
+def _row_values(
+    row: SchoolPopulationRow,
+) -> tuple[str, str, int, str | None, str, str | None]:
     return (
         row.source,
         row.source_category,
