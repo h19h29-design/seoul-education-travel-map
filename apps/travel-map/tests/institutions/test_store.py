@@ -265,6 +265,15 @@ def test_search_item_exposes_only_the_verified_routing_anchor_coordinate() -> No
     assert (item.coordinate.latitude, item.coordinate.longitude) != (37.55, 126.98)
 
 
+def test_active_site_lookup_returns_only_current_search_item() -> None:
+    store = InstitutionStore.load(SNAPSHOT_ROOT)
+    active = store.search(query="샘물초등학교", limit=20)[0]
+
+    assert store.get_search_item(active.site_id) == active
+    assert store.get_search_item("test-neis:B10:CLOSED:main") is None
+    assert store.get_search_item("test-neis:B10:MISSING:main") is None
+
+
 # Production mutation caught: slicing before stable sorting or failing to return
 # an exact next offset, which duplicates or omits equal-rank search results.
 def test_search_page_has_stable_nonoverlapping_offsets_and_total(

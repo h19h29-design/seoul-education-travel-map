@@ -3,7 +3,15 @@
 from datetime import datetime, timedelta
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    StringConstraints,
+    model_validator,
+)
 from pydantic.alias_generators import to_camel
 
 from app.institutions.facets import InstitutionFacetOption, InstitutionFacets
@@ -15,6 +23,7 @@ from app.policy.models import (
     VehicleUse,
 )
 from app.routing.models import FuelType, TravelMode
+from app.storage.models import StoredUserSettings
 from app.trips.models import RouteDirection, TripPattern
 
 
@@ -280,3 +289,48 @@ class ReversePlaceResponse(ApiModel):
 class MeResponse(ApiModel):
     authenticated: bool
     session_expires_at: datetime | None = None
+
+
+class UserSettingsInput(ApiRequestModel):
+    default_origin_site_id: str | None
+    default_trip_pattern: TripPattern
+    default_duration_minutes: Annotated[StrictInt, Field(ge=2, le=1_440)]
+    vehicle_use: VehicleUse
+    fuel_type: FuelType
+    efficiency_km_per_liter: Annotated[StrictFloat, Field(ge=3.0, le=30.0)]
+    parking_cost_krw: Annotated[StrictInt, Field(ge=0, le=100_000)]
+    route_sort: Literal["time", "distance", "cost"]
+
+    @classmethod
+    def from_stored(cls, value: StoredUserSettings) -> Self:
+        return cls.model_validate(
+            {
+                "defaultOriginSiteId": value.default_origin_site_id,
+                "defaultTripPattern": value.default_trip_pattern,
+                "defaultDurationMinutes": value.default_duration_minutes,
+                "vehicleUse": value.vehicle_use,
+                "fuelType": value.fuel_type,
+                "efficiencyKmPerLiter": value.efficiency_km_per_liter,
+                "parkingCostKrw": value.parking_cost_krw,
+                "routeSort": value.route_sort,
+            }
+        )
+
+    def to_stored(self) -> StoredUserSettings:
+        return StoredUserSettings(
+            default_origin_site_id=self.default_origin_site_id,
+            default_trip_pattern=self.default_trip_pattern,
+            default_duration_minutes=self.default_duration_minutes,
+            vehicle_use=self.vehicle_use,
+            fuel_type=self.fuel_type,
+            efficiency_km_per_liter=self.efficiency_km_per_liter,
+            parking_cost_krw=self.parking_cost_krw,
+            route_sort=self.route_sort,
+        )
+
+
+class UserSettingsResponse(ApiModel):
+    settings: UserSettingsInput
+    source: Literal["DEFAULT", "SAVED"]
+    resolved_default_origin: InstitutionSearchItemResponse | None
+    warnings: tuple[str, ...]

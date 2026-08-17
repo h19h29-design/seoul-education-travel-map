@@ -308,8 +308,17 @@ def create_app(
         return await call_next(request)  # type: ignore[operator]
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
-        return JSONResponse({"error": {"code": "VALIDATION_ERROR"}}, status_code=422)
+    async def validation_error(
+        request: Request, _: RequestValidationError
+    ) -> JSONResponse:
+        headers = (
+            {"Cache-Control": "no-store"}
+            if request.url.path.startswith("/api/v1/me/")
+            else None
+        )
+        return JSONResponse(
+            {"error": {"code": "VALIDATION_ERROR"}}, status_code=422, headers=headers
+        )
 
     @app.exception_handler(HTTPException)
     async def http_error(_: Request, exc: HTTPException) -> JSONResponse:

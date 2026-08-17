@@ -73,6 +73,9 @@ class InstitutionStore:
     ) -> None:
         self._active_sites = active_sites
         self._records = records
+        self._active_search_items = MappingProxyType(
+            {record.site.site_id: record.item for record in records}
+        )
         self._display_names = MappingProxyType(dict(display_names))
         self._facets = facets
 
@@ -247,6 +250,13 @@ class InstitutionStore:
         if site is None:
             raise UnknownSiteError(site_id)
         return site
+
+    def get_search_item(self, site_id: str) -> InstitutionSearchItem | None:
+        """Return the current active-site search item without re-searching text."""
+
+        if type(site_id) is not str:
+            raise TypeError("site_id must be a string")
+        return self._active_search_items.get(site_id)
 
     def display_name_for_site(self, site_id: str) -> str:
         if type(site_id) is not str:
