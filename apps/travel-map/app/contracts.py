@@ -275,3 +275,8 @@ class PlacesResponse(ApiModel):
 class ReversePlaceResponse(ApiModel):
     item: dict[str, object] | None
     warnings: tuple[str, ...] = ()
+
+
+class MeResponse(ApiModel):
+    authenticated: bool
+    session_expires_at: datetime | None = None

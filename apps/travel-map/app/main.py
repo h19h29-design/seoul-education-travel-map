@@ -15,6 +15,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api import router as api_router
+from app.api.auth import oauth_router
 from app.dependencies import AppDependencies, build_production_dependencies
 from app.settings import Settings
 
@@ -249,6 +250,7 @@ def create_app(
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    app.include_router(oauth_router)
     app.include_router(api_router)
     app.mount(
         "/static",

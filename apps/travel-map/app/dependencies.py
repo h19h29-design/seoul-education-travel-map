@@ -8,6 +8,7 @@ from typing import Protocol
 
 import orjson
 
+from app.auth.models import UserServices
 from app.cache import TtlLruCache
 from app.institutions.store import InstitutionStore
 from app.policy.coverage import CoverageService, verify_geodata_resources
@@ -51,6 +52,7 @@ class AppDependencies:
     rate_limiter: FixedWindowRateLimiter
     seoul_geojson: bytes
     support_geojson: bytes
+    user_services: UserServices | None = None
     _closed_resource_ids: set[int] = field(default_factory=set, init=False)
 
     async def aclose(self) -> None:
