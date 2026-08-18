@@ -23,7 +23,13 @@ from app.policy.models import (
     VehicleUse,
 )
 from app.routing.models import FuelType, TravelMode
-from app.storage.models import StoredUserSettings
+from app.storage.models import (
+    HistoryDetail,
+    HistoryListItem,
+    HistoryRecalculationDraft,
+    HistoryRouteLegSummary,
+    StoredUserSettings,
+)
 from app.trips.models import RouteDirection, TripPattern
 
 
@@ -334,3 +340,117 @@ class UserSettingsResponse(ApiModel):
     source: Literal["DEFAULT", "SAVED"]
     resolved_default_origin: InstitutionSearchItemResponse | None
     warnings: tuple[str, ...]
+
+
+class HistoryListItemResponse(ApiModel):
+    id: str
+    calculated_at: datetime
+    expires_at: datetime
+    origin_name: str
+    destination_name: str
+    trip_pattern: TripPattern
+    classification: str
+    allowance_status: str
+    allowance_krw: int | None
+
+    @classmethod
+    def from_domain(cls, value: HistoryListItem) -> Self:
+        return cls(
+            id=value.metadata.id,
+            calculated_at=value.metadata.created_at,
+            expires_at=value.metadata.expires_at,
+            origin_name=value.origin_name,
+            destination_name=value.destination_name,
+            trip_pattern=value.trip_pattern,
+            classification=value.classification,
+            allowance_status=value.allowance_status,
+            allowance_krw=value.allowance_krw,
+        )
+
+
+class HistoryRecalculationDraftResponse(ApiModel):
+    origin_site_id: str
+    origin_name: str
+    destination_name: str
+    destination_address: str
+    trip_pattern: TripPattern
+    starts_at: datetime
+    ends_at: datetime
+
+    @classmethod
+    def from_domain(cls, value: HistoryRecalculationDraft) -> Self:
+        return cls(
+            origin_site_id=value.origin_site_id,
+            origin_name=value.origin_name,
+            destination_name=value.destination_name,
+            destination_address=value.destination_address,
+            trip_pattern=value.trip_pattern,
+            starts_at=value.starts_at,
+            ends_at=value.ends_at,
+        )
+
+
+class HistoryRouteLegSummaryResponse(ApiModel):
+    direction: RouteDirection
+    mode: TravelMode
+    duration_seconds: int
+    distance_meters: int
+    mobility_cost_krw: int | None
+
+    @classmethod
+    def from_domain(cls, value: HistoryRouteLegSummary) -> Self:
+        return cls(
+            direction=value.direction,
+            mode=value.mode,
+            duration_seconds=value.duration_seconds,
+            distance_meters=value.distance_meters,
+            mobility_cost_krw=value.mobility_cost_krw,
+        )
+
+
+class HistoryDetailResponse(ApiModel):
+    item: HistoryListItemResponse
+    recalculation_draft: HistoryRecalculationDraftResponse
+    resolved_origin: InstitutionSearchItemResponse | None
+    route_summary: tuple[HistoryRouteLegSummaryResponse, ...]
+    rule_set_id: str | None
+    effective_from: str | None
+    warnings: tuple[str, ...]
+
+    @classmethod
+    def from_domain(
+        cls,
+        value: HistoryDetail,
+        *,
+        resolved_origin: InstitutionSearchItemResponse | None,
+        warnings: tuple[str, ...],
+    ) -> Self:
+        return cls(
+            item=HistoryListItemResponse(
+                id=value.metadata.id,
+                calculated_at=value.metadata.created_at,
+                expires_at=value.metadata.expires_at,
+                origin_name=value.draft.origin_name,
+                destination_name=value.draft.destination_name,
+                trip_pattern=value.draft.trip_pattern,
+                classification=value.summary.classification,
+                allowance_status=value.summary.allowance_status,
+                allowance_krw=value.summary.allowance_krw,
+            ),
+            recalculation_draft=HistoryRecalculationDraftResponse.from_domain(
+                value.draft
+            ),
+            resolved_origin=resolved_origin,
+            route_summary=tuple(
+                HistoryRouteLegSummaryResponse.from_domain(item)
+                for item in value.summary.route_legs
+            ),
+            rule_set_id=value.summary.rule_set_id,
+            effective_from=value.summary.effective_from,
+            warnings=warnings,
+        )
+
+
+class HistoryPageResponse(ApiModel):
+    items: tuple[HistoryListItemResponse, ...]
+    next_cursor: str | None

@@ -2,10 +2,11 @@ import asyncio
 import sqlite3
 import threading
 from base64 import urlsafe_b64encode
+from datetime import UTC, datetime
 
 import app.main as main_module
 from app import dependencies as dependency_module
-from app.auth.models import UserServices
+from app.auth.models import SessionPrincipal, UserServices
 from app.dependencies import _optional_user_services
 from app.main import create_app
 from app.settings import Settings
@@ -121,6 +122,11 @@ class _RawSqliteUnavailableSessions:
         raise sqlite3.OperationalError("sqlite unavailable")
 
 
+class _RawSqliteUnavailableHistory:
+    async def list_page(self, *, user_id: int, before: object, limit: int) -> None:
+        raise sqlite3.OperationalError("history-private-sentinel")
+
+
 # Break caught: a raw SQLite read/PRAGMA error escaping a presented-session
 # resolution and turning a public preview into a 500 instead of the fixed
 # anonymous-history warning.
@@ -143,6 +149,40 @@ def test_presented_session_raw_sqlite_outage_degrades_to_public_preview(client) 
 
     assert response.status_code == 200
     assert "HISTORY_NOT_SAVED" in response.json()["warnings"]
+
+
+def test_history_storage_error_is_fixed_unavailable_without_private_leak(
+    client,
+) -> None:
+    dependencies = client.app.state.dependencies
+    dependencies.user_services = UserServices(
+        oauth_attempts=None,
+        sessions=_ResolvedSession(),
+        history=_RawSqliteUnavailableHistory(),
+        settings=None,
+        retention_cleaner=None,
+        oidc_client=None,
+    )
+
+    response = client.get(
+        "/api/v1/me/history",
+        headers={"Cookie": "__Host-travel_session=opaque-browser-session"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"error": {"code": "AUTH_UNAVAILABLE"}}
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "history-private-sentinel" not in response.text
+
+
+class _ResolvedSession:
+    async def resolve(self, *, raw_token: str, now: object) -> SessionPrincipal:
+        return SessionPrincipal(
+            user_id=73,
+            token_hmac=b"s" * 32,
+            csrf_hmac=b"c" * 32,
+            expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+        )
 
 
 class _RetryingCleaner:
