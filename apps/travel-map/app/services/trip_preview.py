@@ -39,6 +39,11 @@ from app.routing.models import (
     RouteQuery,
     TravelMode,
 )
+from app.storage.models import (
+    HistoryRecalculationDraft,
+    HistoryRouteLegSummary,
+    HistorySummary,
+)
 from app.trips.models import PlannedTripLeg, RouteDirection, TripPattern
 
 PUBLIC_POLICY_PROFILE = PolicyProfile.SEOUL_EDU_PUBLIC_OFFICIAL_CONFIRMED
@@ -268,6 +273,54 @@ class TripPreviewService:
                 previous_allowance_krw=request.previous_allowance_krw,
             )
         )
+
+
+def project_history_records(
+    request: TripPreviewRequest,
+    response: TripPreviewResponse,
+) -> tuple[HistoryRecalculationDraft, HistorySummary]:
+    """Project the public preview into the sole encrypted-history shape."""
+
+    route_legs = tuple(
+        HistoryRouteLegSummary(
+            direction=leg.direction,
+            mode=fastest.mode,
+            duration_seconds=fastest.duration_seconds,
+            distance_meters=fastest.distance_meters,
+            mobility_cost_krw=fastest.mobility_cost_krw,
+        )
+        for leg in response.route_legs
+        for fastest in (
+            next(
+                (
+                    route
+                    for route in leg.routes
+                    if route.id == leg.best.fastest_route_id
+                ),
+                None,
+            ),
+        )
+        if fastest is not None
+    )
+    return (
+        HistoryRecalculationDraft(
+            origin_site_id=request.origin_site_id,
+            origin_name=response.origin.name,
+            destination_name=request.destination.name,
+            destination_address=request.destination.address,
+            trip_pattern=request.trip_pattern,
+            starts_at=request.starts_at,
+            ends_at=request.ends_at,
+        ),
+        HistorySummary(
+            classification=response.classification.value,
+            allowance_status=response.allowance.status,
+            allowance_krw=response.allowance.amount_krw,
+            route_legs=route_legs,
+            rule_set_id=response.rule_set_id,
+            effective_from=response.effective_from,
+        ),
+    )
 
 
 def _plan_trip_legs(

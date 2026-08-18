@@ -1,14 +1,15 @@
 import sqlite3
-from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, Request
 
+from app.api.auth import require_mutating_principal
 from app.api.common import client_ip, dependencies_for
-from app.auth.models import UserServices
+from app.auth.models import SessionPrincipal, UserServices
 from app.contracts import TripPreviewRequest, TripPreviewResponse
 from app.dependencies import AppDependencies
 from app.institutions.store import UnknownSiteError
-from app.services.trip_preview import TripPreviewService
+from app.services.trip_preview import TripPreviewService, project_history_records
+from app.storage.crypto import UserDataUnavailableError
 from app.storage.models import StorageIntegrityError
 
 router = APIRouter(tags=["trips"])
@@ -32,29 +33,48 @@ async def trip_preview(
             detail="RATE_LIMITED",
             headers={"Retry-After": str(decision.retry_after_seconds)},
         )
+    principal, user_services, history_unavailable = await _preview_user_context(
+        request, dependencies
+    )
     try:
         preview = await TripPreviewService(dependencies).preview(payload)
     except UnknownSiteError:
         raise HTTPException(status_code=404, detail="UNKNOWN_ORIGIN_SITE") from None
-    return await _preview_with_user_storage_boundary(request, dependencies, preview)
-
-
-async def _preview_with_user_storage_boundary(
-    request: Request,
-    dependencies: AppDependencies,
-    preview: TripPreviewResponse,
-) -> TripPreviewResponse:
-    raw_token = request.cookies.get(_SESSION_COOKIE)
-    if raw_token is None:
-        return preview
-    user_services = dependencies.user_services
-    if type(user_services) is not UserServices:
+    if history_unavailable:
         return _with_history_not_saved(preview)
+    if principal is None or user_services is None:
+        return preview
     try:
-        await user_services.sessions.resolve(raw_token=raw_token, now=datetime.now(UTC))
-    except (StorageIntegrityError, sqlite3.Error):
+        draft, summary = project_history_records(payload, preview)
+        await user_services.history.create(
+            user_id=principal.user_id,
+            draft=draft,
+            summary=summary,
+        )
+    except (StorageIntegrityError, UserDataUnavailableError, sqlite3.Error):
         return _with_history_not_saved(preview)
     return preview
+
+
+async def _preview_user_context(
+    request: Request,
+    dependencies: AppDependencies,
+) -> tuple[SessionPrincipal | None, UserServices | None, bool]:
+    raw_token = request.cookies.get(_SESSION_COOKIE)
+    if raw_token is None:
+        return None, None, False
+    user_services = dependencies.user_services
+    if type(user_services) is not UserServices:
+        return None, None, True
+    try:
+        principal = await require_mutating_principal(request, services=user_services)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            return None, None, False
+        raise
+    except (StorageIntegrityError, UserDataUnavailableError, sqlite3.Error):
+        return None, None, True
+    return principal, user_services, False
 
 
 def _with_history_not_saved(preview: TripPreviewResponse) -> TripPreviewResponse:

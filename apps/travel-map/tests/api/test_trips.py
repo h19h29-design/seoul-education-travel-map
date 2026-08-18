@@ -1,9 +1,15 @@
-from datetime import datetime
+import hmac
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+from app.auth.models import SessionPrincipal, UserServices
 from app.cache import WALK_TTL_SECONDS
 from app.routing.models import Coordinate, TravelMode
+from app.storage.crypto import UserDataUnavailableError
+from app.storage.models import HistoryMetadata, StorageIntegrityError
 from tests.api.conftest import trip_payload
 from tests.institutions.test_store import load_store_with_main_site_name
 
@@ -17,6 +23,240 @@ def route_for(leg: dict[str, object], mode: str) -> dict[str, object]:
     routes = leg["routes"]
     assert isinstance(routes, list)
     return next(route for route in routes if route["mode"] == mode)
+
+
+def test_authenticated_preview_writes_only_minimal_history_draft(client) -> None:
+    sessions = AsyncMock()
+    sessions.resolve.return_value = SessionPrincipal(
+        user_id=73,
+        token_hmac=b"s" * 32,
+        csrf_hmac=hmac.digest(b"h" * 32, b"csrf-token", "sha256"),
+        expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+    )
+    sessions.verify_csrf.return_value = True
+    history = AsyncMock()
+    history.create.return_value = HistoryMetadata(
+        id="A" * 22,
+        user_id=73,
+        created_at=datetime(2026, 8, 17, tzinfo=UTC),
+        expires_at=datetime(2026, 8, 24, tzinfo=UTC),
+    )
+    dependencies = client.app.state.dependencies
+    dependencies.settings = dependencies.settings.model_copy(
+        update={"public_base_url": "https://travel.example.test"}
+    )
+    dependencies.user_services = UserServices(
+        oauth_attempts=AsyncMock(),
+        sessions=sessions,
+        history=history,
+        settings=AsyncMock(),
+        retention_cleaner=AsyncMock(),
+        oidc_client=AsyncMock(),
+    )
+
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(),
+        headers={
+            "Cookie": "__Host-travel_session=session-token; "
+            "__Host-travel_csrf=csrf-token",
+            "Origin": "https://travel.example.test",
+            "X-CSRF-Token": "csrf-token",
+        },
+    )
+
+    assert response.status_code == 200
+    draft = history.create.await_args.kwargs["draft"]
+    assert history.create.await_args.kwargs["user_id"] == 73
+    assert set(type(draft).__dataclass_fields__) == {
+        "origin_site_id",
+        "origin_name",
+        "destination_name",
+        "destination_address",
+        "trip_pattern",
+        "starts_at",
+        "ends_at",
+    }
+    summary = history.create.await_args.kwargs["summary"]
+    assert set(type(summary).__dataclass_fields__) == {
+        "classification",
+        "allowance_status",
+        "allowance_krw",
+        "route_legs",
+        "rule_set_id",
+        "effective_from",
+    }
+    assert [item.mode for item in summary.route_legs] == [
+        TravelMode.CAR,
+        TravelMode.CAR,
+    ]
+    assert [item.duration_seconds for item in summary.route_legs] == [900, 1_000]
+
+
+def test_authenticated_preview_requires_origin_and_csrf_before_calculation_or_save(
+    client,
+    fake_route_providers,
+) -> None:
+    sessions = AsyncMock()
+    sessions.resolve.return_value = SessionPrincipal(
+        user_id=73,
+        token_hmac=b"s" * 32,
+        csrf_hmac=b"c" * 32,
+        expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+    )
+    sessions.verify_csrf.return_value = False
+    history = AsyncMock()
+    dependencies = client.app.state.dependencies
+    dependencies.settings = dependencies.settings.model_copy(
+        update={"public_base_url": "https://travel.example.test"}
+    )
+    dependencies.user_services = UserServices(
+        oauth_attempts=AsyncMock(),
+        sessions=sessions,
+        history=history,
+        settings=AsyncMock(),
+        retention_cleaner=AsyncMock(),
+        oidc_client=AsyncMock(),
+    )
+
+    missing_origin = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(),
+        headers={"Cookie": "__Host-travel_session=session-token"},
+    )
+    wrong_csrf = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(),
+        headers={
+            "Cookie": "__Host-travel_session=session-token",
+            "Origin": "https://travel.example.test",
+            "X-CSRF-Token": "wrong-csrf",
+        },
+    )
+
+    assert missing_origin.status_code == 403
+    assert missing_origin.json() == {"error": {"code": "INVALID_ORIGIN"}}
+    assert wrong_csrf.status_code == 403
+    assert wrong_csrf.json() == {"error": {"code": "CSRF_FAILED"}}
+    assert all(provider.call_count == 0 for provider in fake_route_providers.values())
+    history.create.assert_not_awaited()
+
+
+def test_history_save_failure_keeps_public_preview_with_fixed_warning(client) -> None:
+    sessions = AsyncMock()
+    sessions.resolve.return_value = SessionPrincipal(
+        user_id=73,
+        token_hmac=b"s" * 32,
+        csrf_hmac=b"c" * 32,
+        expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+    )
+    sessions.verify_csrf.return_value = True
+    history = AsyncMock()
+    history.create.side_effect = UserDataUnavailableError()
+    dependencies = client.app.state.dependencies
+    dependencies.settings = dependencies.settings.model_copy(
+        update={"public_base_url": "https://travel.example.test"}
+    )
+    dependencies.user_services = UserServices(
+        oauth_attempts=AsyncMock(),
+        sessions=sessions,
+        history=history,
+        settings=AsyncMock(),
+        retention_cleaner=AsyncMock(),
+        oidc_client=AsyncMock(),
+    )
+
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(),
+        headers={
+            "Cookie": "__Host-travel_session=session-token",
+            "Origin": "https://travel.example.test",
+            "X-CSRF-Token": "csrf-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "HISTORY_NOT_SAVED" in response.json()["warnings"]
+    history.create.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        StorageIntegrityError("storage input is invalid"),
+        sqlite3.OperationalError("storage unavailable"),
+    ],
+)
+def test_history_storage_write_failure_keeps_public_preview_with_fixed_warning(
+    client,
+    failure: Exception,
+) -> None:
+    sessions = AsyncMock()
+    sessions.resolve.return_value = SessionPrincipal(
+        user_id=73,
+        token_hmac=b"s" * 32,
+        csrf_hmac=b"c" * 32,
+        expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+    )
+    sessions.verify_csrf.return_value = True
+    history = AsyncMock()
+    history.create.side_effect = failure
+    dependencies = client.app.state.dependencies
+    dependencies.settings = dependencies.settings.model_copy(
+        update={"public_base_url": "https://travel.example.test"}
+    )
+    dependencies.user_services = UserServices(
+        oauth_attempts=AsyncMock(),
+        sessions=sessions,
+        history=history,
+        settings=AsyncMock(),
+        retention_cleaner=AsyncMock(),
+        oidc_client=AsyncMock(),
+    )
+
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(),
+        headers={
+            "Cookie": "__Host-travel_session=session-token",
+            "Origin": "https://travel.example.test",
+            "X-CSRF-Token": "csrf-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "HISTORY_NOT_SAVED" in response.json()["warnings"]
+    assert str(failure) not in response.text
+
+
+def test_session_cipher_failure_stays_anonymous_without_saving_or_private_leak(
+    client,
+) -> None:
+    sessions = AsyncMock()
+    sessions.resolve.side_effect = UserDataUnavailableError()
+    history = AsyncMock()
+    dependencies = client.app.state.dependencies
+    dependencies.user_services = UserServices(
+        oauth_attempts=AsyncMock(),
+        sessions=sessions,
+        history=history,
+        settings=AsyncMock(),
+        retention_cleaner=AsyncMock(),
+        oidc_client=AsyncMock(),
+    )
+    opaque_token = "opaque-session-sentinel"
+
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(),
+        headers={"Cookie": f"__Host-travel_session={opaque_token}"},
+    )
+
+    assert response.status_code == 200
+    assert "HISTORY_NOT_SAVED" in response.json()["warnings"]
+    assert opaque_token not in response.text
+    history.create.assert_not_awaited()
 
 
 # Production mutation caught: planning only the outbound leg, swapping a leg's
