@@ -23,6 +23,7 @@ ENV ENVIRONMENT=production \
 
 RUN groupadd --gid 10001 appuser \
     && useradd --uid 10001 --gid appuser --create-home --shell /usr/sbin/nologin appuser
+RUN install -d -m 0700 -o appuser -g appuser /data
 
 WORKDIR /app
 
@@ -51,4 +52,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
 
 # create_app builds production dependencies during the lifespan startup. Invalid
 # credentials or a missing/invalid approved snapshot therefore prevent serving.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log", "--no-proxy-headers"]
+CMD ["/bin/sh", "-c", "umask 077; exec uvicorn app.main:app --host 0.0.0.0 --port 8080 --no-access-log --no-proxy-headers"]

@@ -750,6 +750,115 @@ def test_release_container_artifacts_exclude_non_runtime_payloads() -> None:
     assert "resources/institution-snapshots" in dockerfile
 
 
+def test_nas_runtime_has_one_writable_mount_and_hardened_migration() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "install -d -m 0700 -o appuser -g appuser /data" in dockerfile
+    assert "VOLUME" not in dockerfile
+    assert "umask 077; exec uvicorn" in dockerfile
+    assert "--no-proxy-headers" in dockerfile
+
+    compose = (ROOT / "deploy/nas/compose.example.yml").read_text(encoding="utf-8")
+    migration = (ROOT / "deploy/nas/migrate-user-database.sh").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        "image: ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
+        "${TRAVEL_MAP_MANIFEST_DIGEST:"
+    ) in compose
+    assert "/volume2/docker-1/seoul-education-travel-map/data:/data:rw" in compose
+    assert "read_only: true" in compose
+    assert 'user: "10001:10001"' in compose
+    assert "cap_drop:\n      - ALL" in compose
+    assert "no-new-privileges:true" in compose
+    for flag in (
+        "--network none",
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+    ):
+        assert flag in migration
+    assert "runtime.env" not in migration
+    assert os.access(ROOT / "deploy/nas/migrate-user-database.sh", os.X_OK)
+
+
+def test_nas_compose_is_fixed_to_the_private_data_mount_and_reviewed_image() -> None:
+    compose = (ROOT / "deploy/nas/compose.example.yml").read_text(encoding="utf-8")
+
+    assert "image: ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" in compose
+    assert "/volume1/docker/seoul-education-travel-map/runtime.env" in compose
+    assert compose.count("/volume2/") == 1
+    assert "/volume2/docker-1/seoul-education-travel-map/data:/data:rw" in compose
+    assert "init: true" in compose
+    assert "restart: unless-stopped" in compose
+    assert "read_only: true" in compose
+    assert 'user: "10001:10001"' in compose
+    assert '- "127.0.0.1:18080:8080"' in compose
+    assert "max-size: 10m" in compose
+    assert 'max-file: "5"' in compose
+    assert "no-new-privileges:true" in compose
+    assert "size=16m,mode=0700,uid=10001,gid=10001" in compose
+    assert "travel.h19h19.com" not in compose
+
+
+def test_migration_script_rejects_injected_or_noncanonical_image_references() -> None:
+    migration = ROOT / "deploy/nas/migrate-user-database.sh"
+    invalid_references = (
+        "--network=host",
+        "-ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64,
+        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 63,
+        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "A" * 64,
+        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
+        + "a" * 64
+        + ";not-a-command",
+        "ghcr.io/other/repository@sha256:" + "a" * 64,
+        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
+        + "a" * 64
+        + "@sha256:"
+        + "b" * 64,
+    )
+    for image in invalid_references:
+        completed = subprocess.run(
+            [str(migration), image],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert completed.stderr in {
+            "BLOCKED_INVALID_IMAGE_DIGEST\n",
+            "BLOCKED_INVALID_IMAGE_REPOSITORY\n",
+        }
+
+
+def test_migration_script_uses_a_fixed_quoted_private_path_and_mode_checks() -> None:
+    migration = (ROOT / "deploy/nas/migrate-user-database.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "set -eu" in migration
+    assert "data_dir=/volume2/docker-1/seoul-education-travel-map/data" in migration
+    assert 'CDPATH= cd -- "$data_dir" && pwd -P' in migration
+    assert "10001:10001:700" in migration
+    assert '--mount "type=bind,src=$data_dir,dst=/data"' in migration
+    assert "umask 077" in migration
+    assert "migrate --database /data/travel-map.sqlite3" in migration
+    assert "verify --database /data/travel-map.sqlite3" in migration
+    assert "eval" not in migration
+    assert "source " not in migration
+    assert ". runtime.env" not in migration
+    assert "docker compose" not in migration
+
+
+def test_root_gitignore_excludes_all_sqlite_user_database_artifacts() -> None:
+    gitignore = Path(".gitignore").read_text(encoding="utf-8")
+
+    assert "*.sqlite3" in gitignore
+    assert "*.sqlite3-wal" in gitignore
+    assert "*.sqlite3-shm" in gitignore
+
+
 def _run_smoke(
     extra_environment: dict[str, str],
     *,

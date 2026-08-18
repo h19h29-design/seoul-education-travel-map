@@ -1,0 +1,24 @@
+services:
+  travel-map:
+    image: ghcr.io/h19h29-design/seoul-education-travel-map@sha256:${TRAVEL_MAP_MANIFEST_DIGEST:?set the reviewed 64-hex manifest digest}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - /volume1/docker/seoul-education-travel-map/runtime.env
+    volumes:
+      - /volume2/docker-1/seoul-education-travel-map/data:/data:rw
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10001,gid=10001
+    ports:
+      - "127.0.0.1:18080:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"

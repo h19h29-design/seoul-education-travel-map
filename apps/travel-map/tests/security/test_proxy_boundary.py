@@ -86,8 +86,11 @@ def test_client_ip_never_trusts_wide_proxy_cidrs() -> None:
 # before the app can enforce its exact trusted-connector boundary.
 def test_docker_starts_uvicorn_without_proxy_headers() -> None:
     dockerfile = Path("apps/travel-map/Dockerfile").read_text(encoding="utf-8")
+    command = _docker_runtime_command(dockerfile)
 
-    assert '"--no-proxy-headers"' in dockerfile
+    assert command[:2] == ["/bin/sh", "-c"]
+    assert command[2].startswith("umask 077; exec uvicorn ")
+    assert "--no-proxy-headers" in command[2].split()
 
 
 # Break caught: a real Uvicorn process rewriting the socket peer from a forged
@@ -96,6 +99,7 @@ def test_real_uvicorn_process_does_not_rewrite_socket_peer_from_forwarded_header
     None
 ):
     dockerfile = Path("apps/travel-map/Dockerfile").read_text(encoding="utf-8")
+    docker_command = _docker_runtime_command(dockerfile)
     port = _free_loopback_port()
     command = [
         sys.executable,
@@ -108,7 +112,7 @@ def test_real_uvicorn_process_does_not_rewrite_socket_peer_from_forwarded_header
         str(port),
         "--no-access-log",
     ]
-    if '"--no-proxy-headers"' in dockerfile:
+    if "--no-proxy-headers" in docker_command[2].split():
         command.append("--no-proxy-headers")
     process = subprocess.Popen(
         command,
@@ -127,6 +131,15 @@ def test_real_uvicorn_process_does_not_rewrite_socket_peer_from_forwarded_header
             process.wait(timeout=5)
 
     assert payload == {"clientIp": "127.0.0.1"}
+
+
+def _docker_runtime_command(dockerfile: str) -> list[str]:
+    for line in dockerfile.splitlines():
+        if line.startswith("CMD ["):
+            command = json.loads(line.removeprefix("CMD "))
+            if type(command) is list and all(type(value) is str for value in command):
+                return command
+    raise AssertionError("Dockerfile must declare a JSON-array CMD")
 
 
 def _free_loopback_port() -> int:
