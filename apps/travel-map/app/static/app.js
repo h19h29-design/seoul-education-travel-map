@@ -1,4 +1,5 @@
 import { api, ApiError } from "./api.js";
+import { createAuthController } from "./auth.js";
 import { createDestinationPicker } from "./destination-picker.js";
 import { createInstitutionPicker } from "./institution-picker.js";
 import { KakaoMapController } from "./kakao-map.js";
@@ -9,6 +10,7 @@ import { createTripForm } from "./trip-form.js";
 
 const $ = (selector) => document.querySelector(selector);
 const controls = {
+  authStatus: $("#auth-status"),
   allowanceAmount: $("#allowance-amount"),
   allowanceStatus: $("#allowance-status"),
   calculateButton: $("#calculate-button"),
@@ -34,6 +36,9 @@ const controls = {
   fuelType: $("#fuel-type"),
   helpButton: $("#help-button"),
   helpDialog: $("#help-dialog"),
+  historyButton: $("#history-button"),
+  loginButton: $("#login-button"),
+  logoutButton: $("#logout-button"),
   map: $("#map"),
   mapCollapse: $("#map-collapse"),
   mapStatus: $("#map-status"),
@@ -52,6 +57,9 @@ const controls = {
   previousAllowanceField: $("#previous-allowance-field"),
   policyButton: $("#policy-button"),
   policyDialog: $("#policy-dialog"),
+  privateAuthDialog: $("#private-auth-dialog"),
+  privateAuthCloseButton: $("#private-auth-close-button"),
+  privateAuthLoginButton: $("#private-auth-login-button"),
   quickDurationButtons: [...document.querySelectorAll("[data-duration-hours]")],
   results: $("#results"),
   routeCount: $("#route-count"),
@@ -60,6 +68,7 @@ const controls = {
   startTime: $("#starts-time"),
   tripPattern: [...document.querySelectorAll("input[name='trip-pattern']")],
   utilityNav: $("#utility-nav"),
+  settingsButton: $("#settings-button"),
   vehicleUse: $("#vehicle-use"),
   boundaries: {
     seoul: $("#seoul-layer"),
@@ -77,6 +86,8 @@ const map = new KakaoMapController(controls.map, controls.mapStatus);
 let tripForm;
 let previewRevision = 0;
 let destroyMobileMenu = () => {};
+let authController;
+let settingsRevision = 0;
 
 const helpPanels = createHelpPanels({
   api,
@@ -213,6 +224,40 @@ tripForm = createTripForm({
   schedule,
 });
 
+async function applyAuthenticatedSettings({ authenticated }) {
+  const revision = ++settingsRevision;
+  if (!authenticated) return;
+  try {
+    const response = await api.settings();
+    if (revision !== settingsRevision || !authController.authenticated()) return;
+    if (!response?.settings || typeof response.settings !== "object") return;
+    tripForm.applySettings(response.settings, response.resolvedDefaultOrigin ?? null);
+    routeResults.setSort(response.settings.routeSort);
+    if (response.settings.defaultOriginSiteId && !response.resolvedDefaultOrigin) {
+      controls.originNote.textContent = "기본 근무지를 다시 선택하세요.";
+    }
+    invalidatePreview();
+    updateCalculateAvailability();
+  } catch {
+    if (revision !== settingsRevision || !authController.authenticated()) return;
+    controls.originNote.textContent = "기본 설정을 불러오지 못했습니다. 직접 입력해 계산할 수 있습니다.";
+  }
+}
+
+authController = createAuthController({
+  api,
+  elements: {
+    historyButton: controls.historyButton,
+    loginButtons: [controls.loginButton, controls.privateAuthLoginButton],
+    logoutButton: controls.logoutButton,
+    privateCloseButton: controls.privateAuthCloseButton,
+    privateDialog: controls.privateAuthDialog,
+    settingsButton: controls.settingsButton,
+    status: controls.authStatus,
+  },
+  onSessionChange: applyAuthenticatedSettings,
+});
+
 async function calculate(event) {
   event.preventDefault();
   if (!tripForm.valid()) {
@@ -314,6 +359,7 @@ async function initialize() {
   controls.otherTrips.addEventListener("change", updatePreviousAllowanceControl);
   updatePreviousAllowanceControl();
   updateCalculateAvailability();
+  void authController.initialize();
   try {
     const bootstrap = await api.bootstrap();
     await map.initialize(bootstrap.map.javascriptKey);
@@ -327,6 +373,7 @@ window.addEventListener("pagehide", () => {
   institutionPicker.destroy();
   destinationPicker.destroy();
   helpPanels.destroy();
+  authController.destroy();
   destroyMobileMenu();
 }, { once: true });
 

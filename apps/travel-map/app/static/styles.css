@@ -63,6 +63,8 @@ dialog:focus-visible { outline: none; }
 .utility-nav { margin-left: auto; display: flex; align-items: center; gap: 25px; font-weight: 650; }
 
 .utility-nav a, .utility-button { color: #27364f; text-decoration: none; white-space: nowrap; }
+.auth-status { color: var(--muted); font-size: 11px; font-weight: 600; }
+.auth-action { border: 1px solid #9eb8e8; border-radius: 999px; color: #164fbc; padding: 5px 9px; font-size: 12px; font-weight: 750; }
 
 .app-shell { display: grid; grid-template-columns: minmax(430px, 40%) minmax(0, 60%); min-height: calc(100vh - 111px); }
 
@@ -253,6 +255,7 @@ input::placeholder { color: #9aa4b3; }
   .utility-nav { position: absolute; z-index: 20; top: 57px; right: 10px; left: 10px; display: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-left: 0; border: 1px solid var(--line); border-radius: 8px; background: #fff; box-shadow: var(--shadow); padding: 10px; }
   .utility-nav.is-open { display: grid; }
   .utility-nav a, .utility-nav .utility-button { min-height: 38px; border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px; text-align: left; }
+  .utility-nav .auth-status { grid-column: 1 / -1; padding: 4px 8px; }
   .app-shell { display: flex; flex-direction: column; min-height: 0; }
   .rail { border-right: 0; }
   .steps { padding: 10px 14px; gap: 7px; overflow: hidden; font-size: 12px; }

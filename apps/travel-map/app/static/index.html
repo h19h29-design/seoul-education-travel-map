@@ -14,8 +14,11 @@
       <nav id="utility-nav" class="utility-nav" aria-label="도움말 및 설정">
         <button id="help-button" class="utility-button" type="button">ⓘ 사용 안내</button>
         <button id="policy-button" class="utility-button" type="button">▧ 관련 규정</button>
-        <a href="#results">◷ 계산 이력</a>
-        <button type="button" class="utility-button">⚙ 설정</button>
+        <button id="history-button" class="utility-button" type="button">◷ 계산 이력</button>
+        <button id="settings-button" class="utility-button" type="button">⚙ 설정</button>
+        <span id="auth-status" class="auth-status" role="status" aria-live="polite">로그인 상태를 확인하고 있습니다.</span>
+        <button id="login-button" class="utility-button auth-action" type="button">Kakao 로그인</button>
+        <button id="logout-button" class="utility-button auth-action" type="button" hidden>로그아웃</button>
       </nav>
     </header>
 
@@ -246,6 +249,16 @@
         </section>
         <p class="panel-disclaimer">이 화면의 결과는 예상값이며 실제 지급액 또는 지급 확정을 대신하지 않습니다. 기관의 최종 판단을 확인하세요.</p>
         <p class="panel-disclaimer">Kakao 로그인은 재직 확인이 아닙니다. 카카오 계정 제어 확인일 뿐이며, 공개 고정 여비 기준을 변경하지 않습니다.</p>
+      </div>
+    </dialog>
+    <dialog id="private-auth-dialog" class="info-dialog" aria-labelledby="private-auth-dialog-title">
+      <div class="dialog-heading-row">
+        <h2 id="private-auth-dialog-title" data-dialog-heading tabindex="-1">로그인이 필요한 기능</h2>
+        <button id="private-auth-close-button" class="dialog-close" type="button" aria-label="닫기">닫기</button>
+      </div>
+      <div class="dialog-content">
+        <p>계산 이력과 기본 설정은 선택한 Kakao 로그인 후에만 이용할 수 있습니다. 기관·출장지 검색과 경로·여비 계산은 로그인 없이 계속 이용할 수 있습니다.</p>
+        <button id="private-auth-login-button" class="primary-button" type="button">Kakao 로그인</button>
       </div>
     </dialog>
     <script type="module" src="/static/app.js"></script>

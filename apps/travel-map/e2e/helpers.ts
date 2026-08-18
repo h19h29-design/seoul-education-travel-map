@@ -191,6 +191,9 @@ export async function installMockApi(
         options.bootstrapStatus ?? 200,
       );
     }
+    if (path === "/api/v1/me") {
+      return fulfillJson(route, readFixture("me-anonymous.json"));
+    }
     if (path === "/api/v1/institutions/facets") {
       if (options.facetsHang) return;
       return fulfillJson(

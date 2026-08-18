@@ -335,7 +335,7 @@ test("facet_failure_leaves_text_search_and_anonymous_calculation_available", asy
   await page.getByRole("button", { name: "경로 계산" }).click();
   await expect(page.getByRole("heading", { name: "추천 경로" })).toBeVisible();
   await expect(page.locator("#allowance-amount")).toHaveText("20,000원");
-  expect(requestedPaths.some((path) => path.includes("/me"))).toBe(false);
+  expect(requestedPaths).toContain("/api/v1/me");
 
   const hangingContext = await browser.newContext();
   const hangingPage = await hangingContext.newPage();
