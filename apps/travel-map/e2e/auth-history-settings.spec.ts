@@ -2,9 +2,206 @@ import { expect, test } from "@playwright/test";
 import {
   completePublicOfficialTrip,
   installAuthenticatedHistoryApi,
+  installAuthenticatedSettingsApi,
   installMockApi,
   readFixture,
 } from "./helpers";
+
+test("all saved settings restore and keep cost sorting active", async ({ page }) => {
+  await installAuthenticatedSettingsApi(page);
+  await page.goto("/");
+
+  await expect(page.locator("#origin-selection")).toContainText("샘물공립초등학교");
+  await expect(page.getByRole("radio", { name: "일반 왕복" })).toBeChecked();
+  await expect(page.getByLabel("출장 시간 시간")).toHaveValue("5");
+  await expect(page.getByLabel("출장 시간 분")).toHaveValue("0");
+  await expect(page.locator("#vehicle-use")).toHaveValue("PRIVATE");
+  await expect(page.locator("#fuel-type")).toHaveValue("GASOLINE");
+  await expect(page.locator("#efficiency")).toHaveValue("10");
+  await expect(page.locator("#parking-cost")).toHaveValue("5000");
+  await expect(page.locator("[data-sort='cost']")).toHaveAttribute("aria-selected", "true");
+
+  await page.getByRole("button", { name: "설정" }).click();
+  const dialog = page.getByRole("dialog", { name: "기본 설정" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("출장 시간(분)")).toHaveValue("300");
+  await expect(dialog.getByLabel("차량 구분")).toHaveValue("PRIVATE");
+  await expect(dialog.getByLabel("유종")).toHaveValue("GASOLINE");
+  await expect(dialog.getByLabel("연비(km/L)")).toHaveValue("10");
+  await expect(dialog.getByLabel("예상 주차비(원)")).toHaveValue("5000");
+  await page.getByRole("button", { name: "닫기" }).last().click();
+
+  await completePublicOfficialTrip(page);
+  await expect(page.getByRole("tab", { name: "비용순" })).toHaveAttribute("aria-selected", "true");
+});
+
+test("settings save and clearing default workplace send only the eight approved fields", async ({ page }) => {
+  await installAuthenticatedSettingsApi(page);
+  let savedPayload: Record<string, unknown> | null = null;
+  let csrf: string | undefined;
+  await page.route("**/api/v1/me/settings", async (route) => {
+    if (route.request().method() !== "PUT") return route.fallback();
+    savedPayload = JSON.parse(route.request().postData() || "{}") as Record<string, unknown>;
+    csrf = route.request().headers()["x-csrf-token"];
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        source: "SAVED",
+        settings: savedPayload,
+        resolvedDefaultOrigin: null,
+        warnings: [],
+      }),
+    });
+  });
+  await page.goto("/");
+  await expect(page.locator("#origin-selection")).toContainText("샘물공립초등학교");
+  await page.getByRole("button", { name: "설정" }).click();
+  const dialog = page.getByRole("dialog", { name: "기본 설정" });
+  await dialog.getByRole("button", { name: "현재 출발 기관을 기본 근무지로 사용" }).click();
+  await expect(dialog.locator("#settings-origin-summary")).toContainText("샘물공립초등학교");
+  await dialog.getByRole("button", { name: "기본 근무지 해제" }).click();
+  await dialog.getByLabel("출장 시간(분)").fill("420");
+  await dialog.getByLabel("차량 구분").selectOption("PRIVATE");
+  await dialog.getByLabel("유종").selectOption("DIESEL");
+  await dialog.getByLabel("연비(km/L)").fill("14.5");
+  await dialog.getByLabel("예상 주차비(원)").fill("3000");
+  await dialog.getByRole("radio", { name: "비용순" }).check();
+  await dialog.getByRole("button", { name: "설정 저장" }).click();
+
+  await expect.poll(() => savedPayload).toEqual({
+    defaultOriginSiteId: null,
+    defaultTripPattern: "ROUND_TRIP",
+    defaultDurationMinutes: 420,
+    vehicleUse: "PRIVATE",
+    fuelType: "DIESEL",
+    efficiencyKmPerLiter: 14.5,
+    parkingCostKrw: 3000,
+    routeSort: "cost",
+  });
+  expect(csrf).toBe("fixture-csrf-token");
+});
+
+test("exact server DEFAULT settings apply without browser-local guesses", async ({ page }) => {
+  await installAuthenticatedSettingsApi(page, {
+    settings: {
+      source: "DEFAULT",
+      settings: {
+        defaultOriginSiteId: null,
+        defaultTripPattern: "ROUND_TRIP",
+        defaultDurationMinutes: 300,
+        vehicleUse: "NONE",
+        fuelType: "GASOLINE",
+        efficiencyKmPerLiter: 10,
+        parkingCostKrw: 0,
+        routeSort: "time",
+      },
+      resolvedDefaultOrigin: null,
+      warnings: [],
+    },
+  });
+  await page.goto("/");
+  await expect(page.locator("#vehicle-use")).toHaveValue("NONE");
+  await expect(page.locator("#parking-cost")).toHaveValue("0");
+  await expect(page.locator("[data-sort='time']")).toHaveAttribute("aria-selected", "true");
+  await page.getByRole("button", { name: "설정" }).click();
+  await expect(page.getByRole("dialog", { name: "기본 설정" }).getByText("서버 기본값")).toBeVisible();
+});
+
+test("retention disclosure and delete-data confirmation keep public calculation available", async ({ page }) => {
+  await installAuthenticatedSettingsApi(page);
+  let deleteRequests = 0;
+  let deleteCsrf: string | undefined;
+  await page.route("**/api/v1/me/data", async (route) => {
+    deleteRequests += 1;
+    deleteCsrf = route.request().headers()["x-csrf-token"];
+    await route.fulfill({ status: 204 });
+  });
+  await page.goto("/");
+  await expect(page.locator("#notice")).toContainText("로그인하지 않은 계산은 저장하지 않습니다");
+  await expect(page.locator("#notice")).toContainText("정확히 168시간");
+  await expect(page.locator("#notice")).toContainText("내 데이터 삭제");
+  await expect(page.locator("#notice")).toContainText("검색어, 좌표, 경로 선");
+
+  await page.getByRole("button", { name: "설정" }).click();
+  await page.getByRole("button", { name: "내 데이터 삭제" }).click();
+  const confirmation = page.getByRole("dialog", { name: "내 데이터 삭제 확인" });
+  await expect(confirmation).toBeVisible();
+  expect(deleteRequests).toBe(0);
+  await confirmation.getByRole("button", { name: "내 데이터 삭제" }).click();
+  await expect.poll(() => deleteRequests).toBe(1);
+  expect(deleteCsrf).toBe("fixture-csrf-token");
+  await expect(page.getByRole("button", { name: "Kakao 로그인" })).toBeVisible();
+  await expect(page.getByLabel("출발 기관")).toBeEnabled();
+  await expect(page.getByLabel("출발 기관")).toHaveValue("");
+  await expect(page.locator("#vehicle-use")).toHaveValue("NONE");
+  await expect(page.locator("#parking-cost")).toHaveValue("0");
+  await expect(page.locator("[data-sort='time']")).toHaveAttribute("aria-selected", "true");
+});
+
+test("logout clears saved settings before returning to anonymous calculation", async ({ page }) => {
+  await installAuthenticatedSettingsApi(page);
+  await page.route("**/api/v1/auth/logout", (route) => route.fulfill({ status: 204 }));
+  await page.goto("/");
+  await expect(page.locator("#origin-selection")).toContainText("샘물공립초등학교");
+  await expect(page.locator("#vehicle-use")).toHaveValue("PRIVATE");
+  await page.getByRole("button", { name: "로그아웃" }).click();
+
+  await expect(page.getByRole("button", { name: "Kakao 로그인" })).toBeVisible();
+  await expect(page.getByLabel("출발 기관")).toHaveValue("");
+  await expect(page.getByRole("radio", { name: "일반 왕복" })).toBeChecked();
+  await expect(page.getByLabel("출장 시간 시간")).toHaveValue("4");
+  await expect(page.getByLabel("출장 시간 분")).toHaveValue("0");
+  await expect(page.locator("#vehicle-use")).toHaveValue("NONE");
+  await expect(page.locator("#fuel-type")).toHaveValue("GASOLINE");
+  await expect(page.locator("#efficiency")).toHaveValue("10");
+  await expect(page.locator("#parking-cost")).toHaveValue("0");
+  await expect(page.locator("[data-sort='time']")).toHaveAttribute("aria-selected", "true");
+});
+
+test("anonymous calculation remains intact when a delayed me response resolves", async ({ page }) => {
+  await installMockApi(page);
+  let releaseMe!: () => void;
+  let markMeSeen!: () => void;
+  const heldMe = new Promise<void>((resolve) => { releaseMe = resolve; });
+  const meSeen = new Promise<void>((resolve) => { markMeSeen = resolve; });
+  await page.route("**/api/v1/me", async (route) => {
+    markMeSeen();
+    await heldMe;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(readFixture("me-anonymous.json")),
+    });
+  });
+  await page.goto("/");
+  await meSeen;
+  try {
+    await completePublicOfficialTrip(page);
+    await expect(page.getByRole("heading", { name: "추천 경로" })).toBeVisible();
+    releaseMe();
+    await expect(page.getByText("로그인하지 않아도 계산할 수 있습니다.")).toBeVisible();
+    await expect(page.getByLabel("출발 기관")).toHaveValue("샘물공립초등학교");
+    await expect(page.getByLabel("출장지")).toHaveValue("서울특별시청");
+    await expect(page.getByRole("heading", { name: "추천 경로" })).toBeVisible();
+  } finally {
+    releaseMe();
+  }
+});
+
+test("settings dialog restores focus after Escape and fills the mobile viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await installAuthenticatedSettingsApi(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "메뉴 열기" }).click();
+  const trigger = page.getByRole("button", { name: "설정" });
+  await trigger.click();
+  const dialog = page.getByRole("dialog", { name: "기본 설정" });
+  await expect(dialog).toBeVisible();
+  expect(await dialog.evaluate((element) => element.getBoundingClientRect().width === window.innerWidth)).toBe(true);
+  await page.keyboard.press("Escape");
+  await expect(trigger).toBeFocused();
+});
 
 test("history draft requires a current destination selection", async ({ page }) => {
   await installAuthenticatedHistoryApi(page);

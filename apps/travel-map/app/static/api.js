@@ -76,6 +76,11 @@ export const api = {
   geodata: (name) => request(`/geodata/${name}`),
   me: (options = {}) => request("/me", options),
   settings: (options = {}) => request("/me/settings", options),
+  replaceSettings: (settings) => request("/me/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  }),
   history: ({ cursor = null, limit = 50 } = {}, options = {}) => request(`/me/history?${queryString({
     cursor,
     limit,

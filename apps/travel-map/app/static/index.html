@@ -206,7 +206,7 @@
     <footer id="notice" class="legal-notice">
       <p>⚠ 기관 위치는 경로 기준일 뿐 적용 법규를 정하지 않습니다</p>
       <p>예상액이며 지급 확정액이 아닙니다</p>
-      <small>입력한 검색어와 계산 조건은 이 화면을 벗어나 저장하지 않습니다.</small>
+      <small>로그인하지 않은 계산은 저장하지 않습니다. 로그인하면 계산 이력 중 필요한 최소 정보만 암호화해 정확히 168시간 보관하며, 설정은 “내 데이터 삭제” 전까지 유지합니다. 검색어, 좌표, 경로 선은 계산 이력에 저장하지 않습니다.</small>
     </footer>
     <dialog id="help-dialog" class="info-dialog" aria-labelledby="help-dialog-title">
       <div class="dialog-heading-row">
@@ -286,6 +286,79 @@
         <div class="history-dialog-actions">
           <button id="history-detail-recalculate" class="secondary-action" type="button">다시 계산</button>
           <button id="history-detail-delete" class="secondary-action history-delete" type="button">삭제</button>
+        </div>
+      </div>
+    </dialog>
+    <dialog id="settings-dialog" class="info-dialog" aria-labelledby="settings-dialog-title">
+      <div class="dialog-heading-row">
+        <h2 id="settings-dialog-title" data-dialog-heading tabindex="-1">기본 설정</h2>
+        <button id="settings-close-button" class="dialog-close" type="button" aria-label="닫기">닫기</button>
+      </div>
+      <form id="settings-form" class="dialog-content" novalidate>
+        <p id="settings-status" class="panel-status settings-status" role="status" aria-live="polite"></p>
+        <section aria-labelledby="settings-origin-title">
+          <h3 id="settings-origin-title">기본 근무지</h3>
+          <p id="settings-origin-summary">기본 근무지를 저장하지 않습니다.</p>
+          <div class="history-dialog-actions">
+            <button id="settings-use-current-origin" class="secondary-action" type="button">현재 출발 기관을 기본 근무지로 사용</button>
+            <button id="settings-clear-default-origin" class="secondary-action" type="button">기본 근무지 해제</button>
+          </div>
+        </section>
+        <fieldset class="settings-fieldset">
+          <legend>출장 기본값</legend>
+          <label for="settings-trip-pattern">기본 출장 형태</label>
+          <select id="settings-trip-pattern">
+            <option value="ROUND_TRIP">일반 왕복</option>
+            <option value="OUTBOUND_ONLY_END_AFTER_SCHEDULE">일정 후 퇴근</option>
+            <option value="RETURN_ONLY_DIRECT_TO_DESTINATION">출장지로 바로 출근 후 근무지 복귀</option>
+          </select>
+          <label>출장 시간(분)
+            <input id="settings-duration-minutes" type="number" min="2" max="1440" step="1" inputmode="numeric" required />
+          </label>
+          <label>차량 구분
+            <select id="settings-vehicle-use">
+              <option value="NONE">이용 안 함</option>
+              <option value="PRIVATE">자가용</option>
+              <option value="OFFICIAL_OR_RENTED">관용·임차 차량</option>
+              <option value="ASSIGNED_OFFICIAL">배정 관용차</option>
+            </select>
+          </label>
+          <label>유종
+            <select id="settings-fuel-type">
+              <option value="GASOLINE">휘발유</option>
+              <option value="DIESEL">경유</option>
+              <option value="LPG">LPG</option>
+            </select>
+          </label>
+          <label>연비(km/L)
+            <input id="settings-efficiency" type="number" min="3" max="30" step="0.1" inputmode="decimal" required />
+          </label>
+          <label>예상 주차비(원)
+            <input id="settings-parking-cost" type="number" min="0" max="100000" step="1" inputmode="numeric" required />
+          </label>
+          <fieldset class="settings-route-sort">
+            <legend>경로 정렬</legend>
+            <label><input type="radio" name="settings-route-sort" value="time" /> 시간순</label>
+            <label><input type="radio" name="settings-route-sort" value="distance" /> 거리순</label>
+            <label><input type="radio" name="settings-route-sort" value="cost" /> 비용순</label>
+          </fieldset>
+        </fieldset>
+        <div class="history-dialog-actions">
+          <button id="settings-save-button" class="primary-button" type="submit">설정 저장</button>
+          <button id="settings-delete-data-button" class="secondary-action history-delete" type="button">내 데이터 삭제</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="delete-data-dialog" class="info-dialog" aria-labelledby="delete-data-dialog-title">
+      <div class="dialog-heading-row">
+        <h2 id="delete-data-dialog-title" data-dialog-heading tabindex="-1">내 데이터 삭제 확인</h2>
+        <button id="delete-data-cancel-button" class="dialog-close" type="button" aria-label="취소">취소</button>
+      </div>
+      <div class="dialog-content">
+        <p>저장한 기본 설정과 보관 중인 계산 이력을 삭제하고 로그인 상태를 종료합니다. 이 작업은 되돌릴 수 없습니다.</p>
+        <div class="history-dialog-actions">
+          <button id="delete-data-confirm-button" class="secondary-action history-delete" type="button">내 데이터 삭제</button>
+          <button id="delete-data-keep-button" class="secondary-action" type="button">유지하기</button>
         </div>
       </div>
     </dialog>

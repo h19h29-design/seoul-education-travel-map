@@ -1,0 +1,32 @@
+{
+  "source": "SAVED",
+  "settings": {
+    "defaultOriginSiteId": "test-neis:B10:SEMWATER-ES:main",
+    "defaultTripPattern": "ROUND_TRIP",
+    "defaultDurationMinutes": 300,
+    "vehicleUse": "PRIVATE",
+    "fuelType": "GASOLINE",
+    "efficiencyKmPerLiter": 10,
+    "parkingCostKrw": 5000,
+    "routeSort": "cost"
+  },
+  "resolvedDefaultOrigin": {
+    "institutionId": "test-neis:B10:SEMWATER-ES",
+    "siteId": "test-neis:B10:SEMWATER-ES:main",
+    "officialName": "샘물공립초등학교",
+    "displayName": "샘물공립초등학교",
+    "institutionType": "ELEMENTARY_SCHOOL",
+    "foundationType": "PUBLIC",
+    "educationOffice": "SEOUL_EDU_SUPPORT_JUNGBU",
+    "roadAddress": "서울특별시 중구 샘물로 12",
+    "district": "중구",
+    "coordinate": {
+      "latitude": 37.56341,
+      "longitude": 126.98762
+    },
+    "coordinateQuality": "ROOFTOP",
+    "snapshotId": "fixture-001",
+    "snapshotAsOf": "2026-08-10"
+  },
+  "warnings": []
+}

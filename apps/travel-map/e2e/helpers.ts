@@ -275,6 +275,10 @@ export type AuthenticatedHistoryApiOptions = {
   };
 };
 
+export type AuthenticatedSettingsApiOptions = {
+  settings?: object;
+};
+
 export async function installAuthenticatedHistoryApi(
   page: Page,
   options: AuthenticatedHistoryApiOptions = {},
@@ -325,6 +329,17 @@ export async function installAuthenticatedHistoryApi(
   await page.route("**/api/v1/me", (route) => fulfillJson(
     route,
     readFixture("me-authenticated.json"),
+  ));
+}
+
+export async function installAuthenticatedSettingsApi(
+  page: Page,
+  options: AuthenticatedSettingsApiOptions = {},
+): Promise<void> {
+  await installAuthenticatedHistoryApi(page);
+  await page.route("**/api/v1/me/settings", (route) => fulfillJson(
+    route,
+    options.settings ?? readFixture("settings.json"),
   ));
 }
 

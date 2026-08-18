@@ -7,9 +7,20 @@ import { createHelpPanels } from "./help.js";
 import { createHistoryPanel } from "./history.js";
 import { createRouteResults } from "./route-results.js";
 import { createScheduleController } from "./schedule.js";
+import { createSettingsPanel } from "./settings.js";
 import { createTripForm } from "./trip-form.js";
 
 const $ = (selector) => document.querySelector(selector);
+const ANONYMOUS_PUBLIC_SETTINGS = Object.freeze({
+  defaultDurationMinutes: 4 * 60,
+  defaultOriginSiteId: null,
+  defaultTripPattern: "ROUND_TRIP",
+  efficiencyKmPerLiter: 10,
+  fuelType: "GASOLINE",
+  parkingCostKrw: 0,
+  routeSort: "time",
+  vehicleUse: "NONE",
+});
 const controls = {
   authStatus: $("#auth-status"),
   allowanceAmount: $("#allowance-amount"),
@@ -82,7 +93,9 @@ const controls = {
   tripPattern: [...document.querySelectorAll("input[name='trip-pattern']")],
   utilityNav: $("#utility-nav"),
   settingsButton: $("#settings-button"),
+  settingsDialog: $("#settings-dialog"),
   vehicleUse: $("#vehicle-use"),
+  deleteDataDialog: $("#delete-data-dialog"),
   boundaries: {
     seoul: $("#seoul-layer"),
     support: $("#support-layer"),
@@ -101,6 +114,8 @@ let previewRevision = 0;
 let destroyMobileMenu = () => {};
 let authController;
 let historyPanel;
+let settingsPanel;
+let appliedAuthenticatedSettings = false;
 let settingsRevision = 0;
 
 const helpPanels = createHelpPanels({
@@ -124,6 +139,22 @@ function invalidatePreview() {
   previewRevision += 1;
   routeResults.clear();
   controls.calculateButton.textContent = "▣ 경로 계산";
+}
+
+function setRouteSort(sort) {
+  routeResults.setSort(sort);
+  document.querySelectorAll("[data-sort]").forEach((tab) => {
+    tab.setAttribute("aria-selected", String(tab.dataset.sort === sort));
+  });
+}
+
+function resetAnonymousPublicSettings() {
+  institutionPicker.clear();
+  tripForm.applySettings(ANONYMOUS_PUBLIC_SETTINGS);
+  setRouteSort(ANONYMOUS_PUBLIC_SETTINGS.routeSort);
+  invalidatePreview();
+  updateCalculateAvailability();
+  appliedAuthenticatedSettings = false;
 }
 
 function seoulToday() {
@@ -243,18 +274,14 @@ tripForm = createTripForm({
 async function applyAuthenticatedSettings({ authenticated }) {
   const revision = ++settingsRevision;
   historyPanel?.setAuthenticated(authenticated);
-  if (!authenticated) return;
+  settingsPanel?.setAuthenticated(authenticated);
+  if (!authenticated) {
+    if (appliedAuthenticatedSettings) resetAnonymousPublicSettings();
+    return;
+  }
   try {
-    const response = await api.settings();
+    await settingsPanel?.load();
     if (revision !== settingsRevision || !authController.authenticated()) return;
-    if (!response?.settings || typeof response.settings !== "object") return;
-    tripForm.applySettings(response.settings, response.resolvedDefaultOrigin ?? null);
-    routeResults.setSort(response.settings.routeSort);
-    if (response.settings.defaultOriginSiteId && !response.resolvedDefaultOrigin) {
-      controls.originNote.textContent = "기본 근무지를 다시 선택하세요.";
-    }
-    invalidatePreview();
-    updateCalculateAvailability();
   } catch {
     if (revision !== settingsRevision || !authController.authenticated()) return;
     controls.originNote.textContent = "기본 설정을 불러오지 못했습니다. 직접 입력해 계산할 수 있습니다.";
@@ -302,6 +329,27 @@ historyPanel = createHistoryPanel({
   tripForm,
 });
 
+settingsPanel = createSettingsPanel({
+  api,
+  confirmationDialog: controls.deleteDataDialog,
+  deleteMyData: () => authController.deleteMyData(),
+  dialog: controls.settingsDialog,
+  institutionPicker,
+  isAuthenticated: () => authController.authenticated(),
+  onSettingsApplied: (response) => {
+    const settings = response.settings;
+    appliedAuthenticatedSettings = true;
+    tripForm.applySettings(settings, response.resolvedDefaultOrigin ?? null);
+    setRouteSort(settings.routeSort);
+    if (settings.defaultOriginSiteId && !response.resolvedDefaultOrigin) {
+      controls.originNote.textContent = "기본 근무지를 다시 선택하세요.";
+    }
+    invalidatePreview();
+    updateCalculateAvailability();
+  },
+  trigger: controls.settingsButton,
+});
+
 async function calculate(event) {
   event.preventDefault();
   if (!tripForm.valid()) {
@@ -342,10 +390,7 @@ async function calculate(event) {
 function bindSortTabs() {
   document.querySelectorAll("[data-sort]").forEach((tab) => {
     tab.addEventListener("click", () => {
-      routeResults.setSort(tab.dataset.sort);
-      document.querySelectorAll("[data-sort]").forEach((item) => {
-        item.setAttribute("aria-selected", String(item === tab));
-      });
+      setRouteSort(tab.dataset.sort);
     });
   });
 }
@@ -422,6 +467,7 @@ window.addEventListener("pagehide", () => {
   destinationPicker.destroy();
   helpPanels.destroy();
   historyPanel.destroy();
+  settingsPanel.destroy();
   authController.destroy();
   destroyMobileMenu();
 }, { once: true });

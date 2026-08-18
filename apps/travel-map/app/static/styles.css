@@ -250,6 +250,14 @@ input::placeholder { color: #9aa4b3; }
 .history-detail-content { display: grid; gap: 13px; }
 .history-detail-heading, .history-rule-summary { margin: 0; color: var(--navy); font-weight: 750; }
 .history-route-summary { display: grid; gap: 7px; margin: 0; padding-left: 21px; color: #435069; }
+.settings-status { margin: 0; }
+.settings-fieldset { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; border: 1px solid var(--line); border-radius: var(--radius); margin: 0; padding: 14px; }
+.settings-fieldset legend, .settings-route-sort legend { color: var(--navy); font-weight: 750; }
+.settings-fieldset > label { display: grid; gap: 6px; color: #435069; font-size: 13px; font-weight: 700; }
+.settings-fieldset select, .settings-fieldset input { width: 100%; min-height: 38px; }
+.settings-route-sort { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 10px; margin: 0; border: 0; padding: 0; }
+.settings-route-sort legend { width: 100%; }
+.settings-route-sort label { display: inline-flex; align-items: center; gap: 5px; color: #435069; font-size: 13px; }
 
 @media (max-width: 1120px) {
   .app-shell { grid-template-columns: minmax(400px, 44%) minmax(0, 56%); }
@@ -290,6 +298,7 @@ input::placeholder { color: #9aa4b3; }
   .legal-notice small { margin-left: 0; }
   .info-dialog { width: 100vw; max-width: none; height: 100dvh; max-height: none; border: 0; border-radius: 0; }
   .dialog-heading-row, .dialog-content { padding-left: 16px; padding-right: 16px; }
+  .settings-fieldset { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 380px) {
