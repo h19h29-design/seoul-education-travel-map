@@ -1254,6 +1254,113 @@ def test_release_gate_treats_a_post_completion_signal_as_interrupted() -> None:
     assert '[ "$interrupted" -eq 1 ]' in gate
 
 
+def test_ci_runs_every_warning_strict_release_check() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    publish = Path("apps/travel-map/deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
+    deploy = Path("apps/travel-map/deploy/nas/deploy-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(workflow.split())
+
+    assert "PYTHONWARNINGS: error" in workflow
+    assert "pytest apps/travel-map/tests -q" in normalized
+    assert "ruff check apps/travel-map" in normalized
+    assert (
+        "ruff format --check apps/travel-map/app apps/travel-map/tests "
+        "apps/travel-map/scripts" in normalized
+    )
+    assert "mypy apps/travel-map/app apps/travel-map/scripts" in normalized
+    assert "pnpm --dir apps/travel-map test:e2e" in normalized
+    assert "ghcr.io/h19h29-design/seoul-education-travel-map" in publish
+    assert "docker build" not in publish
+    assert "RepoDigests" in publish and "imagetools inspect" in publish
+    assert "release-gate.sh" in publish and "RELEASE_GATE_IMAGE_RECORD" in publish
+    assert "TRAVEL_MAP_MANIFEST_DIGEST" in deploy
+    assert "docker pull" in deploy and "migrate-user-database.sh" in deploy
+    assert "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" in deploy
+    assert "docker build" not in deploy
+    assert os.access(
+        Path("apps/travel-map/deploy/nas/publish-reviewed-image.sh"), os.X_OK
+    )
+    assert os.access(
+        Path("apps/travel-map/deploy/nas/deploy-reviewed-image.sh"), os.X_OK
+    )
+
+
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "latest",
+        "ghcr.io/h19h29-design/seoul-education-travel-map:latest",
+        "docker.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64,
+        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "A" * 64,
+        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 63,
+        "-ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64,
+    ),
+)
+def test_deploy_wrapper_rejects_tag_other_registry_and_malformed_digest(
+    reference: str,
+) -> None:
+    deploy = ROOT / "deploy/nas/deploy-reviewed-image.sh"
+
+    completed = subprocess.run(
+        [str(deploy), reference],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_INVALID_IMAGE_REFERENCE\n"
+
+
+def test_reviewed_image_handoff_binds_all_attestation_fields_without_rebuild() -> None:
+    publish = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert '[ "$#" -eq 2 ]' in publish
+    assert "RELEASE_GATE_IMAGE_RECORD=$record" in publish
+    assert '"$travel_root/scripts/release-gate.sh" >&2' in publish
+    assert "splitlines(keepends=True)" in publish
+    assert 'set(values) != {"imageTag", "imageId", "platform", "gitSha"}' in publish
+    assert "docker image inspect" in publish
+    assert "RepoDigests" in publish
+    assert "imagetools inspect --raw" in publish
+    assert "BLOCKED_REMOTE_IMAGE_MISMATCH" in publish
+    assert "docker build" not in publish
+
+
+def test_deploy_wrapper_preserves_a_valid_rollback_before_any_mutation() -> None:
+    deploy = (ROOT / "deploy/nas/deploy-reviewed-image.sh").read_text(encoding="utf-8")
+
+    assert "validate_image_env()" in deploy
+    assert 'validate_image_env "$image_env"' in deploy
+    assert 'cp -p "$image_env" "$previous_tmp"' in deploy
+    assert 'validate_image_env "$previous_env"' in deploy
+    assert '"$migration" "$reference"' in deploy
+    assert "TRAVEL_MAP_MANIFEST_DIGEST=%s" in deploy
+    assert 'docker compose --env-file "$image_env" -f "$compose" up -d' in deploy
+    assert "runtime.env" not in deploy
+    assert "docker build" not in deploy
+    assert deploy.index('cp -p "$image_env" "$previous_tmp"') < deploy.index(
+        '"$migration" "$reference"'
+    )
+
+
+def test_deploy_wrapper_treats_interruption_during_env_swap_as_failure() -> None:
+    deploy = (ROOT / "deploy/nas/deploy-reviewed-image.sh").read_text(encoding="utf-8")
+
+    assert "interrupted=0" in deploy
+    assert "interrupted_cleanup()" in deploy
+    assert "trap cleanup_tmp EXIT" in deploy
+    assert "trap interrupted_cleanup HUP INT TERM" in deploy
+    assert '[ "$interrupted" -eq 1 ]' in deploy
+
+
 def _run_smoke(
     extra_environment: dict[str, str],
     *,

@@ -32,8 +32,10 @@ jobs:
         env:
           PYTHONWARNINGS: error
         run: uv run --project apps/travel-map pytest apps/travel-map/tests -q
-      - name: Lint
-        run: uv run --project apps/travel-map ruff check apps/travel-map
+      - name: Lint and format
+        run: |
+          uv run --project apps/travel-map ruff check apps/travel-map
+          uv run --project apps/travel-map ruff format --check apps/travel-map/app apps/travel-map/tests apps/travel-map/scripts
       - name: Type check
         env:
           MYPYPATH: apps/travel-map
