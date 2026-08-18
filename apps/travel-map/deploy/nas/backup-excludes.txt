@@ -1,0 +1,4 @@
+/volume2/docker-1/seoul-education-travel-map/data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

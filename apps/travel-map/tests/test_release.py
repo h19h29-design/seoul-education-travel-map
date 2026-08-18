@@ -859,6 +859,300 @@ def test_root_gitignore_excludes_all_sqlite_user_database_artifacts() -> None:
     assert "*.sqlite3-shm" in gitignore
 
 
+def test_backup_assets_and_admin_runbook_define_private_data_boundary() -> None:
+    excludes = (
+        (ROOT / "deploy/nas/backup-excludes.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    verifier = (ROOT / "deploy/nas/verify-backup-exclusion.sh").read_text(
+        encoding="utf-8"
+    )
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert excludes == [
+        "/volume2/docker-1/seoul-education-travel-map/data/",
+        "*.sqlite3",
+        "*.sqlite3-wal",
+        "*.sqlite3-shm",
+    ]
+    assert "--job-config" in verifier and "--backup-root" in verifier
+    assert os.access(ROOT / "deploy/nas/verify-backup-exclusion.sh", os.X_OK)
+    assert (
+        "/volume2/docker-1/seoul-education-travel-map/data/travel-map.sqlite3" in readme
+    )
+    assert all(
+        name in readme
+        for name in (
+            "KAKAO_SUBJECT_HMAC_KEY",
+            "DATA_ENCRYPTION_KEY_V1",
+            "SESSION_HMAC_KEY",
+        )
+    )
+    assert "168시간" in readme and "travel.h19h19.com" in readme
+    assert "synology.me" not in readme.lower()
+
+
+def test_backup_verifier_rejects_malformed_paths_and_option_injection(
+    tmp_path: Path,
+) -> None:
+    verifier = ROOT / "deploy/nas/verify-backup-exclusion.sh"
+    job_config = tmp_path / "job-export.txt"
+    backup_root = tmp_path / "backup-root"
+    job_config.write_text("not used for malformed arguments\n", encoding="utf-8")
+    backup_root.mkdir()
+
+    cases = (
+        (
+            ("--job-config", "relative-export", "--backup-root", str(backup_root)),
+            "BLOCKED_INVALID_JOB_CONFIG_PATH",
+        ),
+        (
+            ("--job-config", str(job_config), "--backup-root", "/"),
+            "BLOCKED_INVALID_BACKUP_ROOT",
+        ),
+        (
+            ("--job-config", str(job_config), "--unexpected", str(backup_root)),
+            "BLOCKED_INVALID_ARGUMENTS",
+        ),
+    )
+    for arguments, expected_error in cases:
+        completed = subprocess.run(
+            [str(verifier), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert completed.stderr == f"{expected_error}\n"
+
+
+def test_backup_verifier_requires_the_active_job_to_reference_checked_out_excludes(
+    tmp_path: Path,
+) -> None:
+    verifier = ROOT / "deploy/nas/verify-backup-exclusion.sh"
+    job_config = tmp_path / "job-export.txt"
+    backup_root = tmp_path / "backup-root"
+    job_config.write_text(
+        "ACTIVE_EXCLUSION_FILE="
+        "/volume1/docker/seoul-education-travel-map/other-excludes.txt\n",
+        encoding="utf-8",
+    )
+    backup_root.mkdir()
+
+    completed = subprocess.run(
+        [
+            str(verifier),
+            "--job-config",
+            str(job_config),
+            "--backup-root",
+            str(backup_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_MISSING_ACTIVE_EXCLUSION_REFERENCE\n"
+
+
+def test_backup_verifier_rejects_a_job_reference_with_a_checked_out_path_suffix(
+    tmp_path: Path,
+) -> None:
+    verifier = ROOT / "deploy/nas/verify-backup-exclusion.sh"
+    excludes = (ROOT / "deploy/nas/backup-excludes.txt").resolve()
+    job_config = tmp_path / "job-export.txt"
+    backup_root = tmp_path / "backup-root"
+    job_config.write_text(f"active excludes: {excludes}.disabled\n", encoding="utf-8")
+    backup_root.mkdir()
+
+    completed = subprocess.run(
+        [
+            str(verifier),
+            "--job-config",
+            str(job_config),
+            "--backup-root",
+            str(backup_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_MISSING_ACTIVE_EXCLUSION_REFERENCE\n"
+
+
+def test_backup_verifier_rejects_stale_or_disabled_exact_exclusion_reference(
+    tmp_path: Path,
+) -> None:
+    verifier = ROOT / "deploy/nas/verify-backup-exclusion.sh"
+    excludes = (ROOT / "deploy/nas/backup-excludes.txt").resolve()
+    job_config = tmp_path / "job-export.txt"
+    backup_root = tmp_path / "backup-root"
+    job_config.write_text(
+        "# retired ACTIVE_EXCLUSION_FILE=" + str(excludes) + "\n"
+        "ACTIVE_EXCLUSION_FILE=/volume1/docker/other/backup-excludes.txt\n",
+        encoding="utf-8",
+    )
+    backup_root.mkdir()
+
+    completed = subprocess.run(
+        [
+            str(verifier),
+            "--job-config",
+            str(job_config),
+            "--backup-root",
+            str(backup_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_MISSING_ACTIVE_EXCLUSION_REFERENCE\n"
+
+
+def test_backup_verifier_rejects_duplicate_active_exclusion_reference(
+    tmp_path: Path,
+) -> None:
+    verifier = ROOT / "deploy/nas/verify-backup-exclusion.sh"
+    excludes = (ROOT / "deploy/nas/backup-excludes.txt").resolve()
+    job_config = tmp_path / "job-export.txt"
+    backup_root = tmp_path / "backup-root"
+    job_config.write_text(
+        f"ACTIVE_EXCLUSION_FILE={excludes}\n" * 2,
+        encoding="utf-8",
+    )
+    backup_root.mkdir()
+
+    completed = subprocess.run(
+        [
+            str(verifier),
+            "--job-config",
+            str(job_config),
+            "--backup-root",
+            str(backup_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_MISSING_ACTIVE_EXCLUSION_REFERENCE\n"
+
+
+def test_backup_verifier_rejects_another_active_exclusion_field(
+    tmp_path: Path,
+) -> None:
+    verifier = ROOT / "deploy/nas/verify-backup-exclusion.sh"
+    excludes = (ROOT / "deploy/nas/backup-excludes.txt").resolve()
+    job_config = tmp_path / "job-export.txt"
+    backup_root = tmp_path / "backup-root"
+    job_config.write_text(
+        f"ACTIVE_EXCLUSION_FILE={excludes}\n"
+        "ACTIVE_EXCLUSION_FILE=/volume1/docker/other/backup-excludes.txt\n",
+        encoding="utf-8",
+    )
+    backup_root.mkdir()
+
+    completed = subprocess.run(
+        [
+            str(verifier),
+            "--job-config",
+            str(job_config),
+            "--backup-root",
+            str(backup_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_MISSING_ACTIVE_EXCLUSION_REFERENCE\n"
+
+
+def test_backup_verifier_rejects_database_artifacts_in_destination(
+    tmp_path: Path,
+) -> None:
+    verifier = ROOT / "deploy/nas/verify-backup-exclusion.sh"
+    excludes = (ROOT / "deploy/nas/backup-excludes.txt").resolve()
+    job_config = tmp_path / "job-export.txt"
+    backup_root = tmp_path / "backup-root"
+    nested = backup_root / "incremental" / "data"
+    nested.mkdir(parents=True)
+    job_config.write_text(
+        f"ACTIVE_EXCLUSION_FILE={excludes}\n",
+        encoding="utf-8",
+    )
+    (nested / "travel-map.sqlite3-wal").write_bytes(b"test-only-database-marker")
+
+    completed = subprocess.run(
+        [
+            str(verifier),
+            "--job-config",
+            str(job_config),
+            "--backup-root",
+            str(backup_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_DATABASE_ARTIFACT_IN_BACKUP\n"
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ("other.sqlite3", "other.sqlite3-wal", "other.sqlite3-shm"),
+)
+def test_backup_verifier_rejects_every_sqlite_artifact_matching_exclusion_policy(
+    tmp_path: Path,
+    artifact_name: str,
+) -> None:
+    verifier = ROOT / "deploy/nas/verify-backup-exclusion.sh"
+    excludes = (ROOT / "deploy/nas/backup-excludes.txt").resolve()
+    job_config = tmp_path / "job-export.txt"
+    backup_root = tmp_path / "backup-root"
+    backup_root.mkdir()
+    job_config.write_text(
+        f"ACTIVE_EXCLUSION_FILE={excludes}\n",
+        encoding="utf-8",
+    )
+    (backup_root / artifact_name).write_bytes(b"test-only-database-marker")
+
+    completed = subprocess.run(
+        [
+            str(verifier),
+            "--job-config",
+            str(job_config),
+            "--backup-root",
+            str(backup_root),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_DATABASE_ARTIFACT_IN_BACKUP\n"
+
+
 def _run_smoke(
     extra_environment: dict[str, str],
     *,

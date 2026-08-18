@@ -206,113 +206,111 @@ docker run --rm --init -p 8080:8080 \
 
 ## NAS production operations (administrators only)
 
-The public NAS deployment is available at
-<https://travel.h19h19.com>. Cloudflare Tunnel is the only supported public
-entry point. The former `travel.h19h19.synology.me` endpoint is retained only
-as a temporary rollback path and must not be published as the service URL.
-GitHub
-[`h19h29-design/seoul-education-travel-map`](https://github.com/h19h29-design/seoul-education-travel-map)
-is the canonical source and GitLab
-[`h19h19/seoul-education-travel-map`](https://gitlab.aigov.go.kr/h19h19/seoul-education-travel-map)
-is its automated mirror. Do not build from the older monorepo checkout or from
-files copied out of a running container. GitHub Actions runs warning-strict
-Python tests, Ruff, mypy, and Playwright before a reviewed change is considered
-releasable.
+The only public origin and Kakao redirect/domain is
+<https://travel.h19h19.com>. Cloudflare Tunnel routes that origin to the local
+service at `127.0.0.1:18080`; never publish an alternate NAS hostname, including
+during rollback. Keep these operational details out of the public usage panel.
 
-Keep the stateless application and Docker image on SSD volume `/volume1`. The
-image is about 271 MiB and the allowlisted build context is about 3.3 MiB, so
-moving the live workload to the 10 TB archive volume would add latency without
-a meaningful capacity benefit. Keep recovery copies on `/volume2` instead:
+### Filesystem and runtime boundary
 
-- Compose: `/volume1/docker/seoul-education-travel-map/compose.yml`
-- Cloudflare Compose:
-  `/volume1/docker/seoul-education-travel-map/cloudflared-compose.yml`
-- Cloudflare tunnel token:
-  `/volume1/docker/seoul-education-travel-map/cloudflared-token`
-  (`0400`, owned by the connector UID; never print or copy its value)
-- Runtime secrets: `/volume1/docker/seoul-education-travel-map/runtime.env`
-  (`0600 root:root`)
-- Backups: `/volume2/docker-1/backups/seoul-education-travel-map/<UTC stamp>`
-  (`0700 root:root`; files `0600 root:root`)
-
-The Compose service binds only `127.0.0.1:18080`, uses a read-only root
-filesystem, drops all capabilities, and reaches the public internet only via
-the Cloudflare Tunnel connector. The connector named
-`seoul-education-travel-map-nas` routes `travel.h19h19.com` to
-`http://127.0.0.1:18080`, with a terminal HTTP 404 catch-all. Its tunnel ID is
-`46f538d4-52b1-4a7f-8b56-694c1050bdf3`. Pin the connector to
-`cloudflare/cloudflared@sha256:0aa26e284f05e6c77ae375b8c9c11d9eb6a448fb7bcd8d40f31cb6176189eb38`
-(`2026.8.2`) and keep its token outside Compose and Git. Configure Docker's
-`json-file` logger with `max-size: 10m` and `max-file: 5`. Do not remove the
-previous image until the replacement has passed health and route checks.
-
-The production allow-lists must name the Cloudflare hostname exactly:
+The application, fixed Compose file, immutable image state, and runtime
+environment stay below `/volume1/docker/seoul-education-travel-map`. The only
+user-data mount is:
 
 ```text
-ALLOWED_HOSTS=["127.0.0.1","localhost","travel.h19h19.com","travel.h19h19.synology.me"]
-ALLOWED_ORIGINS=["https://travel.h19h19.com","https://travel.h19h19.synology.me"]
+/volume2/docker-1/seoul-education-travel-map/data/travel-map.sqlite3
 ```
 
-The Synology values exist only to make rollback possible. Kakao Developers
-must allow the exact JavaScript SDK domain `https://travel.h19h19.com`; its
-REST key remains server-only.
+The directory is `0700`, the database/WAL/SHM files are `0600`, and all are
+owned by `10001:10001`. The application container has a read-only root, runs as
+UID/GID `10001`, and receives only `/data` as its writable bind mount; do not
+mount it into cloudflared or a backup job. Use the reviewed digest-only Compose
+asset on `/volume1`; `runtime.env`, `image.env`, and `previous-image.env` are
+regular, non-symlink `0600` files and are never copied into Git, images, logs,
+screenshots, reports, or shell arguments.
 
-For each update:
+The production settings use only these public endpoints:
 
-1. Confirm GitLab and GitHub `main` point to the same reviewed commit.
-2. Stage the allowlisted context with `prepare-release-context.py`, then build a
-   new immutable image tag containing the snapshot ID and short Git SHA. Set
-   `COPYFILE_DISABLE=1` when archiving or transferring the context from macOS,
-   and require `find <context> -name '._*' -o -name '.DS_Store'` to return no
-   paths before the Docker build.
-3. Copy `compose.yml` and the current `runtime.env`, and save the current image,
-   to a new
-   root-only backup directory on `/volume2`.
-4. Change only the image tag in Compose and run `docker compose up -d`.
-   Restart the Cloudflare connector separately only when its pinned image,
-   token, or remote ingress configuration changes.
-5. Require container health plus internal and public `/healthz`, HTTPS/TLS,
-   CSP, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`, and
-   the 30-case route review before removing any rollback asset. Confirm the
-   public response is served through Cloudflare and the Kakao map renders.
-   Triage browser console errors without weakening CSP. Also confirm the final image contains no
-   `._*`, `.DS_Store`, `.env`, tests, raw data, or build artifacts.
-6. To roll back, restore the preceding image tag in Compose and run
-   `docker compose up -d` again. If the tunnel itself is unavailable, enable
-   the retained Synology endpoint only for the rollback window rather than
-   changing the published service URL.
+```text
+PUBLIC_BASE_URL=https://travel.h19h19.com
+ALLOWED_HOSTS=["travel.h19h19.com","127.0.0.1","localhost"]
+ALLOWED_ORIGINS=["https://travel.h19h19.com"]
+```
 
-Useful non-secret checks on the NAS are:
+Record the observed Cloudflare connector socket peer as one exact `/32` or
+`/128` `TRUSTED_PROXY_CIDRS` value. Verify a spoofed forwarding header from an
+untrusted peer is ignored before accepting the connector configuration.
+
+### Login keys and retention
+
+Use a login-only Kakao application. `KAKAO_OIDC_CLIENT_ID` and its
+`KAKAO_OIDC_CLIENT_SECRET` configure OIDC; `KAKAO_REST_API_KEY` is the separate
+server-only route/place provider key. Register only
+`https://travel.h19h19.com/auth/kakao/callback`. Do not place any of those
+values in this document or a command history.
+
+Generate `KAKAO_SUBJECT_HMAC_KEY` and `DATA_ENCRYPTION_KEY_V1` exactly once and
+preserve both across routine deployment and rollback. Replacing the subject key
+disconnects existing users; replacing the data key makes settings and history
+undecryptable. Change either only through an explicit reviewed identity or
+re-encryption migration. `SESSION_HMAC_KEY` may rotate only with an announced
+all-session logout.
+
+Encrypted calculation history expires exactly 168시간 (168 hours) after creation.
+Encrypted settings remain only until the user chooses data deletion. The active
+NAS backup job must exclude this private directory and all `*.sqlite3`,
+`*.sqlite3-wal`, and `*.sqlite3-shm` files. These settings and history are
+intentionally not disaster-restored.
+
+### Reviewed installation, migration, and rollback
+
+Do not deploy without an existing immutable rollback digest for the running
+platform in `image.env`; a first deployment without that baseline is blocked.
+For a reviewed release, stage exactly these five NAS assets from the reviewed
+commit in a new private staging directory on `/volume1`:
+
+1. `compose.example.yml`
+2. `migrate-user-database.sh`
+3. `backup-excludes.txt`
+4. `verify-backup-exclusion.sh`
+5. `deploy-reviewed-image.sh`
+
+Compare each staged file's SHA-256 with the reviewed source, reject extra files
+and symlinks, run `sh -n` on scripts, then atomically install the Compose file,
+scripts, and exclusion file with their documented private modes. Do not copy or
+overwrite `runtime.env`, `image.env`, or `previous-image.env` in this step.
+
+The supported deploy wrapper validates and pulls one reviewed immutable GHCR
+digest, preserves the prior digest in `previous-image.env`, runs migration and
+schema verification before the container swap, then starts the fixed Compose
+configuration. The migration's private directory checks must pass before the
+swap. On failure, do not start the new image. Roll back only by restoring the
+preceding immutable image behind the same `travel.h19h19.com` Cloudflare route;
+never substitute a tag, a different repository, or a different public origin.
+
+Before the swap, run the read-only backup check with secret-free artifacts:
 
 ```sh
-docker compose -f /volume1/docker/seoul-education-travel-map/compose.yml ps
-docker compose -f /volume1/docker/seoul-education-travel-map/cloudflared-compose.yml ps
-curl -fsS -H 'Host: travel.h19h19.com' http://127.0.0.1:18080/healthz
-curl -fsS https://travel.h19h19.com/healthz
+verify-backup-exclusion.sh --job-config <absolute-job-export> \
+  --backup-root <absolute-backup-destination>
 ```
 
-The 2026-08-16 cutover backup is stored at
-`/volume2/docker-1/backups/seoul-education-travel-map/cloudflare-cutover-20260816T081726Z`.
-The deployed application image is
-`seoul-education-travel-map:20260814T004744Z-469c13f`; the Cloudflare connector
-has four active QUIC registrations under normal operation.
+The secret-free active-job export must include exactly one enabled line in this
+format, using the checked-out exclusion file's physical absolute path:
 
-Create a new `/volume2` backup after every runtime-secret rotation even if the
-application image is unchanged. Never copy a runtime environment file into the
-Git repository, Docker context, image, CI artifact, or administrator report.
+```text
+ACTIVE_EXCLUSION_FILE=/absolute/path/to/backup-excludes.txt
+```
 
-The 2026-08-14 30-case review covered all 25 Seoul districts, 11 institution
-types, three foundation types, two 12 km buffer cases, and one out-of-coverage
-case. Kakao transit, walk, and car routes remained available. The separate
-Seoul bus API still needs a key approved specifically for the public-data
-`ws.bus.go.kr` service, and the current Opinet key returns an empty price list;
-until those operator issues are resolved, the application keeps the Kakao
-routes and reports unavailable fuel cost as unknown rather than estimating it.
+The verifier fails closed for comments, disabled entries, suffixes, duplicate
+formats, or unsupported exports. It must print `BACKUP_EXCLUSION_OK`. If the
+active NAS job cannot provide a readable export or dry-run and an inspectable
+destination listing, record
+`BLOCKED_BACKUP_CONFIGURATION_UNVERIFIED` and keep deployment blocked; do not
+invent backup evidence.
 
-After the 2026-08-16 Cloudflare cutover, external verification confirmed DNS
-proxying, HTTP/2, `/healthz`, CSP and security headers, the Kakao map SDK with
-21 rendered tiles, institution/place lookup, and a live trip preview containing
-transit, car, and walk routes. Cloudflare's optional analytics beacon and one
-optional Kakao SDK inline style remain blocked by the strict CSP; the map and
-route features operate without relaxing that policy. This does not change the
-Seoul bus and Opinet limitations above.
+After a successful swap, smoke-test anonymous institution/address search and
+all three trip patterns, then login, default-workplace restore, history
+create/detail/delete, logout, and anonymous calculation after logout. Confirm a
+user-storage failure leaves anonymous calculation available while auth,
+history, and settings fail closed.
