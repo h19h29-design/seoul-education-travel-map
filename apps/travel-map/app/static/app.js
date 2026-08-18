@@ -4,6 +4,7 @@ import { createDestinationPicker } from "./destination-picker.js";
 import { createInstitutionPicker } from "./institution-picker.js";
 import { KakaoMapController } from "./kakao-map.js";
 import { createHelpPanels } from "./help.js";
+import { createHistoryPanel } from "./history.js";
 import { createRouteResults } from "./route-results.js";
 import { createScheduleController } from "./schedule.js";
 import { createTripForm } from "./trip-form.js";
@@ -37,6 +38,18 @@ const controls = {
   helpButton: $("#help-button"),
   helpDialog: $("#help-dialog"),
   historyButton: $("#history-button"),
+  historyCloseButton: $("#history-close-button"),
+  historyDeleteAllButton: $("#history-delete-all"),
+  historyDetailCloseButton: $("#history-detail-close-button"),
+  historyDetailDeleteButton: $("#history-detail-delete"),
+  historyDetailDialog: $("#history-detail-dialog"),
+  historyDetailRecalculateButton: $("#history-detail-recalculate"),
+  historyDetailContent: $("#history-detail-content"),
+  historyDialog: $("#history-dialog"),
+  historyLoadMore: $("#history-load-more"),
+  historyRows: $("#history-rows"),
+  historyStatus: $("#history-status"),
+  historyRecalculationStatus: $("#history-recalculation-status"),
   loginButton: $("#login-button"),
   logoutButton: $("#logout-button"),
   map: $("#map"),
@@ -87,6 +100,7 @@ let tripForm;
 let previewRevision = 0;
 let destroyMobileMenu = () => {};
 let authController;
+let historyPanel;
 let settingsRevision = 0;
 
 const helpPanels = createHelpPanels({
@@ -168,6 +182,8 @@ const institutionPicker = createInstitutionPicker({
     status: controls.originNote,
   },
   onSelectionChange: () => {
+    controls.historyRecalculationStatus.hidden = true;
+    controls.historyRecalculationStatus.textContent = "";
     invalidatePreview();
     updateCalculateAvailability();
     setFormError();
@@ -226,6 +242,7 @@ tripForm = createTripForm({
 
 async function applyAuthenticatedSettings({ authenticated }) {
   const revision = ++settingsRevision;
+  historyPanel?.setAuthenticated(authenticated);
   if (!authenticated) return;
   try {
     const response = await api.settings();
@@ -258,6 +275,33 @@ authController = createAuthController({
   onSessionChange: applyAuthenticatedSettings,
 });
 
+historyPanel = createHistoryPanel({
+  api,
+  elements: {
+    button: controls.historyButton,
+    closeButton: controls.historyCloseButton,
+    deleteAllButton: controls.historyDeleteAllButton,
+    detailCloseButton: controls.historyDetailCloseButton,
+    detailDeleteButton: controls.historyDetailDeleteButton,
+    detailContent: controls.historyDetailContent,
+    detailDialog: controls.historyDetailDialog,
+    detailRecalculateButton: controls.historyDetailRecalculateButton,
+    dialog: controls.historyDialog,
+    loadMore: controls.historyLoadMore,
+    rows: controls.historyRows,
+    status: controls.historyStatus,
+  },
+  onDraftApplied: () => {
+    controls.historyRecalculationStatus.hidden = false;
+    controls.historyRecalculationStatus.textContent = "출장지를 다시 선택하세요.";
+    invalidatePreview();
+    setFormError();
+    updateCalculateAvailability();
+    controls.destination.focus();
+  },
+  tripForm,
+});
+
 async function calculate(event) {
   event.preventDefault();
   if (!tripForm.valid()) {
@@ -282,6 +326,9 @@ async function calculate(event) {
     const preview = await api.preview(payload);
     if (!requestIsCurrent()) return;
     routeResults.render(preview, requestDestination);
+    if (!preview.warnings?.includes("HISTORY_NOT_SAVED")) {
+      historyPanel.refreshForSavedPreview();
+    }
   } catch (error) {
     if (!requestIsCurrent()) return;
     setFormError(errorMessage(error));
@@ -356,6 +403,7 @@ async function initialize() {
   bindMapControls();
   destroyMobileMenu = bindMobileMenu();
   helpPanels.initialize();
+  historyPanel.initialize();
   controls.otherTrips.addEventListener("change", updatePreviousAllowanceControl);
   updatePreviousAllowanceControl();
   updateCalculateAvailability();
@@ -373,6 +421,7 @@ window.addEventListener("pagehide", () => {
   institutionPicker.destroy();
   destinationPicker.destroy();
   helpPanels.destroy();
+  historyPanel.destroy();
   authController.destroy();
   destroyMobileMenu();
 }, { once: true });

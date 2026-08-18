@@ -1,0 +1,52 @@
+{
+  "item": {
+    "id": "AbCdEfGhIjKlMnOpQrStUv",
+    "calculatedAt": "2026-08-17T09:00:00.000000Z",
+    "expiresAt": "2026-08-24T09:00:00.000000Z",
+    "originName": "샘물공립초등학교",
+    "destinationName": "서울특별시청",
+    "tripPattern": "ROUND_TRIP",
+    "classification": "LOCAL",
+    "allowanceStatus": "ESTIMATED",
+    "allowanceKrw": 20000
+  },
+  "recalculationDraft": {
+    "originSiteId": "test-neis:B10:SEMWATER-ES:main",
+    "originName": "샘물공립초등학교",
+    "destinationName": "서울특별시청",
+    "destinationAddress": "서울특별시 중구 세종대로 110",
+    "tripPattern": "ROUND_TRIP",
+    "startsAt": "2026-08-17T09:00:00+09:00",
+    "endsAt": "2026-08-17T13:00:00+09:00"
+  },
+  "resolvedOrigin": {
+    "institutionId": "test-neis:B10:SEMWATER-ES",
+    "siteId": "test-neis:B10:SEMWATER-ES:main",
+    "officialName": "샘물공립초등학교",
+    "displayName": "샘물공립초등학교",
+    "institutionType": "ELEMENTARY_SCHOOL",
+    "foundationType": "PUBLIC",
+    "educationOffice": "SEOUL_EDU_SUPPORT_JUNGBU",
+    "roadAddress": "서울특별시 중구 샘물로 12",
+    "district": "중구",
+    "coordinate": {
+      "latitude": 37.56341,
+      "longitude": 126.98762
+    },
+    "coordinateQuality": "ROOFTOP",
+    "snapshotId": "fixture-001",
+    "snapshotAsOf": "2026-08-10"
+  },
+  "routeSummary": [
+    {
+      "direction": "OUTBOUND",
+      "mode": "CAR",
+      "durationSeconds": 2100,
+      "distanceMeters": 12400,
+      "mobilityCostKrw": 8500
+    }
+  ],
+  "ruleSetId": "2025-local-travel",
+  "effectiveFrom": "2025-01-01",
+  "warnings": []
+}

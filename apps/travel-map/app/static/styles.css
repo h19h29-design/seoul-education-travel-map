@@ -240,6 +240,16 @@ input::placeholder { color: #9aa4b3; }
 .policy-sources { display: flex; flex-wrap: wrap; gap: 10px; }
 .policy-sources a { color: #164fbc; font-weight: 750; }
 .panel-disclaimer { border-left: 3px solid var(--amber); background: var(--amber-weak); padding: 9px 10px; color: #75511a !important; font-size: 12px; }
+.history-rows { display: grid; gap: 10px; }
+.history-row { display: grid; gap: 7px; border: 1px solid var(--line); border-radius: var(--radius); background: #fbfcff; padding: 12px; }
+.history-row h3, .history-row p { margin: 0; }
+.history-row h3 { color: var(--navy); font-size: 14px; }
+.history-row p { color: var(--muted); font-size: 12px; }
+.history-actions, .history-dialog-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.history-delete { border-color: #e5b7b3; color: #a32b25; }
+.history-detail-content { display: grid; gap: 13px; }
+.history-detail-heading, .history-rule-summary { margin: 0; color: var(--navy); font-weight: 750; }
+.history-route-summary { display: grid; gap: 7px; margin: 0; padding-left: 21px; color: #435069; }
 
 @media (max-width: 1120px) {
   .app-shell { grid-template-columns: minmax(400px, 44%) minmax(0, 56%); }

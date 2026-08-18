@@ -268,6 +268,66 @@ export async function installMockApi(
   });
 }
 
+export type AuthenticatedHistoryApiOptions = {
+  historyPages?: {
+    afterCursor?: Record<string, object>;
+    first: object;
+  };
+};
+
+export async function installAuthenticatedHistoryApi(
+  page: Page,
+  options: AuthenticatedHistoryApiOptions = {},
+): Promise<void> {
+  await page.addInitScript(() => {
+    Object.defineProperty(document, "cookie", {
+      configurable: true,
+      get: () => "__Host-travel_csrf=fixture-csrf-token",
+    });
+  });
+  await installMockApi(page);
+  await page.route("**/api/v1/me/history**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/v1/me/history" && request.method() === "GET") {
+      const cursor = new URL(request.url()).searchParams.get("cursor");
+      const payload = cursor === null
+        ? options.historyPages?.first ?? readFixture("history.json")
+        : options.historyPages?.afterCursor?.[cursor] ?? { items: [], nextCursor: null };
+      return fulfillJson(route, payload);
+    }
+    if (path === "/api/v1/me/history" && request.method() === "DELETE") {
+      return route.fulfill({ status: 204 });
+    }
+    if (path.startsWith("/api/v1/me/history/") && request.method() === "GET") {
+      return fulfillJson(route, readFixture("history-detail.json"));
+    }
+    if (path.startsWith("/api/v1/me/history/") && request.method() === "DELETE") {
+      return route.fulfill({ status: 204 });
+    }
+    return route.fallback();
+  });
+  await page.route("**/api/v1/me/settings", (route) => fulfillJson(route, {
+    resolvedDefaultOrigin: null,
+    settings: {
+      defaultDurationMinutes: 240,
+      defaultOriginSiteId: null,
+      defaultTripPattern: "ROUND_TRIP",
+      efficiencyKmPerLiter: 10,
+      fuelType: "GASOLINE",
+      parkingCostKrw: 0,
+      routeSort: "time",
+      vehicleUse: "NONE",
+    },
+    source: "DEFAULT",
+    warnings: [],
+  }));
+  await page.route("**/api/v1/me", (route) => fulfillJson(
+    route,
+    readFixture("me-authenticated.json"),
+  ));
+}
+
 export async function mapState(page: Page): Promise<MapState> {
   return page.evaluate(() => {
     const task8Window = window as typeof window & {

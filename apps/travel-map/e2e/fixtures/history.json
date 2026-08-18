@@ -1,0 +1,16 @@
+{
+  "items": [
+    {
+      "id": "AbCdEfGhIjKlMnOpQrStUv",
+      "calculatedAt": "2026-08-17T09:00:00.000000Z",
+      "expiresAt": "2026-08-24T09:00:00.000000Z",
+      "originName": "샘물공립초등학교",
+      "destinationName": "서울특별시청",
+      "tripPattern": "ROUND_TRIP",
+      "classification": "LOCAL",
+      "allowanceStatus": "ESTIMATED",
+      "allowanceKrw": 20000
+    }
+  ],
+  "nextCursor": null
+}

@@ -76,6 +76,13 @@ export const api = {
   geodata: (name) => request(`/geodata/${name}`),
   me: (options = {}) => request("/me", options),
   settings: (options = {}) => request("/me/settings", options),
+  history: ({ cursor = null, limit = 50 } = {}, options = {}) => request(`/me/history?${queryString({
+    cursor,
+    limit,
+  })}`, options),
+  historyDetail: (id, options = {}) => request(`/me/history/${encodeURIComponent(id)}`, options),
+  deleteHistory: (id) => request(`/me/history/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  deleteAllHistory: () => request("/me/history", { method: "DELETE" }),
   logout: () => request("/auth/logout", { method: "POST" }),
   deleteMyData: () => request("/me/data", { method: "DELETE" }),
 };
