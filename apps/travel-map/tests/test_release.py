@@ -1153,6 +1153,107 @@ def test_backup_verifier_rejects_every_sqlite_artifact_matching_exclusion_policy
     assert completed.stderr == "BLOCKED_DATABASE_ARTIFACT_IN_BACKUP\n"
 
 
+def test_release_gate_uses_bounded_helpers_and_real_encrypted_storage() -> None:
+    gate = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+
+    assert "--cap-drop ALL --cap-add CHOWN --cap-add FOWNER" in gate
+    assert "--user 10001:10001" in gate
+    assert "--network none" in gate and "--read-only" in gate
+    assert all(
+        name in gate
+        for name in (
+            "PayloadCipher",
+            "UserSettingsRepository",
+            "HistoryRepository",
+            "ENCRYPTED_STORAGE_SMOKE_OK",
+            "BLOCKED_PLAINTEXT_IN_STORAGE",
+            "RELEASE_GATE_IMAGE_RECORD",
+            "imageId=",
+            "gitSha=",
+        )
+    )
+    assert "sudo" not in gate
+
+
+def test_release_gate_attestation_is_canonical_atomic_and_platform_bound() -> None:
+    gate = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+
+    assert 'case "${NAS_PLATFORM:-}" in' in gate
+    assert "linux/amd64|linux/arm64" in gate
+    assert 'docker buildx build --platform "$NAS_PLATFORM"' in gate
+    assert '--build-arg SNAPSHOT_ID="$snapshot_id"' in gate
+    assert '--load --tag "$gate_image"' in gate
+    assert "RELEASE_GATE_IMAGE_RECORD" in gate
+    assert "gated-image.record" in gate
+    assert "os.fsync" in gate and "os.replace" in gate and "0o600" in gate
+    assert "imageTag={image_tag}" in gate
+    assert "imageId=sha256:" in gate
+    assert "platform={platform}" in gate
+    assert "gitSha={git_sha}" in gate
+
+
+def test_release_gate_cleanup_and_storage_probe_are_narrow_and_secret_safe() -> None:
+    gate = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+
+    assert "gate_data=$gate_parent/data" in gate
+    assert '[ "$gate_data" = "$gate_parent/data" ]' in gate
+    assert "find /data -mindepth 1 -depth -delete" in gate
+    assert (
+        "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10001,gid=10001"
+        in gate
+    )
+    assert "http://127.0.0.1:8080/healthz" in gate
+    assert "storage_sentinel=" in gate
+    assert 'docker logs "$gate_container"' in gate
+    assert 'grep -aF -q -- "$value"' in gate
+    assert "BLOCKED_PLAINTEXT_IN_STORAGE" in gate
+    assert "rm -rf" not in gate
+    assert "sudo" not in gate
+    assert "eval " not in gate
+
+
+def test_release_gate_executes_its_health_and_file_mode_heredocs() -> None:
+    gate = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+
+    assert gate.count("docker exec -i \"$gate_container\" python - <<'PY'") == 2
+
+
+def test_release_gate_refuses_to_attest_a_dirty_source_tree() -> None:
+    gate = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+
+    assert "git diff --quiet --ignore-submodules --" in gate
+    assert "git diff --cached --quiet --ignore-submodules --" in gate
+    assert "git ls-files --others --exclude-standard" in gate
+    assert "BLOCKED_DIRTY_RELEASE_SOURCE" in gate
+
+
+def test_release_gate_encrypts_the_sentinel_through_settings_and_history() -> None:
+    gate = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+
+    assert "replace(DEFAULT_USER_SETTINGS, default_origin_site_id=sentinel)" in gate
+    assert "assert await settings.get(user_id=user.id) == settings_value" in gate
+    assert "destination_address=sentinel" in gate
+    assert "BLOCKED_PLAINTEXT_IN_STORAGE" in gate
+
+
+def test_release_gate_removes_an_uncommitted_attestation_on_interruption() -> None:
+    gate = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+
+    assert "gate_completed=0" in gate
+    assert "remove_unfinished_record" in gate
+    assert '[ "$gate_completed" -ne 1 ]' in gate
+
+
+def test_release_gate_treats_a_post_completion_signal_as_interrupted() -> None:
+    gate = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+
+    assert "interrupted=0" in gate
+    assert "interrupted_cleanup()" in gate
+    assert "trap cleanup EXIT" in gate
+    assert "trap interrupted_cleanup HUP INT TERM" in gate
+    assert '[ "$interrupted" -eq 1 ]' in gate
+
+
 def _run_smoke(
     extra_environment: dict[str, str],
     *,
