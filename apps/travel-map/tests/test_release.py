@@ -1275,7 +1275,8 @@ def test_ci_runs_every_warning_strict_release_check() -> None:
     assert "pnpm --dir apps/travel-map test:e2e" in normalized
     assert "ghcr.io/h19h29-design/seoul-education-travel-map" in publish
     assert "docker build" not in publish
-    assert "RepoDigests" in publish and "imagetools inspect" in publish
+    assert "imagetools inspect --format" in publish
+    assert "imagetools inspect --raw" in publish
     assert "release-gate.sh" in publish and "RELEASE_GATE_IMAGE_RECORD" in publish
     assert "TRAVEL_MAP_MANIFEST_DIGEST" in deploy
     assert "docker pull" in deploy and "migrate-user-database.sh" in deploy
@@ -1328,10 +1329,866 @@ def test_reviewed_image_handoff_binds_all_attestation_fields_without_rebuild() -
     assert "splitlines(keepends=True)" in publish
     assert 'set(values) != {"imageTag", "imageId", "platform", "gitSha"}' in publish
     assert "docker image inspect" in publish
-    assert "RepoDigests" in publish
+    assert "image_id_hex=${image_id#sha256:}" in publish
+    assert "publish_tag=$git_sha-sha256-$image_id_hex" in publish
+    assert '[ "${#publish_tag}" -le 128 ]' in publish
+    assert "tagged=$registry:$publish_tag" in publish
+    assert 'docker tag "$image_id" "$tagged"' in publish
+    assert "imagetools inspect --format" in publish
     assert "imagetools inspect --raw" in publish
     assert "BLOCKED_REMOTE_IMAGE_MISMATCH" in publish
     assert "docker build" not in publish
+
+
+def test_publish_reviewed_image_uses_one_validated_canonical_lock_root() -> None:
+    publish = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "lock_parent=/tmp/travel-map-publish-locks-$publisher_uid" in publish
+    assert "publisher_uid=$(/usr/bin/id -u 2>/dev/null)" in publish
+    assert "/usr/bin/python3 -I -S" in publish
+    assert '/bin/mkdir -m 0700 "$lock_parent"' in publish
+    assert '(umask 077 && /bin/mkdir "$lock_directory")' in publish
+    assert '/bin/rmdir "$lock_directory"' in publish
+    assert 'validate_private_directory "$lock_parent"' in publish
+    assert "details = Path(sys.argv[1]).lstat()" in publish
+    assert "not stat.S_ISDIR(details.st_mode)" in publish
+    assert "stat.S_IMODE(details.st_mode) != 0o700" in publish
+    assert "details.st_uid != os.getuid()" in publish
+    assert "${TMPDIR:-/tmp}/travel-map-publish-locks" not in publish
+
+
+PUBLISH_GIT_SHA = "1" * 40
+PUBLISH_REGISTRY = "ghcr.io/h19h29-design/seoul-education-travel-map"
+OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
+DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
+IN_TOTO_LAYER = "application/vnd.in-toto+json"
+
+
+def _remote_descriptor(digest: str, media_type: str) -> dict[str, object]:
+    return {"mediaType": media_type, "digest": digest, "size": 1024}
+
+
+def _image_manifest(
+    config_digest: str,
+    *,
+    attestation: bool = False,
+) -> dict[str, object]:
+    layer_media_type = (
+        IN_TOTO_LAYER if attestation else "application/vnd.oci.image.layer.v1.tar+gzip"
+    )
+    return {
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "config": {
+            "mediaType": OCI_CONFIG,
+            "digest": config_digest,
+            "size": 256,
+        },
+        "layers": [
+            {
+                "mediaType": layer_media_type,
+                "digest": "sha256:" + ("9" if attestation else "8") * 64,
+                "size": 512,
+            }
+        ],
+    }
+
+
+def _index_manifest(
+    runnable_descriptors: list[tuple[str, str]],
+    *,
+    attestation_digest: str | None = None,
+    attestation_link: str | None = None,
+) -> dict[str, object]:
+    manifests: list[dict[str, object]] = [
+        {
+            **_remote_descriptor(digest, OCI_MANIFEST),
+            "platform": {
+                "os": platform.partition("/")[0],
+                "architecture": platform.partition("/")[2],
+            },
+        }
+        for digest, platform in runnable_descriptors
+    ]
+    if attestation_digest is not None:
+        if attestation_link is None:
+            raise ValueError("an attestation digest requires its runnable link")
+        manifests.append(
+            {
+                **_remote_descriptor(attestation_digest, OCI_MANIFEST),
+                "platform": {"os": "unknown", "architecture": "unknown"},
+                "annotations": {
+                    "vnd.docker.reference.digest": attestation_link,
+                    "vnd.docker.reference.type": "attestation-manifest",
+                },
+            }
+        )
+    elif attestation_link is not None:
+        raise ValueError("an attestation link requires its descriptor")
+    return {"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": manifests}
+
+
+def _write_publish_test_double(path: Path) -> None:
+    path.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+scenario_path = Path(os.environ["FAKE_DOCKER_SCENARIO"])
+state_path = Path(os.environ["FAKE_DOCKER_STATE"])
+scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
+if state_path.exists():
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+else:
+    state = {
+        "image_inspects": {},
+        "image_configs": [],
+        "tag_lookup_attempts": 0,
+        "tag_resolutions": 0,
+        "immutable_resolutions": {},
+        "raw_digests": [],
+        "tag_created": False,
+        "tag_overwrites": 0,
+        "tagged": False,
+        "current_tag_id": None,
+        "pushed": False,
+    }
+
+
+def persist() -> None:
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def fail(message: str) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(91)
+
+
+args = sys.argv[1:]
+if len(args) == 6 and args[:2] == ["image", "ls"]:
+    if args[2:5] != ["--quiet", "--no-trunc", "--filter"]:
+        fail("unexpected local tag preflight")
+    reference = args[5].removeprefix("reference=")
+    if reference != scenario["tagged_reference"]:
+        fail("publisher checked an unexpected local tag")
+    if scenario["local_tag_exists"]:
+        print(scenario["expected_tag_source"])
+    elif state["tagged"]:
+        print(state["current_tag_id"])
+elif len(args) == 5 and args[:3] == ["image", "inspect", "--format"]:
+    reference = args[4]
+    sequence = scenario["local_inspects"].get(reference)
+    if not sequence:
+        fail("unexpected image inspect reference")
+    index = state["image_inspects"].get(reference, 0)
+    if index >= len(sequence):
+        fail("unexpected repeated image inspect")
+    state["image_inspects"][reference] = index + 1
+    persist()
+    inspected = sequence[index]
+    print(f"{inspected['id']} {inspected['platform']}")
+elif len(args) == 3 and args[0] == "tag":
+    if scenario["forbid_tag"]:
+        fail("publisher attempted to overwrite an existing tag")
+    if args[1] != scenario["expected_tag_source"]:
+        fail("publisher did not tag the captured image id")
+    if args[2] != scenario["tagged_reference"]:
+        fail("publisher used an unexpected destination tag")
+    if scenario["local_tag_race"]:
+        state["tagged"] = True
+        state["current_tag_id"] = "sha256:" + "0" * 64
+        state["tag_overwrites"] += 1
+        persist()
+    state["tag_created"] = True
+    state["tagged"] = True
+    state["current_tag_id"] = scenario["expected_tag_source"]
+    persist()
+elif len(args) == 2 and args[0] == "push":
+    if scenario["forbid_push"]:
+        fail("publisher attempted a forbidden push")
+    if args[1] != scenario["tagged_reference"] or not state["tagged"]:
+        fail("publisher pushed an unverified tag")
+    state["pushed"] = True
+    persist()
+elif len(args) >= 4 and args[:3] == ["buildx", "imagetools", "inspect"]:
+    if args[3] == "--raw" and len(args) == 5:
+        reference = args[4]
+        if "@" not in reference:
+            fail("raw inspection did not use an immutable digest")
+        digest = reference.partition("@")[2]
+        payload = scenario["raw_by_digest"].get(digest)
+        if payload is None:
+            fail("unexpected raw digest")
+        state["raw_digests"].append(digest)
+        persist()
+        print(json.dumps(payload, separators=(",", ":")))
+    elif len(args) == 6 and args[3:5] == ["--format", "{{json .Image}}"]:
+        reference = args[5]
+        if "@" not in reference:
+            fail("image config inspection did not use an immutable digest")
+        digest = reference.partition("@")[2]
+        payload = scenario["image_by_digest"].get(digest)
+        if payload is None:
+            fail("unexpected image config digest")
+        state["image_configs"].append(digest)
+        persist()
+        print(json.dumps(payload, separators=(",", ":")))
+    elif (
+        len(args) == 6
+        and args[3] == "--format"
+        and args[4] == "{{json .Manifest}}"
+    ):
+        reference = args[5]
+        if "@" in reference:
+            digest = reference.partition("@")[2]
+            payload = scenario["immutable_descriptors"].get(digest)
+            if payload is None:
+                fail("unexpected immutable descriptor")
+            count = state["immutable_resolutions"].get(digest, 0)
+            state["immutable_resolutions"][digest] = count + 1
+        else:
+            state["tag_lookup_attempts"] += 1
+            lookup_mode = scenario["remote_lookup_mode"]
+            if lookup_mode == "missing" and not state["pushed"]:
+                persist()
+                print(f"ERROR: {reference}: not found", file=sys.stderr)
+                raise SystemExit(1)
+            if lookup_mode == "race-before-push":
+                if state["tag_lookup_attempts"] == 1:
+                    persist()
+                    print(f"ERROR: {reference}: not found", file=sys.stderr)
+                    raise SystemExit(1)
+                if not state["tag_created"]:
+                    fail("publisher did not recheck the remote tag immediately before push")
+            if lookup_mode == "ambiguous":
+                persist()
+                print("ERROR: request failed: network timeout", file=sys.stderr)
+                raise SystemExit(1)
+            index = state["tag_resolutions"]
+            descriptors = scenario["tag_descriptors"]
+            if index >= len(descriptors):
+                fail("unexpected repeated tag resolution")
+            payload = descriptors[index]
+            state["tag_resolutions"] = index + 1
+        persist()
+        print(json.dumps(payload, separators=(",", ":")))
+    else:
+        fail("unexpected imagetools inspection")
+elif len(args) == 3 and args[:2] == ["image", "rm"]:
+    reference = args[2]
+    if reference == scenario["tagged_reference"]:
+        if scenario["local_tag_exists"] or (
+            state["current_tag_id"] is not None
+            and state["current_tag_id"] != scenario["expected_tag_source"]
+        ):
+            fail("publisher removed a pre-existing local tag")
+        state["tagged"] = False
+        state["current_tag_id"] = None
+        persist()
+    if reference == scenario["image_tag_reference"] and scenario["expect_success"]:
+        required_raw = set(scenario["required_raw_digests"])
+        required_images = set(scenario["required_image_digests"])
+        if (
+            state["tag_created"] != scenario["expect_push"]
+            or state["tag_overwrites"] != int(scenario["local_tag_race"])
+            or state["pushed"] != scenario["expect_push"]
+            or state["tag_lookup_attempts"]
+            != scenario["expected_tag_lookup_attempts"]
+            or state["tag_resolutions"] != 2
+            or state["immutable_resolutions"].get(scenario["root_digest"], 0) != 1
+            or not required_raw.issubset(state["raw_digests"])
+            or not required_images.issubset(state["image_configs"])
+        ):
+            fail("publisher skipped a required identity recheck")
+else:
+    fail("unexpected docker command")
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _run_publish_reviewed_image(
+    tmp_path: Path,
+    *,
+    image_id: str,
+    remote_digest: str,
+    root_manifest: dict[str, object],
+    raw_children: dict[str, dict[str, object]] | None = None,
+    image_configs: dict[str, dict[str, object]] | None = None,
+    local_tag_ids: tuple[str, ...] | None = None,
+    tag_descriptors: list[dict[str, object]] | None = None,
+    immutable_descriptor: dict[str, object] | None = None,
+    remote_lookup_mode: str = "missing",
+    local_tag_exists: bool = False,
+    local_tag_race: bool = False,
+    ambient_lock_stale: bool = False,
+    git_sha: str = PUBLISH_GIT_SHA,
+    expect_success: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    test_root = tmp_path / "travel-map"
+    publisher = test_root / "deploy/nas/publish-reviewed-image.sh"
+    publisher.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "deploy/nas/publish-reviewed-image.sh", publisher)
+
+    release_gate = test_root / "scripts/release-gate.sh"
+    release_gate.parent.mkdir(parents=True)
+    release_gate.write_text(
+        """#!/bin/sh
+set -eu
+(umask 077 && printf 'imageTag=seoul-education-travel-map:release-gate-%s\\nimageId=%s\\nplatform=%s\\ngitSha=%s\\n' "$EXPECTED_PUBLISH_SHA" "$FAKE_IMAGE_ID" "$NAS_PLATFORM" "$EXPECTED_PUBLISH_SHA" > "$RELEASE_GATE_IMAGE_RECORD")
+chmod 0600 "$RELEASE_GATE_IMAGE_RECORD"
+""",
+        encoding="utf-8",
+    )
+    release_gate.chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "python3").symlink_to(sys.executable)
+    _write_publish_test_double(fake_bin / "docker")
+
+    image_tag = f"seoul-education-travel-map:release-gate-{git_sha}"
+    image_id_hex = image_id.removeprefix("sha256:")
+    tagged_reference = f"{PUBLISH_REGISTRY}:{git_sha}-sha256-{image_id_hex}"
+    platform = "linux/amd64"
+    inspect = lambda value: {"id": value, "platform": platform}
+    root_media_type = str(root_manifest["mediaType"])
+    raw_by_digest = {remote_digest: root_manifest, **(raw_children or {})}
+    descriptors = tag_descriptors or [
+        _remote_descriptor(remote_digest, root_media_type),
+        _remote_descriptor(remote_digest, root_media_type),
+    ]
+    tag_id_sequence = local_tag_ids or (image_id, image_id)
+    scenario = {
+        "local_inspects": {
+            image_tag: [inspect(value) for value in tag_id_sequence],
+            image_id: [inspect(image_id)],
+            tagged_reference: [inspect(image_id)],
+        },
+        "image_tag_reference": image_tag,
+        "local_tag_exists": local_tag_exists,
+        "local_tag_race": local_tag_race,
+        "forbid_tag": local_tag_exists
+        or remote_lookup_mode in {"existing", "ambiguous"},
+        "forbid_push": remote_lookup_mode != "missing",
+        "remote_lookup_mode": remote_lookup_mode,
+        "expected_tag_source": image_id,
+        "tagged_reference": tagged_reference,
+        "tag_descriptors": descriptors,
+        "immutable_descriptors": {
+            remote_digest: immutable_descriptor
+            or _remote_descriptor(remote_digest, root_media_type)
+        },
+        "raw_by_digest": raw_by_digest,
+        "image_by_digest": image_configs or {},
+        "root_digest": remote_digest,
+        "required_raw_digests": list(raw_by_digest),
+        "required_image_digests": list(image_configs or {}),
+        "expect_push": remote_lookup_mode == "missing",
+        "expected_tag_lookup_attempts": 4 if remote_lookup_mode == "missing" else 2,
+        "expect_success": expect_success,
+    }
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+            "EXPECTED_PUBLISH_SHA": git_sha,
+            "FAKE_IMAGE_ID": image_id,
+            "FAKE_DOCKER_SCENARIO": str(scenario_path),
+            "FAKE_DOCKER_STATE": str(tmp_path / "docker-state.json"),
+        }
+    )
+    ambient_lock_directory = None
+    if ambient_lock_stale:
+        ambient_tmpdir = Path(environment.get("TMPDIR", str(tmp_path)))
+        environment["TMPDIR"] = str(ambient_tmpdir)
+        ambient_lock_parent = ambient_tmpdir / f"travel-map-publish-locks-{os.getuid()}"
+        ambient_lock_parent.mkdir(mode=0o700, exist_ok=True)
+        ambient_lock_directory = ambient_lock_parent / git_sha
+        ambient_lock_directory.mkdir(mode=0o700)
+    try:
+        return subprocess.run(
+            [str(publisher), git_sha, platform],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+    finally:
+        if ambient_lock_directory is not None:
+            ambient_lock_directory.rmdir()
+
+
+def test_publish_reviewed_image_accepts_classic_config_digest_identity(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        expect_success=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == f"{PUBLISH_REGISTRY}@{remote_digest}\n"
+    assert completed.stderr == ""
+
+
+def test_publish_reviewed_image_accepts_containerd_index_with_linked_attestation(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "c" * 64
+    runnable_digest = "sha256:" + "d" * 64
+    attestation_digest = "sha256:" + "e" * 64
+    runnable_config = "sha256:" + "f" * 64
+    attestation_config = "sha256:" + "7" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=image_id,
+        root_manifest=_index_manifest(
+            [(runnable_digest, "linux/amd64")],
+            attestation_digest=attestation_digest,
+            attestation_link=runnable_digest,
+        ),
+        raw_children={
+            runnable_digest: _image_manifest(runnable_config),
+            attestation_digest: _image_manifest(
+                attestation_config,
+                attestation=True,
+            ),
+        },
+        image_configs={runnable_digest: {"architecture": "amd64", "os": "linux"}},
+        expect_success=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == f"{PUBLISH_REGISTRY}@{image_id}\n"
+    assert completed.stderr == ""
+
+
+def test_publish_reviewed_image_accepts_containerd_index_without_attestation(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "c" * 64
+    runnable_digest = "sha256:" + "d" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=image_id,
+        root_manifest=_index_manifest([(runnable_digest, "linux/amd64")]),
+        raw_children={
+            runnable_digest: _image_manifest("sha256:" + "f" * 64),
+        },
+        image_configs={runnable_digest: {"architecture": "amd64", "os": "linux"}},
+        expect_success=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == f"{PUBLISH_REGISTRY}@{image_id}\n"
+    assert completed.stderr == ""
+
+
+def test_publish_reviewed_image_accepts_identical_remote_without_push(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        remote_lookup_mode="existing",
+        expect_success=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == f"{PUBLISH_REGISTRY}@{remote_digest}\n"
+    assert completed.stderr == ""
+
+
+def test_publish_reviewed_image_rejects_preexisting_local_publish_tag(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest(image_id),
+        local_tag_exists=True,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_PUBLISH_TAG_EXISTS\n"
+
+
+def test_publish_reviewed_image_uses_content_addressed_tag_when_docker_overwrites_race(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        local_tag_race=True,
+        expect_success=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == f"{PUBLISH_REGISTRY}@{remote_digest}\n"
+    assert completed.stderr == ""
+
+
+def test_publish_reviewed_image_ignores_ambient_tmpdir_for_lock_identity(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+    ambient_only_sha = "3" * 40
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        ambient_lock_stale=True,
+        git_sha=ambient_only_sha,
+        expect_success=True,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == f"{PUBLISH_REGISTRY}@{remote_digest}\n"
+    assert completed.stderr == ""
+
+
+def test_publish_reviewed_image_blocks_stale_canonical_lock_without_removing_it(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    stale_sha = "2" * 40
+    lock_parent = Path(f"/tmp/travel-map-publish-locks-{os.getuid()}")
+    lock_parent.mkdir(mode=0o700, exist_ok=True)
+    lock_directory = lock_parent / stale_sha
+    lock_directory.mkdir(mode=0o700)
+    try:
+        completed = _run_publish_reviewed_image(
+            tmp_path,
+            image_id=image_id,
+            remote_digest="sha256:" + "b" * 64,
+            root_manifest=_image_manifest(image_id),
+            git_sha=stale_sha,
+        )
+
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert completed.stderr == "BLOCKED_PUBLISH_LOCKED\n"
+        assert lock_directory.is_dir()
+    finally:
+        lock_directory.rmdir()
+
+
+def test_publish_reviewed_image_rejects_ambiguous_remote_lookup_before_push(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest(image_id),
+        remote_lookup_mode="ambiguous",
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_TAG_UNVERIFIED\n"
+
+
+def test_publish_reviewed_image_rejects_different_existing_remote_before_push(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest("sha256:" + "c" * 64),
+        remote_lookup_mode="existing",
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
+
+
+def test_publish_reviewed_image_rejects_remote_tag_created_before_push(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest("sha256:" + "c" * 64),
+        remote_lookup_mode="race-before-push",
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
+
+
+def test_publish_reviewed_image_rejects_child_image_platform_mismatch(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "c" * 64
+    runnable_digest = "sha256:" + "d" * 64
+    attestation_digest = "sha256:" + "e" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=image_id,
+        root_manifest=_index_manifest(
+            [(runnable_digest, "linux/amd64")],
+            attestation_digest=attestation_digest,
+            attestation_link=runnable_digest,
+        ),
+        raw_children={
+            runnable_digest: _image_manifest("sha256:" + "f" * 64),
+            attestation_digest: _image_manifest(
+                "sha256:" + "7" * 64,
+                attestation=True,
+            ),
+        },
+        image_configs={runnable_digest: {"architecture": "arm64", "os": "linux"}},
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
+
+
+@pytest.mark.parametrize("identity_mode", ("classic-config", "containerd-root"))
+def test_publish_reviewed_image_rejects_root_or_config_identity_mismatch(
+    tmp_path: Path,
+    identity_mode: str,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+    if identity_mode == "classic-config":
+        root_manifest = _image_manifest("sha256:" + "c" * 64)
+    else:
+        runnable_digest = "sha256:" + "d" * 64
+        attestation_digest = "sha256:" + "e" * 64
+        root_manifest = _index_manifest(
+            [(runnable_digest, "linux/amd64")],
+            attestation_digest=attestation_digest,
+            attestation_link=runnable_digest,
+        )
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=root_manifest,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
+
+
+@pytest.mark.parametrize(
+    "runnable_descriptors",
+    (
+        [("sha256:" + "d" * 64, "linux/arm64")],
+        [
+            ("sha256:" + "d" * 64, "linux/amd64"),
+            ("sha256:" + "6" * 64, "linux/amd64"),
+        ],
+    ),
+    ids=("wrong-platform", "duplicate-platform"),
+)
+def test_publish_reviewed_image_rejects_wrong_or_duplicate_runnable_platform(
+    tmp_path: Path,
+    runnable_descriptors: list[tuple[str, str]],
+) -> None:
+    image_id = "sha256:" + "c" * 64
+    attestation_digest = "sha256:" + "e" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=image_id,
+        root_manifest=_index_manifest(
+            runnable_descriptors,
+            attestation_digest=attestation_digest,
+            attestation_link=runnable_descriptors[0][0],
+        ),
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
+
+
+def test_publish_reviewed_image_rejects_unlinked_attestation(tmp_path: Path) -> None:
+    image_id = "sha256:" + "c" * 64
+    runnable_digest = "sha256:" + "d" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=image_id,
+        root_manifest=_index_manifest(
+            [(runnable_digest, "linux/amd64")],
+            attestation_digest="sha256:" + "e" * 64,
+            attestation_link="sha256:" + "f" * 64,
+        ),
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
+
+
+def test_publish_reviewed_image_rejects_local_tag_identity_change(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        local_tag_ids=(image_id, "sha256:" + "0" * 64),
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_INVALID_GATE_ATTESTATION\n"
+
+
+def test_publish_reviewed_image_rejects_remote_tag_identity_change(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+    changed_digest = "sha256:" + "c" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        tag_descriptors=[
+            _remote_descriptor(remote_digest, OCI_MANIFEST),
+            _remote_descriptor(changed_digest, OCI_MANIFEST),
+        ],
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
+
+
+def test_publish_reviewed_image_rejects_remote_descriptor_size_change(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+    changed_size = _remote_descriptor(remote_digest, OCI_MANIFEST)
+    changed_size["size"] = 2048
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        tag_descriptors=[
+            _remote_descriptor(remote_digest, OCI_MANIFEST),
+            changed_size,
+        ],
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
+
+
+def test_publish_reviewed_image_rejects_remote_descriptor_media_type_change(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        tag_descriptors=[
+            _remote_descriptor(remote_digest, OCI_MANIFEST),
+            _remote_descriptor(remote_digest, DOCKER_MANIFEST),
+        ],
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
+
+
+def test_publish_reviewed_image_rejects_immutable_descriptor_tuple_change(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+    changed_immutable = _remote_descriptor(remote_digest, OCI_MANIFEST)
+    changed_immutable["size"] = 2048
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        immutable_descriptor=changed_immutable,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
 
 
 def test_deploy_wrapper_preserves_a_valid_rollback_before_any_mutation() -> None:
