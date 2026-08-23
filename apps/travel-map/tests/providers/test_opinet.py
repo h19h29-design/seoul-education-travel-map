@@ -43,7 +43,7 @@ def test_fuel_price_and_car_cost_use_strict_exact_inputs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_opinet_requires_certkey_uses_official_codes_and_caches() -> None:
+async def test_opinet_uses_key_code_authentication_and_caches_prices() -> None:
     secret = "opinet+a/b?secret"
     requests = 0
 
@@ -51,7 +51,8 @@ async def test_opinet_requires_certkey_uses_official_codes_and_caches() -> None:
         nonlocal requests
         requests += 1
         assert request.url.params["out"] == "json"
-        assert request.url.params["certkey"] == secret
+        assert request.url.params["code"] == secret
+        assert "certkey" not in request.url.params
         return httpx.Response(
             200,
             headers={"Content-Type": "application/json"},

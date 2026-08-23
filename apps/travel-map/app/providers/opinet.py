@@ -103,7 +103,7 @@ class OpinetClient:
             payload = await self._transport.get_json(
                 url=_AVERAGE_URL,
                 params={"out": "json"},
-                query_secret=("certkey", self._cert_key),
+                query_secret=("code", self._cert_key),
                 accepted_content_types=_AVERAGE_JSON_CONTENT_TYPES,
             )
             prices = _parse_prices(payload)

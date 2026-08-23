@@ -35,7 +35,8 @@ async def test_kakao_car_returns_all_alternatives_and_self_driving_cost() -> Non
                 json=load_json("kakao-car.json"),
             )
         assert request.url.host == "www.opinet.co.kr"
-        assert request.url.params["certkey"] == opinet_secret
+        assert request.url.params["code"] == opinet_secret
+        assert "certkey" not in request.url.params
         return httpx.Response(
             200,
             headers={"Content-Type": "application/json"},
