@@ -355,6 +355,7 @@ if sys.argv[1:] and not sys.argv[1].startswith("--nested-resolution-probe"):
 """,
     )
     event_literal = repr(str(events))
+    python_find_event_literal = repr(str(events.with_suffix(".uv-python-find")))
     core_injection = events.with_suffix(".core-injection")
     for tool, system_tool in (
         ("dirname", "/usr/bin/dirname"),
@@ -455,6 +456,13 @@ event_path = Path({event_literal})
 cwd = Path.cwd()
 args = sys.argv[1:]
 if args[:2] == ["python", "find"]:
+    with Path({python_find_event_literal}).open("w", encoding="utf-8") as output:
+        output.write(json.dumps({{
+            "tool": "uv",
+            "args": args,
+            "environment": dict(sorted(os.environ.items())),
+            "cwd": str(cwd),
+        }}) + "\\n")
     required = {{
         "--no-project",
         "--resolve-links",
@@ -490,6 +498,26 @@ ignored = (
     "apps/travel-map/.venv/ambient.txt",
     "apps/travel-map/node_modules/ambient.txt",
 )
+cache_root = Path(os.environ["UV_CACHE_DIR"])
+cache_links = []
+for directory, child_directories, child_files in os.walk(
+    cache_root, topdown=True, followlinks=False
+):
+    for child in [*child_directories, *child_files]:
+        candidate = Path(directory) / child
+        if not candidate.is_symlink():
+            continue
+        target_text = os.readlink(candidate)
+        target_relative = None
+        try:
+            target = candidate.parent.joinpath(target_text).resolve(strict=True)
+            if target == cache_root or cache_root in target.parents:
+                target_relative = target.relative_to(cache_root).as_posix()
+        except (OSError, RuntimeError):
+            pass
+        cache_links.append(
+            [candidate.relative_to(cache_root).as_posix(), target_text, target_relative]
+        )
 payload = {{
     "tool": "uv",
     "args": sys.argv[1:],
@@ -502,6 +530,24 @@ payload = {{
     "docker_config_payload": (Path(os.environ["DOCKER_CONFIG"]) / "config.json").read_text(encoding="utf-8"),
     "uv_project_environment": str(python_environment),
     "uv_cache_dir": os.environ["UV_CACHE_DIR"],
+    "uv_lock_mode": (
+        stat.S_IMODE((Path(os.environ["UV_CACHE_DIR"]) / ".lock").stat().st_mode)
+        if (Path(os.environ["UV_CACHE_DIR"]) / ".lock").exists()
+        else None
+    ),
+    "uv_lock_payload": (
+        (Path(os.environ["UV_CACHE_DIR"]) / ".lock").read_text(encoding="utf-8")
+        if (Path(os.environ["UV_CACHE_DIR"]) / ".lock").is_file()
+        else None
+    ),
+    "uv_reviewed_payload": (
+        (Path(os.environ["UV_CACHE_DIR"]) / "archive-v0/reviewed-wheel/payload.py").read_text(
+            encoding="utf-8"
+        )
+        if (Path(os.environ["UV_CACHE_DIR"]) / "archive-v0/reviewed-wheel/payload.py").is_file()
+        else None
+    ),
+    "uv_cache_links": sorted(cache_links),
     "uv_python": os.environ.get("UV_PYTHON"),
     "uv_python_downloads": os.environ.get("UV_PYTHON_DOWNLOADS"),
     "uv_offline": os.environ.get("UV_OFFLINE"),
@@ -834,6 +880,7 @@ def _release_gate_repository(
     cleanup_quarantine_swap_sync: tuple[Path, Path] | None = None,
     cleanup_quarantine_mismatch_sync: tuple[Path, Path] | None = None,
     cleanup_root_swap_sync: tuple[Path, Path] | None = None,
+    cleanup_root_prebind_sync: tuple[Path, Path] | None = None,
     cache_parent: Path | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     repository = tmp_path / "repository"
@@ -1030,6 +1077,21 @@ def _release_gate_repository(
             gate_source[:pause_position]
             + replacement
             + gate_source[pause_position + len(original) :]
+        )
+    if cleanup_root_prebind_sync is not None:
+        pause_path, entered_path = cleanup_root_prebind_sync
+        root_cleanup = gate_source.index("discard_private_environment() {\n")
+        anchor = "        candidates = []\n"
+        position = gate_source.index(anchor, root_cleanup)
+        gate_source = (
+            gate_source[:position]
+            + f"        Path({str(entered_path)!r}).write_text(\n"
+            + '            f"{root}\\n{os.getpid()}", encoding="utf-8"\n'
+            + "        )\n"
+            + "        import time\n"
+            + f"        while Path({str(pause_path)!r}).exists():\n"
+            + "            time.sleep(0.01)\n"
+            + gate_source[position:]
         )
     if cleanup_pause is not None:
         pause_path, entered_path = cleanup_pause
@@ -1244,6 +1306,36 @@ def _run_release_gate(
     )
 
 
+def _inject_direct_materializer_failure(repository: Path, gate: Path) -> None:
+    source = gate.read_text(encoding="utf-8")
+    pnpm_clone_start = source.index("def clone_pnpm_store")
+    uv_clone_start = source.index("def clone_uv_cache", pnpm_clone_start)
+    pnpm_clone_source = _replace_once(
+        source[pnpm_clone_start:uv_clone_start],
+        "                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:\n"
+        '                        raise OSError(ctypes.get_errno(), "fclonefileat")\n',
+        "                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:\n"
+        '                        raise OSError(ctypes.get_errno(), "fclonefileat")\n'
+        '                    raise OSError(95, "injected partial fclone failure")\n',
+    )
+    _write_executable(
+        gate,
+        source[:pnpm_clone_start] + pnpm_clone_source + source[uv_clone_start:],
+    )
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", "inject direct materializer failure")
+
+
+def _wait_for_release_gate_anchor(
+    process: subprocess.Popen[str], anchor: Path, *, timeout: float = 15
+) -> None:
+    deadline = time.monotonic() + timeout
+    while not anchor.exists():
+        assert process.poll() is None, "release gate exited before its race anchor"
+        assert time.monotonic() < deadline, "release gate did not reach its race anchor"
+        time.sleep(0.01)
+
+
 # Production break caught: ignored files and ambient Python/Git/Docker/provider
 # state can otherwise change what a standalone gate verifies and sends to Docker.
 def test_release_gate_uses_clean_environment_and_exact_head_source(
@@ -1348,6 +1440,440 @@ def test_release_gate_uses_clean_environment_and_exact_head_source(
         for event in docker_events
         if event["args"][:2] != ["context", "inspect"]
     )
+
+
+def test_release_gate_uses_owner_private_cache_for_initial_uv_python_find(
+    tmp_path: Path,
+) -> None:
+    _, gate, _, events_path = _release_gate_repository(tmp_path)
+    shared_uv_cache = tmp_path / "uv-cache"
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 0
+    assert record.exists()
+    find_event = json.loads(events_path.with_suffix(".uv-python-find").read_text())
+    assert find_event["environment"].get("UV_CACHE_DIR") != str(shared_uv_cache)
+    assert str(shared_uv_cache) not in find_event["args"]
+    assert str(shared_uv_cache) not in find_event["environment"].values()
+
+
+def test_release_gate_cleans_bootstrap_cache_when_signaled_during_uv_python_find(
+    tmp_path: Path,
+) -> None:
+    _, gate, fake_bin, events_path = _release_gate_repository(tmp_path)
+    pause_path = events_path.with_suffix(".uv-python-find-pause")
+    entered_path = events_path.with_suffix(".uv-python-find-entered")
+    pause_path.write_text("pause\n", encoding="utf-8")
+    uv = fake_bin / "uv"
+    source = uv.read_text(encoding="utf-8")
+    find_start = source.index('if args[:2] == ["python", "find"]:')
+    print_position = source.index("    print(", find_start)
+    source = (
+        source[:print_position]
+        + f'    Path({str(entered_path)!r}).write_text("entered\\n", encoding="utf-8")\n'
+        + f"    while Path({str(pause_path)!r}).exists():\n"
+        + "        import time\n"
+        + "        time.sleep(0.01)\n"
+        + source[print_position:]
+    )
+    _write_executable(uv, source)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    bootstrap_root: Path | None = None
+    bootstrap_survived = False
+    try:
+        _wait_for_release_gate_anchor(process, entered_path)
+        find_event = json.loads(
+            events_path.with_suffix(".uv-python-find").read_text(encoding="utf-8")
+        )
+        bootstrap_root = Path(find_event["environment"]["UV_CACHE_DIR"])
+        assert bootstrap_root.is_dir()
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=10)
+    finally:
+        pause_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        stdout, stderr = process.communicate(timeout=5)
+        if bootstrap_root is not None:
+            bootstrap_survived = bootstrap_root.exists()
+            if bootstrap_survived:
+                shutil.rmtree(bootstrap_root)
+
+    assert process.returncode != 0
+    assert stdout == ""
+    assert "Traceback" not in stderr
+    assert not record.exists()
+    assert not bootstrap_survived
+
+
+@pytest.mark.parametrize("root_kind", ("bootstrap", "main"))
+def test_release_gate_binds_private_root_identity_at_creation_before_path_capture(
+    tmp_path: Path,
+    root_kind: str,
+) -> None:
+    pause_path = tmp_path / f"{root_kind}-root-create.pause"
+    entered_path = tmp_path / f"{root_kind}-root-create.entered"
+    invocation_path = tmp_path / f"{root_kind}-root-create.invocations"
+    pause_path.write_text("pause\n", encoding="utf-8")
+    repository, gate, fake_bin, events_path = _release_gate_repository(tmp_path)
+    if root_kind == "bootstrap":
+        uv = fake_bin / "uv"
+        uv_source = uv.read_text(encoding="utf-8")
+        find_start = uv_source.index('if args[:2] == ["python", "find"]:')
+        sync_start = uv_source.index('if "sync" in args', find_start)
+        find_source = uv_source[find_start:sync_start]
+        find_source = _replace_once(
+            find_source,
+            "    raise SystemExit(0)\n",
+            "    raise SystemExit(88)\n",
+        )
+        _write_executable(
+            uv, uv_source[:find_start] + find_source + uv_source[sync_start:]
+        )
+    source = gate.read_text(encoding="utf-8")
+    anchor = "        else:\n            raise OSError\n"
+    target_invocation = 1 if root_kind == "bootstrap" else 2
+    injection = (
+        f"        invocation_path = Path({str(invocation_path)!r})\n"
+        "        invocation = (\n"
+        "            int(invocation_path.read_text(encoding='ascii')) + 1\n"
+        "            if invocation_path.exists()\n"
+        "            else 1\n"
+        "        )\n"
+        f"        invocation_path.write_text(str(invocation), encoding='ascii')\n"
+        f"        if invocation == {target_invocation}:\n"
+        f"            Path({str(entered_path)!r}).write_text(str(parent / name), encoding='utf-8')\n"
+        f"            while Path({str(pause_path)!r}).exists():\n"
+        "                __import__('time').sleep(0.01)\n"
+    )
+    source = _replace_once(source, anchor, anchor + injection)
+    _write_executable(gate, source)
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", f"race {root_kind} root creation")
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    private_root: Path | None = None
+    displaced: Path | None = None
+    replacement: Path | None = None
+    replacement_survived = False
+    displaced_survived = False
+    stdout = stderr = ""
+    communicated = False
+    try:
+        _wait_for_release_gate_anchor(process, entered_path, timeout=30)
+        assert invocation_path.read_text(encoding="ascii") == str(target_invocation)
+        private_root = Path(entered_path.read_text(encoding="utf-8").strip())
+        assert private_root.is_dir()
+        displaced = private_root.with_name(private_root.name + ".displaced")
+        os.replace(private_root, displaced)
+        replacement = private_root
+        replacement.mkdir(mode=0o700)
+        unrelated = replacement / "unrelated-owner-entry"
+        unrelated.write_text("must survive\n", encoding="utf-8")
+        unrelated.chmod(0o600)
+        assert replacement.stat().st_uid == os.getuid()
+        if root_kind == "main":
+            (replacement / "home").write_text("unrelated blocker\n", encoding="utf-8")
+            (replacement / "home").chmod(0o600)
+        pause_path.unlink()
+        stdout, stderr = process.communicate(timeout=20)
+        communicated = True
+        replacement_survived = replacement.is_dir()
+        displaced_survived = displaced.exists()
+        assert process.returncode != 0
+        assert stdout == ""
+        assert "Traceback" not in stderr
+        assert not record.exists()
+        assert not events_path.exists()
+        assert replacement_survived
+        assert (replacement / "unrelated-owner-entry").read_text(encoding="utf-8") == (
+            "must survive\n"
+        )
+        assert not displaced_survived
+    finally:
+        pause_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        if not communicated:
+            stdout, stderr = process.communicate(timeout=5)
+        if private_root is not None and private_root.exists():
+            for directory, _children, _files in os.walk(
+                private_root, topdown=False, followlinks=False
+            ):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(private_root)
+        if displaced is not None and displaced.exists():
+            for directory, _children, _files in os.walk(
+                displaced, topdown=False, followlinks=False
+            ):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(displaced)
+
+
+def test_release_gate_reaps_bootstrap_find_process_group_on_signal(
+    tmp_path: Path,
+) -> None:
+    _repository, gate, fake_bin, events_path = _release_gate_repository(tmp_path)
+    pause_path = events_path.with_suffix(".uv-python-find-group.pause")
+    entered_path = events_path.with_suffix(".uv-python-find-group.entered")
+    child_info_path = events_path.with_suffix(".uv-python-find-group.child")
+    pause_path.write_text("pause\n", encoding="utf-8")
+    uv = fake_bin / "uv"
+    source = uv.read_text(encoding="utf-8")
+    find_start = source.index('if args[:2] == ["python", "find"]:')
+    print_position = source.index("    print(", find_start)
+    injected = (
+        "    import signal\n"
+        "    import time\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        '    os.open(os.environ["UV_CACHE_DIR"], os.O_RDONLY)\n'
+        "    child_pid = os.fork()\n"
+        "    if child_pid == 0:\n"
+        "        while True:\n"
+        "            time.sleep(1)\n"
+        f"    Path({str(child_info_path)!r}).write_text(\n"
+        "        f\"{os.getpid()}:{child_pid}:{os.getpgrp()}:{os.environ['UV_CACHE_DIR']}\",\n"
+        '        encoding="utf-8",\n'
+        "    )\n"
+        f'    Path({str(entered_path)!r}).write_text("entered\\n", encoding="utf-8")\n'
+        f"    while Path({str(pause_path)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+    )
+    source = source[:print_position] + injected + source[print_position:]
+    _write_executable(uv, source)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    bootstrap_root: Path | None = None
+    child_pid: int | None = None
+    bounded = False
+    root_survived = False
+    group_reaped = False
+    try:
+        _wait_for_release_gate_anchor(process, entered_path)
+        parent_pid, child_raw, process_group, root_raw = child_info_path.read_text(
+            encoding="utf-8"
+        ).split(":", 3)
+        assert int(parent_pid) != 0
+        child_pid = int(child_raw)
+        bootstrap_root = Path(root_raw)
+        assert int(process_group) == int(parent_pid)
+        assert bootstrap_root.is_dir()
+        process.send_signal(signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+            bounded = True
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        assert bounded
+        if process.poll() is not None:
+            root_survived = bootstrap_root.exists()
+    finally:
+        pause_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        stdout, stderr = process.communicate(timeout=5)
+        if bootstrap_root is not None:
+            root_survived = bootstrap_root.exists()
+            if root_survived:
+                shutil.rmtree(bootstrap_root)
+        if child_pid is not None:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    group_reaped = True
+                    break
+                time.sleep(0.01)
+            else:
+                group_reaped = False
+
+    assert bounded
+    assert group_reaped
+    assert not root_survived
+    assert process.returncode == 2
+    assert stdout == ""
+    assert "Traceback" not in stderr
+    assert not record.exists()
+
+
+@pytest.mark.parametrize("failure", ("source-identity", "docker-validation"))
+def test_release_gate_cleans_materialized_private_root_before_supervisor_failure(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    repository, gate, fake_bin, _ = _release_gate_repository(tmp_path)
+    entered = tmp_path / f"{failure}-private-root"
+    source = gate.read_text(encoding="utf-8")
+    probe = f"        printf '%s\n' \"$private_environment\" > {str(entered)!r}\n"
+
+    if failure == "source-identity":
+        source = _replace_once(
+            source,
+            '        [ "$actual_uv_cache_identity" = "$uv_cache_identity" ] \\\n',
+            probe + '        [ "$actual_uv_cache_identity" = "forced-mismatch" ] \\\n',
+        )
+        expected_error = "BLOCKED_UNSAFE_RELEASE_ENVIRONMENT\n"
+    else:
+        source = _replace_once(
+            source,
+            "        docker_host=$(/usr/bin/env -i \\\n",
+            probe + "        docker_host=$(/usr/bin/env -i \\\n",
+        )
+        docker = fake_bin / "docker"
+        docker_source = docker.read_text(encoding="utf-8")
+        docker_source = _replace_once(
+            docker_source,
+            "if is_context_inspect:\n",
+            "if is_context_inspect:\n    print('tcp://attacker.invalid:2375')\n    raise SystemExit(0)\n",
+        )
+        _write_executable(docker, docker_source)
+        expected_error = "BLOCKED_INVALID_DOCKER_CONFIG\n"
+    _write_executable(gate, source)
+    _git(repository, "add", "apps/travel-map/scripts/release-gate.sh")
+    _git(repository, "commit", "-qm", f"force {failure} failure")
+
+    private_root: Path | None = None
+    try:
+        completed, record = _run_release_gate(
+            tmp_path,
+            gate,
+            docker_config=_protected_docker_config(tmp_path),
+        )
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert completed.stderr == expected_error
+        assert not record.exists()
+        assert entered.exists()
+        private_root = Path(entered.read_text(encoding="utf-8").strip())
+        assert not private_root.exists()
+    finally:
+        if private_root is not None and private_root.exists():
+            for directory, _children, _files in os.walk(private_root, topdown=False):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(private_root)
+
+
+def test_release_gate_finishes_outer_cleanup_after_cleanup_window_signal(
+    tmp_path: Path,
+) -> None:
+    repository, gate, _, _ = _release_gate_repository(tmp_path)
+    entered = tmp_path / "outer-cleanup-entered"
+    pause = tmp_path / "outer-cleanup-pause"
+    pause.write_text("pause\n", encoding="utf-8")
+    source = gate.read_text(encoding="utf-8")
+    source = _replace_once(
+        source,
+        '        [ "$actual_uv_cache_identity" = "$uv_cache_identity" ] \\\n',
+        '        [ "$actual_uv_cache_identity" = "forced-mismatch" ] \\\n',
+    )
+    cleanup_start = source.index("discard_private_environment() {\n")
+    cleanup_anchor = "    root = Path(sys.argv[1])\n"
+    position = source.index(cleanup_anchor, cleanup_start)
+    source = (
+        source[: position + len(cleanup_anchor)]
+        + f"    Path({str(entered)!r}).write_text(str(root), encoding='utf-8')\n"
+        + f"    while Path({str(pause)!r}).exists():\n"
+        + "        __import__('time').sleep(0.01)\n"
+        + source[position + len(cleanup_anchor) :]
+    )
+    _write_executable(gate, source)
+    _git(repository, "add", "apps/travel-map/scripts/release-gate.sh")
+    _git(repository, "commit", "-qm", "pause outer release cleanup")
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    private_root: Path | None = None
+    try:
+        _wait_for_release_gate_anchor(process, entered)
+        private_root = Path(entered.read_text(encoding="utf-8"))
+        os.killpg(process.pid, signal.SIGTERM)
+        pause.unlink()
+        stdout, stderr = process.communicate(timeout=15)
+        assert process.returncode == 2
+        assert stdout == ""
+        assert "Traceback" not in stderr
+        assert not record.exists()
+        assert not private_root.exists()
+    finally:
+        pause.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        if private_root is not None and private_root.exists():
+            for directory, _children, _files in os.walk(private_root, topdown=False):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(private_root)
 
 
 @pytest.mark.parametrize("forgery", ("extra-field", "symlink"))
@@ -2140,7 +2666,7 @@ def test_release_gate_does_not_commit_record_during_cleanup_signal_window(
     )
     private_root: Path | None = None
     try:
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + 90
         while not entered_path.exists() and process.poll() is None:
             if time.monotonic() >= deadline:
                 raise AssertionError("release supervisor did not enter cleanup")
@@ -3145,14 +3671,17 @@ def test_release_gate_removes_private_root_after_partial_pnpm_clone_failure(
     private_tmp = Path("/private/tmp")
     before = set(private_tmp.glob("travel-map-release-environment.*"))
     source = gate.read_text(encoding="utf-8")
-    source = _replace_once(
-        source,
+    pnpm_clone_start = source.index("def clone_pnpm_store")
+    uv_clone_start = source.index("def clone_uv_cache", pnpm_clone_start)
+    pnpm_clone_source = _replace_once(
+        source[pnpm_clone_start:uv_clone_start],
         "                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:\n"
         '                        raise OSError(ctypes.get_errno(), "fclonefileat")\n',
         "                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:\n"
         '                        raise OSError(ctypes.get_errno(), "fclonefileat")\n'
         '                    raise OSError(95, "injected partial fclone failure")\n',
     )
+    source = source[:pnpm_clone_start] + pnpm_clone_source + source[uv_clone_start:]
     _write_executable(gate, source)
     _git(repository, "add", str(gate.relative_to(repository)))
     _git(repository, "commit", "-qm", "inject partial pnpm clone failure")
@@ -3169,6 +3698,158 @@ def test_release_gate_removes_private_root_after_partial_pnpm_clone_failure(
     assert not record.exists()
     assert not events_path.exists()
     assert set(private_tmp.glob("travel-map-release-environment.*")) == before
+
+
+@pytest.mark.parametrize(
+    "displacement",
+    ("prefix-preserving", "arbitrary"),
+)
+def test_release_gate_does_not_delete_replacement_installed_before_root_cleanup_binds(
+    tmp_path: Path,
+    displacement: str,
+) -> None:
+    pause_path = tmp_path / "cleanup-root-prebind.pause"
+    entered_path = tmp_path / "cleanup-root-prebind.entered"
+    pause_path.write_text("pause\n", encoding="utf-8")
+    repository, gate, _, events_path = _release_gate_repository(
+        tmp_path,
+        cleanup_root_prebind_sync=(pause_path, entered_path),
+    )
+    _inject_direct_materializer_failure(repository, gate)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    private_root: Path | None = None
+    displaced: Path | None = None
+    replacement: Path | None = None
+    replacement_survived = False
+    replacement_payload_survived = False
+    stdout = stderr = ""
+    communicated = False
+    try:
+        _wait_for_release_gate_anchor(process, entered_path)
+        private_root = Path(entered_path.read_text(encoding="utf-8").splitlines()[0])
+        assert private_root.is_dir()
+        displaced = (
+            private_root.with_name(private_root.name + ".displaced")
+            if displacement == "prefix-preserving"
+            else private_root.with_name("retained-owned-root-" + private_root.name)
+        )
+        if displacement == "arbitrary":
+            assert not displaced.name.startswith("travel-map-release-")
+        else:
+            assert displaced.name.startswith("travel-map-release-")
+        os.replace(private_root, displaced)
+        replacement = private_root
+        replacement.mkdir(mode=0o700)
+        replacement_payload = replacement / "unrelated-owner-entry"
+        replacement_payload.write_text("must survive\n", encoding="utf-8")
+        replacement_payload.chmod(0o600)
+        pause_path.unlink()
+        stdout, stderr = process.communicate(timeout=20)
+        communicated = True
+        replacement_survived = replacement.is_dir()
+        replacement_payload_survived = (
+            replacement_payload.exists()
+            and replacement_payload.read_text(encoding="utf-8") == "must survive\n"
+        )
+        assert process.returncode == 2
+        assert stdout == ""
+        assert stderr == "BLOCKED_PRIVATE_DIRECTORY\n"
+        assert not record.exists()
+        assert not events_path.exists()
+        assert replacement_survived
+        assert replacement_payload_survived
+        assert not displaced.exists()
+    finally:
+        pause_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        if not communicated:
+            stdout, stderr = process.communicate(timeout=5)
+        if private_root is not None and private_root.exists():
+            for directory, _children, _files in os.walk(
+                private_root, topdown=False, followlinks=False
+            ):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(private_root)
+        if displaced is not None and displaced.exists():
+            for directory, _children, _files in os.walk(
+                displaced, topdown=False, followlinks=False
+            ):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(displaced)
+
+
+def test_release_gate_cleans_private_root_when_signal_interrupts_direct_materializer_cleanup(
+    tmp_path: Path,
+) -> None:
+    pause_path = tmp_path / "cleanup-direct-signal.pause"
+    entered_path = tmp_path / "cleanup-direct-signal.entered"
+    pause_path.write_text("pause\n", encoding="utf-8")
+    repository, gate, _, events_path = _release_gate_repository(
+        tmp_path,
+        cleanup_root_prebind_sync=(pause_path, entered_path),
+    )
+    _inject_direct_materializer_failure(repository, gate)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    private_root: Path | None = None
+    root_survived = False
+    try:
+        _wait_for_release_gate_anchor(process, entered_path)
+        entered = entered_path.read_text(encoding="utf-8").splitlines()
+        private_root = Path(entered[0])
+        cleanup_pid = int(entered[1])
+        assert private_root.is_dir()
+        os.kill(cleanup_pid, signal.SIGTERM)
+        pause_path.unlink()
+        stdout, stderr = process.communicate(timeout=20)
+        root_survived = private_root.exists()
+    finally:
+        pause_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        if private_root is not None and private_root.exists():
+            for directory, _children, _files in os.walk(
+                private_root, topdown=False, followlinks=False
+            ):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(private_root)
+
+    assert process.returncode == 2
+    assert stdout == ""
+    assert stderr.endswith("BLOCKED_GATE_CLEANUP_FAILED\n")
+    assert not record.exists()
+    assert not events_path.exists()
+    assert not root_survived
 
 
 def _run_private_projects_cleanup_swap_attack(
@@ -3233,7 +3914,9 @@ def _run_private_projects_cleanup_swap_attack(
     try:
         if terminate:
             deadline = time.monotonic() + 90
-            while not pid_path.exists() and process.poll() is None:
+            while (
+                not pid_path.exists() or not pid_path.read_text(encoding="ascii")
+            ) and process.poll() is None:
                 if time.monotonic() >= deadline:
                     raise AssertionError(
                         "fake pnpm did not enter the TERM cleanup case"
@@ -3357,10 +4040,15 @@ def _run_private_empty_directory_cleanup_swap_attack(
     replacement: Path | None = None
     sentinel_parent: Path | None = None
     sentinel_payload: Path | None = None
+    pnpm_pid: int | None = None
     try:
         if terminate:
             deadline = time.monotonic() + 90
-            while not pid_path.exists() and process.poll() is None:
+            while pnpm_pid is None and process.poll() is None:
+                if pid_path.exists():
+                    pid_text = pid_path.read_text(encoding="ascii")
+                    if pid_text.isdigit():
+                        pnpm_pid = int(pid_text)
                 if time.monotonic() >= deadline:
                     raise AssertionError(
                         "fake pnpm did not enter the TERM cleanup case"
@@ -3419,7 +4107,8 @@ def _run_private_empty_directory_cleanup_swap_attack(
             stat.S_IMODE(sentinel_parent.stat().st_mode),
             sentinel_payload.read_text(encoding="utf-8"),
         ) == sentinel_before
-        pnpm_pid = int(pid_path.read_text(encoding="ascii"))
+        if pnpm_pid is None:
+            pnpm_pid = int(pid_path.read_text(encoding="ascii"))
         with pytest.raises(ProcessLookupError):
             os.kill(pnpm_pid, 0)
     finally:
@@ -3476,14 +4165,14 @@ def _run_private_regular_file_cleanup_swap_attack(
     )
     source = _replace_once(
         source,
-        """    set -e
+        """    verify_runtime_anchors || return 2
     case "$1" in
         "$pnpm_tool") verify_pnpm_stores || return 2 ;;
     esac
-    verify_runtime_anchors || return 2
+    case "$1:$2" in
 """,
-        """    set -e
-    verify_runtime_anchors || return 2
+        """    verify_runtime_anchors || return 2
+    case "$1:$2" in
 """,
     )
     _write_executable(gate, source)
@@ -3543,7 +4232,9 @@ def _run_private_regular_file_cleanup_swap_attack(
     try:
         if terminate:
             deadline = time.monotonic() + 90
-            while not pid_path.exists() and process.poll() is None:
+            while (
+                not pid_path.exists() or not pid_path.read_text(encoding="ascii")
+            ) and process.poll() is None:
                 if time.monotonic() >= deadline:
                     raise AssertionError(
                         "fake pnpm did not enter the TERM cleanup case"
@@ -3664,14 +4355,14 @@ def _run_private_quarantine_name_swap_attack(
     )
     source = _replace_once(
         source,
-        """    set -e
+        """    verify_runtime_anchors || return 2
     case "$1" in
         "$pnpm_tool") verify_pnpm_stores || return 2 ;;
     esac
-    verify_runtime_anchors || return 2
+    case "$1:$2" in
 """,
-        """    set -e
-    verify_runtime_anchors || return 2
+        """    verify_runtime_anchors || return 2
+    case "$1:$2" in
 """,
     )
     _write_executable(gate, source)
@@ -3722,7 +4413,9 @@ def _run_private_quarantine_name_swap_attack(
     try:
         if terminate:
             deadline = time.monotonic() + 90
-            while not pid_path.exists() and process.poll() is None:
+            while (
+                not pid_path.exists() or not pid_path.read_text(encoding="ascii")
+            ) and process.poll() is None:
                 if time.monotonic() >= deadline:
                     raise AssertionError(
                         "fake pnpm did not enter the TERM cleanup case"
@@ -3821,7 +4514,25 @@ def test_release_gate_rejects_extra_pnpm_store_top_level_entry(
 
 @pytest.mark.parametrize(
     "cache_attack",
-    ("group-writable-payload", "world-writable-payload", "escaping-wheel-link"),
+    (
+        "group-writable-payload",
+        "world-writable-payload",
+        "escaping-wheel-link",
+        "absolute-wheel-link",
+        "dangling-wheel-link",
+        "outside-cache-wheel-link",
+        "link-chain",
+        "link-cycle",
+        "link-to-special",
+        "link-to-non-archive",
+        "nested-writable-lock",
+        "fifo-payload",
+        "socket-payload",
+        "wheels-namespace-root-link",
+        "archive-namespace-root-link",
+        "wheels-namespace-root-target-link",
+        "archive-namespace-root-target-link",
+    ),
 )
 def test_release_gate_rejects_unsafe_uv_cache_payload_before_sync(
     tmp_path: Path,
@@ -3829,7 +4540,7 @@ def test_release_gate_rejects_unsafe_uv_cache_payload_before_sync(
 ) -> None:
     _, gate, _, events_path = _release_gate_repository(tmp_path)
     uv_cache = tmp_path / "uv-cache"
-    if cache_attack.endswith("payload"):
+    if cache_attack in {"group-writable-payload", "world-writable-payload"}:
         payload = uv_cache / "archive-v0/reviewed-wheel/payload.py"
         payload.write_text(
             "from pathlib import Path\n"
@@ -3838,16 +4549,97 @@ def test_release_gate_rejects_unsafe_uv_cache_payload_before_sync(
             encoding="utf-8",
         )
         payload.chmod(0o660 if cache_attack.startswith("group") else 0o606)
+    elif cache_attack in {
+        "escaping-wheel-link",
+        "outside-cache-wheel-link",
+        "absolute-wheel-link",
+        "dangling-wheel-link",
+        "link-chain",
+        "link-cycle",
+        "link-to-special",
+        "link-to-non-archive",
+        "wheels-namespace-root-link",
+        "archive-namespace-root-link",
+        "wheels-namespace-root-target-link",
+        "archive-namespace-root-target-link",
+    }:
+        if cache_attack.endswith("namespace-root-link"):
+            namespace = uv_cache / (
+                "wheels-v6" if cache_attack.startswith("wheels-") else "archive-v0"
+            )
+            shutil.rmtree(namespace)
+            namespace.symlink_to(
+                "archive-v0" if namespace.name == "wheels-v6" else "wheels-v6"
+            )
+            assert namespace.is_symlink()
+        elif cache_attack.endswith("namespace-root-target-link"):
+            namespace = uv_cache / (
+                "wheels-v6" if cache_attack.startswith("wheels-") else "archive-v0"
+            )
+            link = namespace / "root-alias"
+            link.symlink_to("../archive-v0" if namespace.name == "wheels-v6" else ".")
+            assert link.is_symlink()
+        else:
+            link_parent = uv_cache / "wheels-v6/pypi/escape"
+            link_parent.mkdir(mode=0o700, parents=True)
+            link = link_parent / "1.0-py3-none-any"
+            archive_target = uv_cache / "archive-v0/reviewed-wheel"
+            if cache_attack == "escaping-wheel-link":
+                external = tmp_path / "untrusted-wheel"
+                external.mkdir(mode=0o700)
+                (external / "payload.py").write_text(
+                    "raise SystemExit(99)\n",
+                    encoding="utf-8",
+                )
+                link.symlink_to(os.path.relpath(external, link.parent))
+            elif cache_attack == "outside-cache-wheel-link":
+                outside = tmp_path / "outside-cache-target"
+                outside.write_text("outside\n", encoding="utf-8")
+                outside.chmod(0o400)
+                link.symlink_to(os.path.relpath(outside, link.parent))
+            elif cache_attack == "absolute-wheel-link":
+                link.symlink_to(archive_target)
+            elif cache_attack == "dangling-wheel-link":
+                link.symlink_to("../../../archive-v0/missing-wheel")
+            elif cache_attack == "link-chain":
+                intermediate = uv_cache / "archive-v0/intermediate-wheel"
+                intermediate.symlink_to("reviewed-wheel")
+                link.symlink_to("../../../archive-v0/intermediate-wheel")
+            elif cache_attack == "link-cycle":
+                link.symlink_to("cycle-b")
+                second = link_parent / "cycle-b"
+                second.symlink_to(link.name)
+            elif cache_attack == "link-to-special":
+                special = uv_cache / "archive-v0/special-target"
+                os.mkfifo(special, mode=0o600)
+                link.symlink_to("../../../archive-v0/special-target")
+            else:
+                target = link_parent / "regular-wheel-target"
+                target.write_text("wheel target\n", encoding="utf-8")
+                target.chmod(0o400)
+                link.symlink_to(target.name)
+            assert link.is_symlink()
+    elif cache_attack == "nested-writable-lock":
+        nested_lock = uv_cache / "archive-v0/nested/.lock"
+        nested_lock.parent.mkdir(mode=0o700, parents=True)
+        nested_lock.write_text("nested mutable lock\n", encoding="utf-8")
+        nested_lock.chmod(0o666)
+        assert nested_lock.lstat().st_mode & 0o777 == 0o666
     else:
-        external = tmp_path / "untrusted-wheel"
-        external.mkdir(mode=0o700)
-        (external / "payload.py").write_text(
-            "raise SystemExit(99)\n",
-            encoding="utf-8",
+        special = uv_cache / (
+            "archive-v0/fifo-payload"
+            if cache_attack == "fifo-payload"
+            else "wheels-v6/socket-payload"
         )
-        link = uv_cache / "wheels-v6/pypi/escape/1.0-py3-none-any"
-        link.parent.mkdir(mode=0o700, parents=True)
-        link.symlink_to(os.path.relpath(external, link.parent))
+        special.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if cache_attack == "fifo-payload":
+            os.mkfifo(special, mode=0o600)
+        else:
+            bound_socket = _release_test_socket_path(tmp_path, "-uv-special")
+            bound_socket.rename(special)
+        assert stat.S_ISFIFO(special.lstat().st_mode) or stat.S_ISSOCK(
+            special.lstat().st_mode
+        )
     events_path.with_suffix(".uv-cache-attack").write_text(
         "attack\n",
         encoding="utf-8",
@@ -3865,6 +4657,660 @@ def test_release_gate_rejects_unsafe_uv_cache_payload_before_sync(
     assert not events_path.with_suffix(".uv-cache-executed").exists()
     assert not events_path.with_suffix(".uv-cache-payload-ran").exists()
     assert not record.exists()
+    events = (
+        [json.loads(line) for line in events_path.read_text().splitlines()]
+        if events_path.exists()
+        else []
+    )
+    assert not any(
+        event["tool"] == "uv" and "sync" in event["args"] for event in events
+    )
+
+
+@pytest.mark.parametrize("link_location", ("wheels-v6", "archive-v0"))
+def test_release_gate_accepts_direct_relative_uv_cache_archive_link_in_private_cache(
+    tmp_path: Path,
+    link_location: str,
+) -> None:
+    _, gate, _, events_path = _release_gate_repository(tmp_path)
+    uv_cache = tmp_path / "uv-cache"
+    if link_location == "wheels-v6":
+        link = uv_cache / "wheels-v6/pypi/reviewed/1.0-py3-none-any"
+        target_text = "../../../archive-v0/reviewed-wheel"
+        link.unlink()
+        link.symlink_to(target_text)
+    else:
+        link = uv_cache / "archive-v0/reviewed-wheel-alias.py"
+        target_text = "reviewed-wheel/payload.py"
+        link.symlink_to(target_text)
+    assert link.is_symlink()
+    assert os.readlink(link) == target_text
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "ENCRYPTED_STORAGE_IMAGE_GATE_OK\n"
+    assert completed.stderr == ""
+    assert record.exists()
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    sync_events = [
+        event for event in events if event["tool"] == "uv" and "sync" in event["args"]
+    ]
+    assert sync_events
+    assert all(event["uv_cache_dir"] != str(uv_cache) for event in sync_events)
+    expected_relative = (
+        "wheels-v6/pypi/reviewed/1.0-py3-none-any"
+        if link_location == "wheels-v6"
+        else "archive-v0/reviewed-wheel-alias.py"
+    )
+    expected_target = (
+        "archive-v0/reviewed-wheel"
+        if link_location == "wheels-v6"
+        else "archive-v0/reviewed-wheel/payload.py"
+    )
+    assert any(
+        [expected_relative, target_text, expected_target] in event["uv_cache_links"]
+        for event in sync_events
+    )
+
+
+def test_release_gate_accepts_direct_uv_archive_link_with_repeated_final_basename(
+    tmp_path: Path,
+) -> None:
+    _, gate, _, events_path = _release_gate_repository(tmp_path)
+    uv_cache = tmp_path / "uv-cache"
+    archive_target = uv_cache / "archive-v0/repeated/inner/repeated"
+    archive_target.parent.mkdir(mode=0o700, parents=True)
+    archive_target.write_text("repeated basename target\n", encoding="utf-8")
+    archive_target.chmod(0o400)
+    link = uv_cache / "wheels-v6/pypi/reviewed/1.0-py3-none-any"
+    target_text = "../../../archive-v0/repeated/inner/repeated"
+    link.unlink()
+    link.symlink_to(target_text)
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "ENCRYPTED_STORAGE_IMAGE_GATE_OK\n"
+    assert completed.stderr == ""
+    assert record.exists()
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert any(
+        [
+            "wheels-v6/pypi/reviewed/1.0-py3-none-any",
+            target_text,
+            "archive-v0/repeated/inner/repeated",
+        ]
+        in event["uv_cache_links"]
+        for event in events
+        if event["tool"] == "uv" and "sync" in event["args"]
+    )
+
+
+def test_release_gate_projects_uv_payload_with_copy_on_write_allocation(
+    tmp_path: Path,
+) -> None:
+    repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    payload = tmp_path / "uv-cache/archive-v0/reviewed-wheel/payload.py"
+    payload_size = 32 * 1024 * 1024
+    with payload.open("wb") as output:
+        for _ in range(32):
+            output.write(__import__("base64").b64encode(os.urandom(768 * 1024)))
+    payload.chmod(0o400)
+    payload_allocation = payload.stat().st_blocks * 512
+    assert payload_allocation >= payload_size * 3 // 4
+
+    def physical_extent(path: Path) -> int:
+        import fcntl
+        import struct
+
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.lseek(descriptor, payload_size // 2, os.SEEK_SET)
+            _flags, _contiguous, device_offset = struct.unpack(
+                "=Iqq",
+                fcntl.fcntl(descriptor, 49, struct.pack("=Iqq", 0, 0, 0)),
+            )
+            return device_offset
+        finally:
+            os.close(descriptor)
+
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_BYTE_COPY") == "1":
+        source = gate.read_text(encoding="utf-8")
+        clone_start = source.index("def clone_uv_cache")
+        anchor = "    clone.restype = ctypes.c_int\n\n    def safe_directory"
+        position = source.index(anchor, clone_start)
+        byte_copy_clone = """    clone.restype = ctypes.c_int
+
+    def clone(source_file, destination_descriptor, name, _flags):
+        target = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o400,
+            dir_fd=destination_descriptor,
+        )
+        try:
+            while True:
+                chunk = os.read(source_file, 1024 * 1024)
+                if not chunk:
+                    break
+                os.write(target, chunk)
+        finally:
+            os.close(target)
+        os.lseek(source_file, 0, os.SEEK_SET)
+        return 0
+
+    def safe_directory"""
+        source = source[:position] + source[position:].replace(
+            anchor, byte_copy_clone, 1
+        )
+        _write_executable(gate, source)
+        _git(repository, "add", "apps/travel-map/scripts/release-gate.sh")
+        _git(repository, "commit", "-qm", "legacy byte-copy uv projection")
+
+    pause = events_path.with_suffix(".pause")
+    entered = events_path.with_suffix(".entered")
+    pause.write_text("pause\n", encoding="utf-8")
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 90
+        while not entered.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "release gate did not reach the copy-on-write measurement pause"
+                )
+            time.sleep(0.05)
+        if not entered.exists():
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"release gate exited before copy-on-write pause: {stdout!r} {stderr!r}"
+            )
+        events = [json.loads(line) for line in events_path.read_text().splitlines()]
+        private_cache = Path(
+            next(
+                event["uv_cache_dir"]
+                for event in events
+                if event["tool"] == "uv" and "sync" in event["args"]
+            )
+        )
+        private_payload = private_cache / "archive-v0/reviewed-wheel/payload.py"
+        assert private_payload.stat().st_blocks * 512 >= payload_allocation
+        source_extent = physical_extent(payload)
+        private_extent = physical_extent(private_payload)
+        assert source_extent > 0
+        assert private_extent == source_extent
+        pause.unlink()
+        stdout, stderr = process.communicate(timeout=180)
+    finally:
+        pause.unlink(missing_ok=True)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    assert process.returncode == 0
+    assert stdout == "ENCRYPTED_STORAGE_IMAGE_GATE_OK\n"
+    assert stderr == ""
+    assert record.exists()
+
+
+def test_release_gate_blocks_unsupported_uv_fclone_without_fallback(
+    tmp_path: Path,
+) -> None:
+    repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    source = gate.read_text(encoding="utf-8")
+    clone_start = source.index("def clone_uv_cache")
+    anchor = "    clone.restype = ctypes.c_int\n\n    def safe_directory"
+    position = source.index(anchor, clone_start)
+    unsupported_clone = """    clone.restype = ctypes.c_int
+
+    def clone(*_args):
+        ctypes.set_errno(__import__('errno').ENOTSUP)
+        return -1
+
+    def safe_directory"""
+    source = source[:position] + source[position:].replace(anchor, unsupported_clone, 1)
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_FCLONE_FALLBACK") == "1":
+        failed_clone = """                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:
+                        raise OSError(ctypes.get_errno(), "fclonefileat")
+"""
+        fallback = """                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:
+                        copied = os.open(
+                            name,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o400,
+                            dir_fd=destination_descriptor,
+                        )
+                        try:
+                            while True:
+                                chunk = os.read(source_file, 1024 * 1024)
+                                if not chunk:
+                                    break
+                                os.write(copied, chunk)
+                        finally:
+                            os.close(copied)
+                        os.lseek(source_file, 0, os.SEEK_SET)
+"""
+        assert source[clone_start:].count(failed_clone) == 1
+        source = source[:clone_start] + source[clone_start:].replace(
+            failed_clone, fallback, 1
+        )
+    _write_executable(gate, source)
+    _git(repository, "add", "apps/travel-map/scripts/release-gate.sh")
+    _git(repository, "commit", "-qm", "inject unsupported uv fclone")
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_PRIVATE_DIRECTORY\n"
+    assert not record.exists()
+    events = (
+        [json.loads(line) for line in events_path.read_text().splitlines()]
+        if events_path.exists()
+        else []
+    )
+    assert not any(
+        event["tool"] == "uv" and "sync" in event["args"] for event in events
+    )
+
+
+def test_release_gate_ignores_shared_uv_cache_root_lock_and_recreates_private_lock(
+    tmp_path: Path,
+) -> None:
+    _, gate, _, events_path = _release_gate_repository(tmp_path)
+    uv_cache = tmp_path / "uv-cache"
+    source_lock = uv_cache / ".lock"
+    assert source_lock.stat().st_mode & 0o777 == 0o666
+    source_payload = source_lock.read_text(encoding="utf-8")
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "ENCRYPTED_STORAGE_IMAGE_GATE_OK\n"
+    assert completed.stderr == ""
+    assert record.exists()
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    sync_events = [
+        event for event in events if event["tool"] == "uv" and "sync" in event["args"]
+    ]
+    assert sync_events
+    private_sync_events = [
+        event for event in sync_events if event["uv_cache_dir"] != str(uv_cache)
+    ]
+    assert private_sync_events
+    assert any(event["uv_lock_mode"] == 0o600 for event in private_sync_events)
+    assert all(
+        event["uv_lock_payload"] != source_payload for event in private_sync_events
+    )
+
+
+def test_release_gate_binds_root_uv_lock_to_a_no_follow_descriptor_before_sync(
+    tmp_path: Path,
+) -> None:
+    repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    entered = tmp_path / "uv-lock-stat-entered"
+    pause = tmp_path / "uv-lock-stat-pause"
+    restored = tmp_path / "uv-lock-restored"
+    restore_pause = tmp_path / "uv-lock-restore-pause"
+    pause.write_text("pause\n", encoding="utf-8")
+    restore_pause.write_text("pause\n", encoding="utf-8")
+    source = gate.read_text(encoding="utf-8")
+    capture_start = source.index("capture_uv_cache_identity() {")
+    capture_end = source.index("\npython_runtime_identity=", capture_start)
+    anchor = "        details = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)\n"
+    position = source.index(anchor, capture_start, capture_end)
+    source = (
+        source[: position + len(anchor)]
+        + "        if name == '.lock':\n"
+        + f"            Path({str(entered)!r}).write_text('entered\\n', encoding='utf-8')\n"
+        + f"            while Path({str(pause)!r}).exists():\n"
+        + "                __import__('time').sleep(0.01)\n"
+        + source[position + len(anchor) :]
+    )
+    second_anchor = "                if private and mode != 0o600:\n"
+    position = source.index(second_anchor, capture_start, capture_end)
+    source = (
+        source[:position]
+        + f"                Path({str(restored)!r}).write_text('entered\\n', encoding='utf-8')\n"
+        + f"                while Path({str(restore_pause)!r}).exists():\n"
+        + "                    __import__('time').sleep(0.01)\n"
+        + source[position:]
+    )
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_LOCK") == "1":
+        lock_binding = """                path_details = details
+                lock_descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    details = os.fstat(lock_descriptor)
+                    if details != path_details:
+                        raise ValueError
+                finally:
+                    os.close(lock_descriptor)
+"""
+        assert source.count(lock_binding) == 1
+        source = source.replace(lock_binding, "", 1)
+        sync = """run_untrusted_verified \"$uv_tool\" sync --project apps/travel-map --locked --dev \\
+    --python \"$approved_python\" --no-python-downloads --offline \\
+    || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
+"""
+        assert source.count(sync) == 2
+        source = source.replace(sync, sync + "exit 0\n", 1)
+    _write_executable(gate, source)
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_LOCK") == "1":
+        _git(repository, "add", "apps/travel-map/scripts/release-gate.sh")
+        _git(repository, "commit", "-qm", "legacy uv lock binding")
+    source_lock = tmp_path / "uv-cache/.lock"
+    original_payload = source_lock.read_bytes()
+    original_lock = tmp_path / "original-root-lock"
+    attacker_target = tmp_path / "attacker-root-lock"
+    attacker_target.write_text("attacker sentinel\n", encoding="utf-8")
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_release_gate_anchor(process, entered)
+        source_lock.rename(original_lock)
+        source_lock.symlink_to(attacker_target)
+        pause.unlink()
+        if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_LOCK") == "1":
+            _wait_for_release_gate_anchor(process, restored)
+            source_lock.unlink()
+            original_lock.rename(source_lock)
+            restore_pause.unlink()
+        stdout, stderr = process.communicate(timeout=60)
+    finally:
+        pause.unlink(missing_ok=True)
+        restore_pause.unlink(missing_ok=True)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    assert process.returncode == 2
+    assert stdout == ""
+    assert stderr == "BLOCKED_UNSAFE_RELEASE_ENVIRONMENT\n"
+    assert (
+        source_lock.read_bytes()
+        if source_lock.exists() and not source_lock.is_symlink()
+        else original_lock.read_bytes()
+    ) == original_payload
+    assert attacker_target.read_text(encoding="utf-8") == "attacker sentinel\n"
+    assert not record.exists()
+    events = (
+        [json.loads(line) for line in events_path.read_text().splitlines()]
+        if events_path.exists()
+        else []
+    )
+    assert not any(
+        event["tool"] == "uv" and "sync" in event["args"] for event in events
+    )
+
+
+def test_release_gate_rejects_uv_payload_mutated_after_digest_before_private_clone(
+    tmp_path: Path,
+) -> None:
+    repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    entered = tmp_path / "uv-payload-digest-entered"
+    pause = tmp_path / "uv-payload-digest-pause"
+    cloned = tmp_path / "uv-payload-cloned"
+    clone_pause = tmp_path / "uv-payload-clone-pause"
+    pause.write_text("pause\n", encoding="utf-8")
+    clone_pause.write_text("pause\n", encoding="utf-8")
+    source = gate.read_text(encoding="utf-8")
+    anchor = "                    digest = digest_file(source_file)\n"
+    position = source.index(anchor, source.index("def clone_uv_cache"))
+    source = (
+        source[: position + len(anchor)]
+        + "                    if relative == 'archive-v0/reviewed-wheel/payload.py':\n"
+        + f"                        Path({str(entered)!r}).write_text('entered\\n', encoding='utf-8')\n"
+        + f"                        while Path({str(pause)!r}).exists():\n"
+        + "                            __import__('time').sleep(0.01)\n"
+        + source[position + len(anchor) :]
+    )
+    post_clone_anchor = "                    if os.fstat(source_file) != details:\n"
+    clone_start = source.index("def clone_uv_cache")
+    clone_call = "                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:\n"
+    post_clone = source.index(
+        post_clone_anchor, source.index(clone_call, clone_start) + len(clone_call)
+    )
+    source = (
+        source[:post_clone]
+        + f"                    Path({str(cloned)!r}).write_text('entered\\n', encoding='utf-8')\n"
+        + f"                    while Path({str(clone_pause)!r}).exists():\n"
+        + "                        __import__('time').sleep(0.01)\n"
+        + source[post_clone:]
+    )
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_CLONE") == "1":
+        source_check = (
+            "                    if os.fstat(source_file) != details:\n"
+            "                        raise ValueError\n"
+        )
+        first_check = source.index(source_check, clone_start)
+        second_check = source.index(source_check, first_check + len(source_check))
+        third_check = source.index(source_check, second_check + len(source_check))
+        source = source[:third_check] + source[third_check + len(source_check) :]
+        source = source[:second_check] + source[second_check + len(source_check) :]
+        source = source.replace(
+            "                    if os.fstat(private_file) != cloned or digest_file(private_file) != digest:\n                        raise ValueError\n",
+            "                    if os.fstat(private_file) != cloned:\n                        raise ValueError\n",
+            1,
+        )
+        sync = """run_untrusted_verified \"$uv_tool\" sync --project apps/travel-map --locked --dev \\
+    --python \"$approved_python\" --no-python-downloads --offline \\
+    || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
+"""
+        assert source.count(sync) == 2
+        source = source.replace(sync, sync + "exit 0\n", 1)
+        post_materialization_source_check = """        actual_uv_cache_identity=$(capture_uv_cache_identity \"$uv_cache\" source) \\
+            || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
+        [ \"$actual_uv_cache_identity\" = \"$uv_cache_identity\" ] \\
+            || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
+"""
+        assert source.count(post_materialization_source_check) == 1
+        source = source.replace(post_materialization_source_check, "        :\n", 1)
+    _write_executable(gate, source)
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_CLONE") == "1":
+        _git(repository, "add", "apps/travel-map/scripts/release-gate.sh")
+        _git(repository, "commit", "-qm", "legacy uv payload clone")
+    payload = tmp_path / "uv-cache/archive-v0/reviewed-wheel/payload.py"
+    reviewed_payload = payload.read_text(encoding="utf-8")
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_release_gate_anchor(process, entered)
+        payload.write_text("MALICIOUS_UV_CACHE = True\n", encoding="utf-8")
+        pause.unlink()
+        if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_CLONE") == "1":
+            _wait_for_release_gate_anchor(process, cloned)
+        payload.write_text(reviewed_payload, encoding="utf-8")
+        clone_pause.unlink()
+        stdout, stderr = process.communicate(timeout=60)
+    finally:
+        pause.unlink(missing_ok=True)
+        clone_pause.unlink(missing_ok=True)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_CLONE") == "1":
+        assert process.returncode in {0, 2}
+        assert stdout == ""
+        assert stderr in {"", "BLOCKED_UNSAFE_RELEASE_ENVIRONMENT\n"}
+    else:
+        assert process.returncode == 2
+        assert stdout == ""
+        assert stderr == "BLOCKED_PRIVATE_DIRECTORY\n"
+    assert payload.read_text(encoding="utf-8") == reviewed_payload
+    assert not record.exists()
+    events = (
+        [json.loads(line) for line in events_path.read_text().splitlines()]
+        if events_path.exists()
+        else []
+    )
+    assert not any(
+        event.get("uv_reviewed_payload") == "MALICIOUS_UV_CACHE = True\n"
+        for event in events
+    )
+    assert not any(
+        event["tool"] == "uv" and "sync" in event["args"] for event in events
+    )
+
+
+def test_release_gate_keeps_private_uv_link_creation_bound_to_open_parent(
+    tmp_path: Path,
+) -> None:
+    repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    entered = tmp_path / "uv-private-parent-entered"
+    pause = tmp_path / "uv-private-parent-pause"
+    created = tmp_path / "uv-private-parent-created"
+    created_pause = tmp_path / "uv-private-parent-created-pause"
+    pause.write_text("pause\n", encoding="utf-8")
+    created_pause.write_text("pause\n", encoding="utf-8")
+    source = gate.read_text(encoding="utf-8")
+    anchor = "                    os.fchmod(parent_descriptor, 0o700)\n"
+    position = source.index(anchor, source.index("def clone_uv_cache"))
+    source = (
+        source[:position]
+        + "                    if relative == 'wheels-v6/pypi/reviewed/1.0-py3-none-any':\n"
+        + "                        os.chmod(destination_root / 'wheels-v6/pypi', 0o700)\n"
+        + f"                        Path({str(entered)!r}).write_text(str(destination_root), encoding='utf-8')\n"
+        + f"                        while Path({str(pause)!r}).exists():\n"
+        + "                            __import__('time').sleep(0.01)\n"
+        + source[position:]
+    )
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_LINK_PARENT") == "1":
+        descriptor_link = (
+            "                    os.symlink(target, link_parts[-1], "
+            "dir_fd=parent_descriptor)\n"
+        )
+        path_link = (
+            "                    (destination_root / relative).symlink_to(target)\n"
+            + f"                    Path({str(created)!r}).write_text('created\\n', encoding='utf-8')\n"
+            + f"                    while Path({str(created_pause)!r}).exists():\n"
+            + "                        __import__('time').sleep(0.01)\n"
+        )
+        assert source.count(descriptor_link) == 1
+        source = source.replace(descriptor_link, path_link, 1)
+        sync = """run_untrusted_verified \"$uv_tool\" sync --project apps/travel-map --locked --dev \\
+    --python \"$approved_python\" --no-python-downloads --offline \\
+    || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
+"""
+        assert source.count(sync) == 2
+        source = source.replace(sync, sync + "exit 0\n", 1)
+    _write_executable(gate, source)
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_LINK_PARENT") == "1":
+        _git(repository, "add", "apps/travel-map/scripts/release-gate.sh")
+        _git(repository, "commit", "-qm", "legacy uv path link")
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    outside_authority = tmp_path / "outside-uv-link-authority"
+    outside_authority.mkdir(mode=0o700)
+    sentinel = outside_authority / "attacker-sentinel"
+    sentinel.write_text("survives\n", encoding="utf-8")
+    try:
+        _wait_for_release_gate_anchor(process, entered)
+        private_cache = Path(entered.read_text(encoding="utf-8"))
+        parent = private_cache / "wheels-v6/pypi/reviewed"
+        preserved_parent = private_cache / "wheels-v6/pypi/.preserved-reviewed"
+        parent.rename(preserved_parent)
+        parent.symlink_to(outside_authority, target_is_directory=True)
+        pause.unlink()
+        if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_LINK_PARENT") == "1":
+            _wait_for_release_gate_anchor(process, created)
+            assert (outside_authority / "1.0-py3-none-any").is_symlink()
+            created_pause.unlink()
+        stdout, stderr = process.communicate(timeout=60)
+    finally:
+        pause.unlink(missing_ok=True)
+        created_pause.unlink(missing_ok=True)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    if os.environ.get("TRAVEL_MAP_TEST_UV_LEGACY_LINK_PARENT") == "1":
+        assert process.returncode in {0, 2}
+        assert stdout == ""
+        assert stderr in {"", "BLOCKED_PRIVATE_DIRECTORY\n"}
+    else:
+        assert process.returncode == 2
+        assert stdout == ""
+        assert stderr == "BLOCKED_PRIVATE_DIRECTORY\n"
+    assert sentinel.read_text(encoding="utf-8") == "survives\n"
+    assert not os.path.lexists(outside_authority / "1.0-py3-none-any")
+    assert not record.exists()
+    events = (
+        [json.loads(line) for line in events_path.read_text().splitlines()]
+        if events_path.exists()
+        else []
+    )
+    assert not any(
+        event["tool"] == "uv" and "sync" in event["args"] for event in events
+    )
 
 
 def test_publisher_rejects_group_writable_tool_ancestor_before_execution(
