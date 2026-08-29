@@ -11,7 +11,7 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {
-    command: "uv run --project . uvicorn app.main:app --host 127.0.0.1 --port 4173",
+    command: "uv run --locked --no-sync --project . uvicorn app.main:app --host 127.0.0.1 --port 4173",
     url: "http://127.0.0.1:4173/healthz",
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,

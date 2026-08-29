@@ -1,7 +1,9 @@
+import hashlib
 import json
 import os
 import runpy
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -1180,7 +1182,13 @@ def test_release_gate_attestation_is_canonical_atomic_and_platform_bound() -> No
 
     assert 'case "${NAS_PLATFORM:-}" in' in gate
     assert "linux/amd64|linux/arm64" in gate
-    assert 'docker buildx build --platform "$NAS_PLATFORM"' in gate
+    assert 'run_buildx build --platform "$NAS_PLATFORM"' in gate
+    assert (
+        "buildx_tool=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/trusted-bin/docker-buildx" in gate
+    )
+    assert '"$buildx_tool" "$@"' in gate
+    assert 'verify_release_docker_socket "$release_docker_host"' in gate
+    assert 'docker buildx build --platform "$NAS_PLATFORM"' not in gate
     assert '--build-arg SNAPSHOT_ID="$snapshot_id"' in gate
     assert '--load --tag "$gate_image"' in gate
     assert "RELEASE_GATE_IMAGE_RECORD" in gate
@@ -1218,12 +1226,15 @@ def test_release_gate_executes_its_health_and_file_mode_heredocs() -> None:
     assert gate.count("docker exec -i \"$gate_container\" python - <<'PY'") == 2
 
 
-def test_release_gate_refuses_to_attest_a_dirty_source_tree() -> None:
+def test_release_gate_refuses_dirty_and_hidden_index_state() -> None:
     gate = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+    normalized = " ".join(gate.split())
 
-    assert "git diff --quiet --ignore-submodules --" in gate
-    assert "git diff --cached --quiet --ignore-submodules --" in gate
-    assert "git ls-files --others --exclude-standard" in gate
+    # The subprocess tests in test_release_hardening.py pressure-test these
+    # branches with dirty, assume-unchanged, and skip-worktree repositories.
+    assert '"status", "--porcelain=v1", "-z"' in normalized
+    assert 'git("ls-files", "-v", "-z")' in normalized
+    assert 'entry.startswith(b"H ")' in normalized
     assert "BLOCKED_DIRTY_RELEASE_SOURCE" in gate
 
 
@@ -1275,9 +1286,13 @@ def test_ci_runs_every_warning_strict_release_check() -> None:
     assert "pnpm --dir apps/travel-map test:e2e" in normalized
     assert "ghcr.io/h19h29-design/seoul-education-travel-map" in publish
     assert "docker build" not in publish
-    assert "imagetools inspect --format" in publish
-    assert "imagetools inspect --raw" in publish
-    assert "release-gate.sh" in publish and "RELEASE_GATE_IMAGE_RECORD" in publish
+    assert "docker_tool=$(resolve_publish_tool docker)" in publish
+    assert '"$docker_tool" "$@"' in publish
+    assert "run_buildx imagetools inspect" in publish
+    assert '--raw "$repo_digest"' in publish
+    assert "release-gate.sh" not in publish
+    assert "RELEASE_GATE_IMAGE_RECORD" not in publish
+    assert "travel_root" not in publish
     assert "TRAVEL_MAP_MANIFEST_DIGEST" in deploy
     assert "docker pull" in deploy and "migrate-user-database.sh" in deploy
     assert "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" in deploy
@@ -1323,19 +1338,28 @@ def test_reviewed_image_handoff_binds_all_attestation_fields_without_rebuild() -
         encoding="utf-8"
     )
 
-    assert '[ "$#" -eq 2 ]' in publish
-    assert "RELEASE_GATE_IMAGE_RECORD=$record" in publish
-    assert '"$travel_root/scripts/release-gate.sh" >&2' in publish
-    assert "splitlines(keepends=True)" in publish
-    assert 'set(values) != {"imageTag", "imageId", "platform", "gitSha"}' in publish
+    assert '[ "$#" -eq 6 ]' in publish
+    assert "record=$1" in publish
+    assert "expected_image_tag=$2" in publish
+    assert "expected_image_id=$3" in publish
+    assert "nas_platform=$4" in publish
+    assert "git_sha=$5" in publish
+    assert "expected_record_sha256=$6" in publish
+    assert "validate_approved_record" in publish
+    assert "hashlib.sha256(payload).hexdigest() != expected_hash" in publish
+    assert "release-gate.sh" not in publish
+    assert "RELEASE_GATE_IMAGE_RECORD" not in publish
+    assert "travel_root" not in publish
     assert "docker image inspect" in publish
     assert "image_id_hex=${image_id#sha256:}" in publish
     assert "publish_tag=$git_sha-sha256-$image_id_hex" in publish
     assert '[ "${#publish_tag}" -le 128 ]' in publish
     assert "tagged=$registry:$publish_tag" in publish
     assert 'docker tag "$image_id" "$tagged"' in publish
-    assert "imagetools inspect --format" in publish
-    assert "imagetools inspect --raw" in publish
+    assert "docker_tool=$(resolve_publish_tool docker)" in publish
+    assert '"$docker_tool" "$@"' in publish
+    assert "run_buildx imagetools inspect" in publish
+    assert '--raw "$repo_digest"' in publish
     assert "BLOCKED_REMOTE_IMAGE_MISMATCH" in publish
     assert "docker build" not in publish
 
@@ -1361,6 +1385,10 @@ def test_publish_reviewed_image_uses_one_validated_canonical_lock_root() -> None
 
 PUBLISH_GIT_SHA = "1" * 40
 PUBLISH_REGISTRY = "ghcr.io/h19h29-design/seoul-education-travel-map"
+PUBLISH_TOOL_SEARCH_PATH_ASSIGNMENT = (
+    "tool_search_path=$canonical_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
+    "$trusted_path"
+)
 OCI_INDEX = "application/vnd.oci.image.index.v1+json"
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
@@ -1368,8 +1396,167 @@ DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
 IN_TOTO_LAYER = "application/vnd.in-toto+json"
 
 
+def _publisher_socket_path(tmp_path: Path) -> Path:
+    suffix = hashlib.sha256(str(tmp_path).encode("utf-8")).hexdigest()[:16]
+    return Path("/private/tmp") / f"tm-publisher-{suffix}.sock"
+
+
 def _remote_descriptor(digest: str, media_type: str) -> dict[str, object]:
     return {"mediaType": media_type, "digest": digest, "size": 1024}
+
+
+def _encoded_publish_json(value: object) -> bytes:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _publish_payload_descriptor(
+    payload: bytes,
+    media_type: str,
+) -> dict[str, object]:
+    return {
+        "mediaType": media_type,
+        "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+        "size": len(payload),
+    }
+
+
+def _bind_publish_payloads(
+    *,
+    image_id: str,
+    remote_digest: str,
+    root_manifest: dict[str, object],
+    raw_children: dict[str, dict[str, object]] | None,
+    image_configs: dict[str, dict[str, object]] | None,
+) -> tuple[str, str, dict[str, str], dict[str, str], int]:
+    bound_root = json.loads(json.dumps(root_manifest))
+    root_media_type = str(bound_root["mediaType"])
+    raw_payloads: dict[str, str] = {}
+    config_payloads: dict[str, str] = {}
+
+    if root_media_type in {OCI_MANIFEST, DOCKER_MANIFEST}:
+        config = bound_root["config"]
+        assert isinstance(config, dict)
+        if config.get("digest") == image_id:
+            config_value = (image_configs or {}).get(
+                remote_digest,
+                {"architecture": "amd64", "os": "linux"},
+            )
+            config_payload = _encoded_publish_json(config_value)
+            bound_config = _publish_payload_descriptor(
+                config_payload,
+                str(config["mediaType"]),
+            )
+            bound_root["config"] = bound_config
+            image_id = str(bound_config["digest"])
+        else:
+            config_payload = None
+        root_payload = _encoded_publish_json(bound_root)
+        root_descriptor = _publish_payload_descriptor(root_payload, root_media_type)
+        remote_digest = str(root_descriptor["digest"])
+        raw_payloads[remote_digest] = root_payload.hex()
+        if config_payload is not None:
+            config_payloads[remote_digest] = config_payload.hex()
+        return (
+            image_id,
+            remote_digest,
+            raw_payloads,
+            config_payloads,
+            len(root_payload),
+        )
+
+    assert root_media_type == OCI_INDEX
+    original_image_id = image_id
+    original_remote_digest = remote_digest
+    manifests = bound_root["manifests"]
+    assert isinstance(manifests, list)
+    child_digests: dict[str, str] = {}
+    runnable_image_id: str | None = None
+    children = raw_children or {}
+    configs = image_configs or {}
+    for candidate in manifests:
+        assert isinstance(candidate, dict)
+        logical_digest = str(candidate["digest"])
+        child = children.get(logical_digest)
+        if child is None:
+            continue
+        bound_child = json.loads(json.dumps(child))
+        child_config = bound_child["config"]
+        assert isinstance(child_config, dict)
+        platform = candidate.get("platform")
+        attestation = isinstance(platform, dict) and platform.get("os") == "unknown"
+        config_value = configs.get(
+            logical_digest,
+            {
+                "architecture": "unknown" if attestation else "amd64",
+                "os": "unknown" if attestation else "linux",
+            },
+        )
+        config_payload = _encoded_publish_json(config_value)
+        bound_child["config"] = _publish_payload_descriptor(
+            config_payload,
+            str(child_config["mediaType"]),
+        )
+        if (
+            not attestation
+            and isinstance(platform, dict)
+            and platform.get("os") == "linux"
+            and platform.get("architecture") == "amd64"
+        ):
+            runnable_image_id = str(bound_child["config"]["digest"])
+        child_payload = _encoded_publish_json(bound_child)
+        child_descriptor = _publish_payload_descriptor(
+            child_payload,
+            str(candidate["mediaType"]),
+        )
+        actual_digest = str(child_descriptor["digest"])
+        child_digests[logical_digest] = actual_digest
+        candidate["digest"] = actual_digest
+        candidate["size"] = child_descriptor["size"]
+        raw_payloads[actual_digest] = child_payload.hex()
+        config_payloads[actual_digest] = config_payload.hex()
+
+    for candidate in manifests:
+        assert isinstance(candidate, dict)
+        annotations = candidate.get("annotations")
+        if not isinstance(annotations, dict):
+            continue
+        reference = annotations.get("vnd.docker.reference.digest")
+        if isinstance(reference, str) and reference in child_digests:
+            annotations["vnd.docker.reference.digest"] = child_digests[reference]
+
+    root_payload = _encoded_publish_json(bound_root)
+    root_descriptor = _publish_payload_descriptor(root_payload, root_media_type)
+    remote_digest = str(root_descriptor["digest"])
+    raw_payloads[remote_digest] = root_payload.hex()
+    if original_remote_digest == original_image_id and runnable_image_id is not None:
+        image_id = runnable_image_id
+    return (
+        image_id,
+        remote_digest,
+        raw_payloads,
+        config_payloads,
+        len(root_payload),
+    )
+
+
+def _bind_remote_descriptor(
+    descriptor: dict[str, object],
+    *,
+    original_digest: str,
+    actual_digest: str,
+    actual_size: int,
+) -> dict[str, object]:
+    bound = dict(descriptor)
+    if bound.get("digest") == original_digest:
+        bound["digest"] = actual_digest
+    if bound.get("size") == 1024:
+        bound["size"] = actual_size
+    return bound
+
+
+def _published_reference(tmp_path: Path) -> str:
+    scenario = json.loads((tmp_path / "scenario.json").read_text(encoding="utf-8"))
+    return f"{PUBLISH_REGISTRY}@{scenario['root_digest']}\n"
 
 
 def _image_manifest(
@@ -1432,17 +1619,33 @@ def _index_manifest(
     return {"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": manifests}
 
 
-def _write_publish_test_double(path: Path) -> None:
-    path.write_text(
-        """#!/usr/bin/env python3
+def _write_publish_test_double(
+    path: Path,
+    *,
+    scenario_path: Path,
+    state_path: Path,
+    environment_log: Path,
+) -> None:
+    source = """#!/usr/bin/env python3
 import json
 import os
 import sys
 from pathlib import Path
 
-scenario_path = Path(os.environ["FAKE_DOCKER_SCENARIO"])
-state_path = Path(os.environ["FAKE_DOCKER_STATE"])
+scenario_path = Path("__SCENARIO_PATH__")
+state_path = Path("__STATE_PATH__")
 scenario = json.loads(scenario_path.read_text(encoding="utf-8"))
+with Path("__ENVIRONMENT_LOG__").open("a", encoding="utf-8") as environment_output:
+    environment_output.write(
+        json.dumps(
+            {
+                "names": sorted(os.environ),
+                "docker_host": os.environ.get("DOCKER_HOST"),
+                "docker_config": os.environ.get("DOCKER_CONFIG"),
+            }
+        )
+        + "\\n"
+    )
 if state_path.exists():
     state = json.loads(state_path.read_text(encoding="utf-8"))
 else:
@@ -1471,6 +1674,13 @@ def fail(message: str) -> None:
 
 
 args = sys.argv[1:]
+if Path(sys.argv[0]).name == "docker-buildx":
+    args.insert(0, "buildx")
+if args == ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]:
+    print(scenario["docker_host"])
+    raise SystemExit(0)
+if os.environ.get("DOCKER_HOST") != scenario["docker_host"]:
+    fail("publisher did not bind the validated local Docker endpoint")
 if len(args) == 6 and args[:2] == ["image", "ls"]:
     if args[2:5] != ["--quiet", "--no-trunc", "--filter"]:
         fail("unexpected local tag preflight")
@@ -1527,7 +1737,7 @@ elif len(args) >= 4 and args[:3] == ["buildx", "imagetools", "inspect"]:
             fail("unexpected raw digest")
         state["raw_digests"].append(digest)
         persist()
-        print(json.dumps(payload, separators=(",", ":")))
+        sys.stdout.buffer.write(bytes.fromhex(payload))
     elif len(args) == 6 and args[3:5] == ["--format", "{{json .Image}}"]:
         reference = args[5]
         if "@" not in reference:
@@ -1538,7 +1748,7 @@ elif len(args) >= 4 and args[:3] == ["buildx", "imagetools", "inspect"]:
             fail("unexpected image config digest")
         state["image_configs"].append(digest)
         persist()
-        print(json.dumps(payload, separators=(",", ":")))
+        sys.stdout.buffer.write(bytes.fromhex(payload))
     elif (
         len(args) == 6
         and args[3] == "--format"
@@ -1608,9 +1818,16 @@ elif len(args) == 3 and args[:2] == ["image", "rm"]:
             fail("publisher skipped a required identity recheck")
 else:
     fail("unexpected docker command")
-""",
-        encoding="utf-8",
-    )
+"""
+    replacements = {
+        "__SCENARIO_PATH__": str(scenario_path),
+        "__STATE_PATH__": str(state_path),
+        "__ENVIRONMENT_LOG__": str(environment_log),
+    }
+    for marker, replacement in replacements.items():
+        assert source.count(marker) == 1
+        source = source.replace(marker, replacement, 1)
+    path.write_text(source, encoding="utf-8")
     path.chmod(0o755)
 
 
@@ -1629,30 +1846,174 @@ def _run_publish_reviewed_image(
     local_tag_exists: bool = False,
     local_tag_race: bool = False,
     ambient_lock_stale: bool = False,
-    git_sha: str = PUBLISH_GIT_SHA,
+    canonical_lock_stale: bool = False,
+    git_sha: str | None = None,
     expect_success: bool = False,
+    record_payload: str | None = None,
+    publisher_attack: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    test_root = tmp_path / "travel-map"
-    publisher = test_root / "deploy/nas/publish-reviewed-image.sh"
-    publisher.parent.mkdir(parents=True)
-    shutil.copy2(ROOT / "deploy/nas/publish-reviewed-image.sh", publisher)
-
-    release_gate = test_root / "scripts/release-gate.sh"
-    release_gate.parent.mkdir(parents=True)
-    release_gate.write_text(
-        """#!/bin/sh
-set -eu
-(umask 077 && printf 'imageTag=seoul-education-travel-map:release-gate-%s\\nimageId=%s\\nplatform=%s\\ngitSha=%s\\n' "$EXPECTED_PUBLISH_SHA" "$FAKE_IMAGE_ID" "$NAS_PLATFORM" "$EXPECTED_PUBLISH_SHA" > "$RELEASE_GATE_IMAGE_RECORD")
-chmod 0600 "$RELEASE_GATE_IMAGE_RECORD"
-""",
-        encoding="utf-8",
-    )
-    release_gate.chmod(0o755)
-
+    ambient_lock_name = git_sha
+    repository = tmp_path / "repository"
+    test_root = repository / "apps/travel-map"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "python3").symlink_to(sys.executable)
-    _write_publish_test_double(fake_bin / "docker")
+
+    publisher = test_root / "deploy/nas/publish-reviewed-image.sh"
+    publisher.parent.mkdir(parents=True)
+    publisher_source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
+    publisher_mode_log = tmp_path / "publisher-modes.jsonl"
+    mode_probe = f"""umask 077
+/usr/bin/python3 -I -S - "$0" <<'PY'
+import json
+import stat
+import sys
+from pathlib import Path
+
+with Path({str(publisher_mode_log)!r}).open("a", encoding="utf-8") as output:
+    launcher = Path(sys.argv[1])
+    launcher_details = launcher.stat()
+    output.write(
+        json.dumps(
+            {{
+                "path": str(launcher),
+                "mode": stat.S_IMODE(launcher_details.st_mode),
+                "device": launcher_details.st_dev,
+                "inode": launcher_details.st_ino,
+            }}
+        )
+        + "\\n"
+    )
+PY"""
+    launcher_anchor = "#!/bin/sh\nset -eu\n\numask 077\n"
+    assert publisher_source.count(launcher_anchor) == 1
+    publisher_source = publisher_source.replace(
+        launcher_anchor,
+        "#!/bin/sh\nset -eu\n\n" + mode_probe + "\n",
+        1,
+    )
+    replacements = {
+        PUBLISH_TOOL_SEARCH_PATH_ASSIGNMENT: (
+            f"tool_search_path={fake_bin}:$trusted_path"
+        ),
+    }
+    for original, replacement in replacements.items():
+        assert publisher_source.count(original) == 1
+        publisher_source = publisher_source.replace(original, replacement, 1)
+    publisher.write_text(publisher_source, encoding="utf-8")
+    publisher.chmod(0o755)
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(repository), "init", "-q"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(repository),
+            "config",
+            "user.name",
+            "Publisher Test",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(repository),
+            "config",
+            "user.email",
+            "publisher-test@example.invalid",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(repository), "add", "."],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(repository),
+            "commit",
+            "-qm",
+            "reviewed publisher",
+        ],
+        check=True,
+    )
+    git_sha = subprocess.run(
+        ["/usr/bin/git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    publisher_relative = "apps/travel-map/deploy/nas/publish-reviewed-image.sh"
+    if publisher_attack == "dirty":
+        with publisher.open("a", encoding="utf-8") as output:
+            output.write("\n# accidental unreviewed publisher edit\n")
+    elif publisher_attack == "mode":
+        publisher.chmod(0o777)
+    elif publisher_attack == "assume":
+        subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(repository),
+                "update-index",
+                "--assume-unchanged",
+                publisher_relative,
+            ],
+            check=True,
+        )
+    elif publisher_attack == "skip":
+        subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(repository),
+                "update-index",
+                "--skip-worktree",
+                publisher_relative,
+            ],
+            check=True,
+        )
+    elif publisher_attack is not None:
+        raise ValueError(f"unknown publisher attack: {publisher_attack}")
+
+    original_image_id = image_id
+    original_remote_digest = remote_digest
+    (
+        image_id,
+        remote_digest,
+        raw_by_digest,
+        image_by_digest,
+        root_size,
+    ) = _bind_publish_payloads(
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=root_manifest,
+        raw_children=raw_children,
+        image_configs=image_configs,
+    )
+    valid_record = (
+        f"imageTag=seoul-education-travel-map:release-gate-{git_sha}\n"
+        f"imageId={image_id}\n"
+        "platform=linux/amd64\n"
+        f"gitSha={git_sha}\n"
+    )
+    approved_record_parent = tmp_path / "approved-record"
+    approved_record_parent.mkdir(mode=0o700)
+    approved_record_parent.chmod(0o700)
+    approved_record = approved_record_parent / "gated-image.record"
+    approved_payload = (
+        record_payload if record_payload is not None else valid_record
+    ).encode("ascii")
+    approved_record.write_bytes(approved_payload)
+    approved_record.chmod(0o600)
+    approved_record_sha256 = hashlib.sha256(approved_payload).hexdigest()
 
     image_tag = f"seoul-education-travel-map:release-gate-{git_sha}"
     image_id_hex = image_id.removeprefix("sha256:")
@@ -1660,13 +2021,38 @@ chmod 0600 "$RELEASE_GATE_IMAGE_RECORD"
     platform = "linux/amd64"
     inspect = lambda value: {"id": value, "platform": platform}
     root_media_type = str(root_manifest["mediaType"])
-    raw_by_digest = {remote_digest: root_manifest, **(raw_children or {})}
-    descriptors = tag_descriptors or [
-        _remote_descriptor(remote_digest, root_media_type),
-        _remote_descriptor(remote_digest, root_media_type),
-    ]
-    tag_id_sequence = local_tag_ids or (image_id, image_id)
+    if tag_descriptors is None:
+        descriptors = [
+            {
+                "digest": remote_digest,
+                "mediaType": root_media_type,
+                "size": root_size,
+            },
+            {
+                "digest": remote_digest,
+                "mediaType": root_media_type,
+                "size": root_size,
+            },
+        ]
+    else:
+        descriptors = [
+            _bind_remote_descriptor(
+                descriptor,
+                original_digest=original_remote_digest,
+                actual_digest=remote_digest,
+                actual_size=root_size,
+            )
+            for descriptor in tag_descriptors
+        ]
+    if local_tag_ids is None:
+        tag_id_sequence = (image_id, image_id, image_id)
+    else:
+        tag_id_sequence = tuple(
+            image_id if value == original_image_id else value for value in local_tag_ids
+        )
+    publisher_socket = _publisher_socket_path(tmp_path)
     scenario = {
+        "docker_host": "unix://" + str(publisher_socket),
         "local_inspects": {
             image_tag: [inspect(value) for value in tag_id_sequence],
             image_id: [inspect(image_id)],
@@ -1683,29 +2069,108 @@ chmod 0600 "$RELEASE_GATE_IMAGE_RECORD"
         "tagged_reference": tagged_reference,
         "tag_descriptors": descriptors,
         "immutable_descriptors": {
-            remote_digest: immutable_descriptor
-            or _remote_descriptor(remote_digest, root_media_type)
+            remote_digest: (
+                {
+                    "digest": remote_digest,
+                    "mediaType": root_media_type,
+                    "size": root_size,
+                }
+                if immutable_descriptor is None
+                else _bind_remote_descriptor(
+                    immutable_descriptor,
+                    original_digest=original_remote_digest,
+                    actual_digest=remote_digest,
+                    actual_size=root_size,
+                )
+            )
         },
         "raw_by_digest": raw_by_digest,
-        "image_by_digest": image_configs or {},
+        "image_by_digest": image_by_digest,
         "root_digest": remote_digest,
         "required_raw_digests": list(raw_by_digest),
-        "required_image_digests": list(image_configs or {}),
+        "required_image_digests": list(image_by_digest),
         "expect_push": remote_lookup_mode == "missing",
         "expected_tag_lookup_attempts": 4 if remote_lookup_mode == "missing" else 2,
         "expect_success": expect_success,
     }
     scenario_path = tmp_path / "scenario.json"
     scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+    docker_state = tmp_path / "docker-state.json"
+    publisher_environment_log = tmp_path / "publisher-environment.jsonl"
+    _write_publish_test_double(
+        fake_bin / "docker",
+        scenario_path=scenario_path,
+        state_path=docker_state,
+        environment_log=publisher_environment_log,
+    )
+    shutil.copy2(fake_bin / "docker", fake_bin / "docker-buildx")
+    (fake_bin / "docker-buildx").chmod(0o755)
+
+    docker_config = tmp_path / "protected-docker"
+    docker_config.mkdir(mode=0o700)
+    docker_json = docker_config / "config.json"
+    docker_json.write_text(
+        '{"auths":{"ghcr.io":{"auth":"dGVzdA=="}},"currentContext":"release-test"}\n',
+        encoding="utf-8",
+    )
+    docker_json.chmod(0o600)
+    context_id = hashlib.sha256(b"release-test").hexdigest()
+    context_root = docker_config / "contexts/meta" / context_id
+    context_root.mkdir(mode=0o700, parents=True)
+    for directory in (
+        docker_config / "contexts",
+        docker_config / "contexts/meta",
+        context_root,
+    ):
+        directory.chmod(0o700)
+    context_metadata = context_root / "meta.json"
+    context_metadata.write_text(
+        json.dumps(
+            {
+                "Name": "release-test",
+                "Metadata": {},
+                "Endpoints": {
+                    "docker": {
+                        "Host": f"unix://{publisher_socket}",
+                        "SkipTLSVerify": False,
+                    }
+                },
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    context_metadata.chmod(0o600)
+    ambient_tmp = tmp_path / "ambient-tmp"
+    ambient_tmp.mkdir()
+    ambient_python = tmp_path / "ambient-python"
+    ambient_python.mkdir()
+    (ambient_python / "sitecustomize.py").write_text(
+        "raise SystemExit('ambient publisher sitecustomize')\n",
+        encoding="utf-8",
+    )
 
     environment = dict(os.environ)
     environment.update(
         {
-            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
-            "EXPECTED_PUBLISH_SHA": git_sha,
-            "FAKE_IMAGE_ID": image_id,
-            "FAKE_DOCKER_SCENARIO": str(scenario_path),
-            "FAKE_DOCKER_STATE": str(tmp_path / "docker-state.json"),
+            "PATH": "/nonexistent",
+            "HOME": str(tmp_path / "ambient-home"),
+            "TMPDIR": str(ambient_tmp),
+            "PYTHONPATH": str(ambient_python),
+            "PYTHONWARNINGS": "ignore",
+            "PYTEST_ADDOPTS": "--collect-only",
+            "GIT_CONFIG_GLOBAL": str(tmp_path / "ambient.gitconfig"),
+            "GIT_DIR": str(tmp_path / "ambient-git-dir"),
+            "DOCKER_CONFIG": str(docker_config),
+            "DOCKER_HOST": "tcp://attacker.invalid:2375",
+            "DOCKER_CONTEXT": "ambient-context",
+            "BUILDKIT_HOST": "tcp://attacker.invalid:1234",
+            "KAKAO_REST_API_KEY": "ambient-rest-secret",
+            "SEOUL_TRANSIT_SERVICE_KEY": "ambient-transit-secret",
+            "OPINET_CERT_KEY": "ambient-opinet-secret",
+            "KAKAO_OIDC_CLIENT_ID": "ambient-oidc-id",
+            "KAKAO_OIDC_CLIENT_SECRET": "ambient-oidc-secret",
         }
     )
     ambient_lock_directory = None
@@ -1714,17 +2179,35 @@ chmod 0600 "$RELEASE_GATE_IMAGE_RECORD"
         environment["TMPDIR"] = str(ambient_tmpdir)
         ambient_lock_parent = ambient_tmpdir / f"travel-map-publish-locks-{os.getuid()}"
         ambient_lock_parent.mkdir(mode=0o700, exist_ok=True)
-        ambient_lock_directory = ambient_lock_parent / git_sha
+        ambient_lock_directory = ambient_lock_parent / (ambient_lock_name or git_sha)
         ambient_lock_directory.mkdir(mode=0o700)
+    if canonical_lock_stale:
+        canonical_lock_parent = Path(f"/tmp/travel-map-publish-locks-{os.getuid()}")
+        canonical_lock_parent.mkdir(mode=0o700, exist_ok=True)
+        (canonical_lock_parent / git_sha).mkdir(mode=0o700)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(publisher_socket))
+    publisher_socket.chmod(0o600)
+    listener.listen(1)
     try:
         return subprocess.run(
-            [str(publisher), git_sha, platform],
+            [
+                str(publisher),
+                str(approved_record.resolve(strict=True)),
+                image_tag,
+                image_id,
+                platform,
+                git_sha,
+                approved_record_sha256,
+            ],
             check=False,
             capture_output=True,
             text=True,
             env=environment,
         )
     finally:
+        listener.close()
+        publisher_socket.unlink(missing_ok=True)
         if ambient_lock_directory is not None:
             ambient_lock_directory.rmdir()
 
@@ -1744,8 +2227,179 @@ def test_publish_reviewed_image_accepts_classic_config_digest_identity(
     )
 
     assert completed.returncode == 0
-    assert completed.stdout == f"{PUBLISH_REGISTRY}@{remote_digest}\n"
+    assert completed.stdout == _published_reference(tmp_path)
     assert completed.stderr == ""
+
+
+def test_publish_reviewed_image_runs_approved_private_launcher_copy(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        expect_success=True,
+    )
+
+    modes = [
+        json.loads(line)
+        for line in (tmp_path / "publisher-modes.jsonl").read_text().splitlines()
+    ]
+    assert completed.returncode == 0
+    assert [event["mode"] for event in modes] == [0o755, 0o500, 0o500]
+    source_launcher = Path(modes[0]["path"])
+    private_launcher = Path(modes[1]["path"])
+    assert source_launcher == (
+        tmp_path / "repository/apps/travel-map/deploy/nas/publish-reviewed-image.sh"
+    )
+    assert private_launcher.parent.parent == Path("/private/tmp")
+    assert private_launcher.parent.name.startswith("travel-map-publish-launcher.")
+    assert private_launcher.name == "publish-reviewed-image.sh"
+    assert modes[2]["path"] == modes[1]["path"]
+    assert (modes[2]["device"], modes[2]["inode"]) == (
+        modes[1]["device"],
+        modes[1]["inode"],
+    )
+    assert (modes[1]["device"], modes[1]["inode"]) != (
+        modes[0]["device"],
+        modes[0]["inode"],
+    )
+
+
+@pytest.mark.parametrize("publisher_attack", ("dirty", "mode", "assume", "skip"))
+def test_publish_reviewed_image_blocks_unreviewed_launcher_before_docker(
+    tmp_path: Path,
+    publisher_attack: str,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest(image_id),
+        publisher_attack=publisher_attack,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_INVALID_PUBLISH_CONTEXT\n"
+    assert not (tmp_path / "publisher-environment.jsonl").exists()
+
+
+def test_publish_reviewed_image_removes_ambient_injection_environment(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        expect_success=True,
+    )
+
+    assert completed.returncode == 0
+    expected_docker_host = "unix://" + str(_publisher_socket_path(tmp_path))
+    docker_environments = [
+        json.loads(line)
+        for line in (tmp_path / "publisher-environment.jsonl").read_text().splitlines()
+    ]
+    banned = {
+        "PYTHONPATH",
+        "PYTEST_ADDOPTS",
+        "GIT_DIR",
+        "DOCKER_CONTEXT",
+        "BUILDKIT_HOST",
+        "KAKAO_REST_API_KEY",
+        "SEOUL_TRANSIT_SERVICE_KEY",
+        "OPINET_CERT_KEY",
+        "KAKAO_OIDC_CLIENT_ID",
+        "KAKAO_OIDC_CLIENT_SECRET",
+    }
+    assert docker_environments
+    assert all(
+        not set(environment["names"]).intersection(banned)
+        for environment in docker_environments
+    )
+    assert all(
+        environment["docker_host"] is not None for environment in docker_environments
+    )
+    assert all(
+        environment["docker_host"] == expected_docker_host
+        for environment in docker_environments
+    )
+    assert all(
+        environment["docker_config"] == str(tmp_path / "protected-docker")
+        for environment in docker_environments
+    )
+
+
+@pytest.mark.parametrize(
+    "record_payload",
+    (
+        "imageTag=seoul-education-travel-map:release-gate-" + "1" * 40 + "\n"
+        "imageId=sha256:" + "a" * 64 + "\n"
+        "platform=linux/amd64\n"
+        "gitSha=" + "1" * 40 + "\n"
+        "extra=ambient\n",
+        "imageTag=seoul-education-travel-map:release-gate-" + "1" * 40 + "\n"
+        "imageId=sha256:" + "a" * 64 + "\n"
+        "imageId=sha256:" + "a" * 64 + "\n"
+        "platform=linux/amd64\n",
+        "imageTag=$(touch ambient)\n"
+        "imageId=sha256:" + "a" * 64 + "\n"
+        "platform=linux/amd64\n"
+        "gitSha=" + "1" * 40,
+    ),
+    ids=("extra-field", "duplicate-field", "shell-and-missing-newline"),
+)
+def test_publish_reviewed_image_rejects_malformed_approved_record_injection(
+    tmp_path: Path,
+    record_payload: str,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest(image_id),
+        git_sha=PUBLISH_GIT_SHA,
+        record_payload=record_payload,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_INVALID_GATE_ATTESTATION\n"
+    assert not (tmp_path / "ambient").exists()
+
+
+def test_publish_reviewed_image_rejects_malformed_descriptor_scalar_types(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    remote_digest = "sha256:" + "b" * 64
+    malformed = _remote_descriptor(remote_digest, OCI_MANIFEST)
+    malformed["size"] = True
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest=remote_digest,
+        root_manifest=_image_manifest(image_id),
+        tag_descriptors=[malformed],
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
 
 
 def test_publish_reviewed_image_accepts_containerd_index_with_linked_attestation(
@@ -1754,7 +2408,6 @@ def test_publish_reviewed_image_accepts_containerd_index_with_linked_attestation
     image_id = "sha256:" + "c" * 64
     runnable_digest = "sha256:" + "d" * 64
     attestation_digest = "sha256:" + "e" * 64
-    runnable_config = "sha256:" + "f" * 64
     attestation_config = "sha256:" + "7" * 64
 
     completed = _run_publish_reviewed_image(
@@ -1767,7 +2420,7 @@ def test_publish_reviewed_image_accepts_containerd_index_with_linked_attestation
             attestation_link=runnable_digest,
         ),
         raw_children={
-            runnable_digest: _image_manifest(runnable_config),
+            runnable_digest: _image_manifest(image_id),
             attestation_digest: _image_manifest(
                 attestation_config,
                 attestation=True,
@@ -1778,7 +2431,7 @@ def test_publish_reviewed_image_accepts_containerd_index_with_linked_attestation
     )
 
     assert completed.returncode == 0
-    assert completed.stdout == f"{PUBLISH_REGISTRY}@{image_id}\n"
+    assert completed.stdout == _published_reference(tmp_path)
     assert completed.stderr == ""
 
 
@@ -1794,14 +2447,14 @@ def test_publish_reviewed_image_accepts_containerd_index_without_attestation(
         remote_digest=image_id,
         root_manifest=_index_manifest([(runnable_digest, "linux/amd64")]),
         raw_children={
-            runnable_digest: _image_manifest("sha256:" + "f" * 64),
+            runnable_digest: _image_manifest(image_id),
         },
         image_configs={runnable_digest: {"architecture": "amd64", "os": "linux"}},
         expect_success=True,
     )
 
     assert completed.returncode == 0
-    assert completed.stdout == f"{PUBLISH_REGISTRY}@{image_id}\n"
+    assert completed.stdout == _published_reference(tmp_path)
     assert completed.stderr == ""
 
 
@@ -1821,7 +2474,7 @@ def test_publish_reviewed_image_accepts_identical_remote_without_push(
     )
 
     assert completed.returncode == 0
-    assert completed.stdout == f"{PUBLISH_REGISTRY}@{remote_digest}\n"
+    assert completed.stdout == _published_reference(tmp_path)
     assert completed.stderr == ""
 
 
@@ -1859,7 +2512,7 @@ def test_publish_reviewed_image_uses_content_addressed_tag_when_docker_overwrite
     )
 
     assert completed.returncode == 0
-    assert completed.stdout == f"{PUBLISH_REGISTRY}@{remote_digest}\n"
+    assert completed.stdout == _published_reference(tmp_path)
     assert completed.stderr == ""
 
 
@@ -1881,7 +2534,7 @@ def test_publish_reviewed_image_ignores_ambient_tmpdir_for_lock_identity(
     )
 
     assert completed.returncode == 0
-    assert completed.stdout == f"{PUBLISH_REGISTRY}@{remote_digest}\n"
+    assert completed.stdout == _published_reference(tmp_path)
     assert completed.stderr == ""
 
 
@@ -1889,26 +2542,36 @@ def test_publish_reviewed_image_blocks_stale_canonical_lock_without_removing_it(
     tmp_path: Path,
 ) -> None:
     image_id = "sha256:" + "a" * 64
-    stale_sha = "2" * 40
-    lock_parent = Path(f"/tmp/travel-map-publish-locks-{os.getuid()}")
-    lock_parent.mkdir(mode=0o700, exist_ok=True)
-    lock_directory = lock_parent / stale_sha
-    lock_directory.mkdir(mode=0o700)
+    lock_directory: Path | None = None
     try:
         completed = _run_publish_reviewed_image(
             tmp_path,
             image_id=image_id,
             remote_digest="sha256:" + "b" * 64,
             root_manifest=_image_manifest(image_id),
-            git_sha=stale_sha,
+            canonical_lock_stale=True,
         )
+        git_sha = subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(tmp_path / "repository"),
+                "rev-parse",
+                "HEAD",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        lock_directory = Path(f"/tmp/travel-map-publish-locks-{os.getuid()}") / git_sha
 
         assert completed.returncode == 2
         assert completed.stdout == ""
         assert completed.stderr == "BLOCKED_PUBLISH_LOCKED\n"
         assert lock_directory.is_dir()
     finally:
-        lock_directory.rmdir()
+        if lock_directory is not None:
+            lock_directory.rmdir()
 
 
 def test_publish_reviewed_image_rejects_ambiguous_remote_lookup_before_push(
@@ -1998,13 +2661,14 @@ def test_publish_reviewed_image_rejects_child_image_platform_mismatch(
     assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
 
 
-@pytest.mark.parametrize("identity_mode", ("classic-config", "containerd-root"))
-def test_publish_reviewed_image_rejects_root_or_config_identity_mismatch(
+@pytest.mark.parametrize("identity_mode", ("classic-config", "containerd-config"))
+def test_publish_reviewed_image_rejects_classic_or_containerd_config_mismatch(
     tmp_path: Path,
     identity_mode: str,
 ) -> None:
     image_id = "sha256:" + "a" * 64
     remote_digest = "sha256:" + "b" * 64
+    raw_children = None
     if identity_mode == "classic-config":
         root_manifest = _image_manifest("sha256:" + "c" * 64)
     else:
@@ -2015,12 +2679,20 @@ def test_publish_reviewed_image_rejects_root_or_config_identity_mismatch(
             attestation_digest=attestation_digest,
             attestation_link=runnable_digest,
         )
+        raw_children = {
+            runnable_digest: _image_manifest("sha256:" + "c" * 64),
+            attestation_digest: _image_manifest(
+                "sha256:" + "7" * 64,
+                attestation=True,
+            ),
+        }
 
     completed = _run_publish_reviewed_image(
         tmp_path,
         image_id=image_id,
         remote_digest=remote_digest,
         root_manifest=root_manifest,
+        raw_children=raw_children,
     )
 
     assert completed.returncode == 2
@@ -2093,7 +2765,7 @@ def test_publish_reviewed_image_rejects_local_tag_identity_change(
         image_id=image_id,
         remote_digest=remote_digest,
         root_manifest=_image_manifest(image_id),
-        local_tag_ids=(image_id, "sha256:" + "0" * 64),
+        local_tag_ids=(image_id, image_id, "sha256:" + "0" * 64),
     )
 
     assert completed.returncode == 2

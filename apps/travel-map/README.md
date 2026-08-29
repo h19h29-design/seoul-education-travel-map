@@ -179,13 +179,52 @@ The current rule sources are versioned in `resources/rules/local-travel-2026-07-
 
 The Docker context is staged from a reviewed workspace: it validates SGIS source and normalized geodata hashes, hash-pinned rule payloads, and `current.json` before Docker is consulted. The staged context contains no `.env`, Git metadata, source/raw provider data, geodata source, institution-source input, tests, E2E files, artifacts, or historical snapshots—only the snapshot selected by `current.json`. The runtime image uses UID `10001` and contains only application code, rules, normalized geodata/manifest, and that one approved institution snapshot. It has a `/healthz` health check and runs in production mode, so invalid settings or artifacts fail closed before serving traffic.
 
-Run the single release command only after the approved snapshot and deployment secrets exist:
+Run Stage A only after the snapshot is approved and a dedicated, authless local
+Docker context exists. This stage must not receive registry credentials,
+provider credentials, an auth-bearing Docker path, or an open secret file
+descriptor:
 
 ```sh
+record_parent=$(mktemp -d "${TMPDIR:-/tmp}/travel-map-release-record.XXXXXX")
+record_parent=$(CDPATH= cd -- "$record_parent" && /bin/pwd -P)
+/bin/chmod 0700 "$record_parent"
+
+DOCKER_CONFIG=/protected/path/docker-local-authless \
+NAS_PLATFORM=linux/amd64 \
+RELEASE_GATE_IMAGE_RECORD="$record_parent/gated-image.record" \
 ./apps/travel-map/scripts/release-gate.sh
 ```
 
-It completes verified-artifact preflight before checking Docker, then runs offline gates and produces `seoul-education-travel-map:0.1.0` only when `current.json` selects a verified snapshot. Supply production secrets and allow-lists through the platform secret manager; never bake them into the image or a saved command.
+Stage A `DOCKER_CONFIG` is mandatory and has no implicit fallback. Its physical,
+caller-owned directory must be `0700`, and its regular, non-symlink
+`config.json` must be `0600`. It may select only a strictly described local Unix
+socket context and must contain no `auths`, `credsStore`, `credHelpers`, or
+`cliPluginsExtraDirs`. Select `linux/amd64` or `linux/arm64` only from the
+read-only NAS platform inspection.
+
+Every release tool executable and every directory in its physical path must be
+owned by root or the caller and must not be group- or world-writable. A default
+Homebrew tree with a group-writable `Cellar` therefore fails closed; use a
+separately reviewed non-writable tool installation or an explicitly reviewed,
+temporary mode-hardening procedure that is restored after the gate.
+
+The gate tests and builds the exact clean `HEAD` bytes offline, reaps accidental
+child processes, and durably creates one `0600` record only after the image and
+platform are revalidated. The record has exactly these four fields:
+
+```text
+imageTag=seoul-education-travel-map:release-gate-<40-char-git-sha>
+imageId=sha256:<64-hex-local-image-id>
+platform=linux/amd64|linux/arm64
+gitSha=<40-char-git-sha>
+```
+
+Privately present those four values plus the SHA-256 of the exact record bytes
+for action-time approval. A valid local tag may remain when Stage A is
+interrupted or fails after the build; without the durable record it has no
+release authority. Do not delete a possibly replaced mutable tag automatically.
+After investigation or successful publication, an administrator may remove only
+the exact reviewed local tag and record directory.
 
 For an explicit build and local production run, prepare the same minimal context
 first. The supported build context is the staged directory below; do not run
@@ -287,6 +326,62 @@ configuration. The migration's private directory checks must pass before the
 swap. On failure, do not start the new image. Roll back only by restoring the
 preceding immutable image behind the same `travel.h19h19.com` Cloudflare route;
 never substitute a tag, a different repository, or a different public origin.
+
+Stage B starts only after a reviewer approves the independent tuple
+`(imageTag, imageId, platform, gitSha, recordSha256)`. Invoke it from the clean
+approved checkout whose `HEAD` is the approved `gitSha`; do not derive the
+expected arguments from the record at publish time:
+
+```sh
+DOCKER_CONFIG=/protected/path/docker-ghcr-inline-auth \
+apps/travel-map/deploy/nas/publish-reviewed-image.sh \
+  /physical/path/travel-map-release-record.XXXXXX/gated-image.record \
+  '<approved-image-tag>' \
+  'sha256:<approved-local-image-id>' \
+  '<approved-linux-platform>' \
+  '<approved-40-char-git-sha>' \
+  '<approved-record-sha256>'
+```
+
+The five-field content tuple is the approval authority; the record path is transport only.
+The approval remains unchanged when relocating identical record bytes to another valid canonical,
+secure `0700` parent does not change that approval, although every record
+metadata, byte-hash, and tuple check still applies at the new path.
+
+The `DOCKER_CONFIG` directory must be `0700` and its `config.json` must be
+`0600`; both must be owned by the invoking user and must not be symlinks. Stage
+B accepts only inline `ghcr.io` auth plus an optional strictly validated local
+Unix socket context. External credential helpers, credential stores, plugin
+search paths, and remote endpoints are forbidden. User-owned local sockets must
+not be group- or world-accessible. A root-owned `0660` socket is allowed only
+when its group is one of the caller's groups and it has no group-execute or
+world bits; world-writable sockets are always forbidden.
+The publisher does not rerun Stage A or execute source tests. Before opening the
+auth config it validates the record hash and every independently approved field,
+requires the approved commit as a clean `HEAD` with no hidden index flags, and
+binds the publisher mode and bytes to that commit's Git blob. Only a private
+`0500` copy of that verified launcher may open the auth config. Before any
+registry operation it revalidates the local tag, image ID, platform, and
+reviewed Git identity.
+
+The publisher hashes the exact raw root and child manifest bytes against every
+manifest descriptor. Buildx may reserialize image-config JSON, so config output
+is checked semantically instead of being treated as raw descriptor bytes. The
+runnable config digest remains bound by the verified manifest to the approved
+local image ID; attestation config descriptors must retain their allowed media
+type and positive size. The local `release-gate-*` tag is retained on both
+success and failure and is removed only by the administrator's exact cleanup
+step.
+
+The publisher deliberately uses the stronger content-addressed registry tag
+`<git-sha>-sha256-<local-image-id>` instead of the earlier plain `<git-sha>`
+operational-plan tag. This binds the immutable registry name to both the
+reviewed commit and the exact locally gated image bytes. The four-field record
+is evidence, not a cryptographic provenance token; Stage B's independently
+approved tuple is the authority. Process-group cleanup covers accidental child
+processes from the reviewed snapshot. Deliberately hostile same-UID code that
+escapes its process group requires a separate UID, container sandbox, or signed
+broker and is outside this gate's stated boundary.
 
 Before the swap, run the read-only backup check with secret-free artifacts:
 
