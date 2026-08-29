@@ -1333,6 +1333,167 @@ def test_deploy_wrapper_rejects_tag_other_registry_and_malformed_digest(
     assert completed.stderr == "BLOCKED_INVALID_IMAGE_REFERENCE\n"
 
 
+@pytest.mark.parametrize(
+    ("nas_architecture", "expected_platform"),
+    (
+        ("amd64", "linux/amd64"),
+        ("x86_64", "linux/amd64"),
+        ("arm64", "linux/arm64"),
+        ("aarch64", "linux/arm64"),
+    ),
+)
+def test_deploy_wrapper_maps_exact_nas_platform_architecture_before_mutation(
+    tmp_path: Path,
+    nas_architecture: str,
+    expected_platform: str,
+) -> None:
+    reference = "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64
+    deploy, environment, events_path, migration_events_path, base = (
+        _deploy_wrapper_fixture(
+            tmp_path,
+            nas_architecture=nas_architecture,
+            image_platform=expected_platform,
+        )
+    )
+
+    completed = subprocess.run(
+        [str(deploy), reference],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "DEPLOYED_REVIEWED_IMAGE\n"
+    assert completed.stderr == ""
+    events = _read_test_event_log(events_path)
+    migration_events = _read_test_event_log(migration_events_path)
+    assert events.index("docker info --format {{.Architecture}}") < events.index(
+        f"docker pull {reference}"
+    )
+    assert events.index(f"docker pull {reference}") < events.index(
+        "docker image inspect --format {{.Os}}/{{.Architecture}} " + reference
+    )
+    assert events.index(
+        "docker image inspect --format {{.Os}}/{{.Architecture}} " + reference
+    ) < events.index(
+        "docker compose --env-file "
+        + str(base / "image.env")
+        + " -f "
+        + str(base / "compose.yml")
+        + " up -d"
+    )
+    assert migration_events == [f"migration {reference}"]
+    assert (base / "image.env").read_text(encoding="utf-8") == (
+        "TRAVEL_MAP_MANIFEST_DIGEST=" + "a" * 64 + "\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "nas_architecture",
+    (
+        "",
+        "AMD64",
+        "x86",
+        "i386",
+        "arm",
+        "armv7l",
+        " ",
+        "\t",
+        " amd64 ",
+        "\tamd64",
+        "amd64\t",
+        "$(touch should-not-run)",
+        "amd64; touch should-not-run",
+        "`touch should-not-run`",
+    ),
+)
+def test_deploy_wrapper_rejects_unverified_nas_platform_before_mutation(
+    tmp_path: Path,
+    nas_architecture: str,
+) -> None:
+    reference = "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64
+    deploy, environment, events_path, migration_events_path, base = (
+        _deploy_wrapper_fixture(
+            tmp_path,
+            nas_architecture=nas_architecture,
+            image_platform="linux/amd64",
+        )
+    )
+    original_image_env = (base / "image.env").read_text(encoding="utf-8")
+    should_not_run = tmp_path / "should-not-run"
+    assert not should_not_run.exists()
+
+    completed = subprocess.run(
+        [str(deploy), reference],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=tmp_path,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_NAS_PLATFORM_UNVERIFIED\n"
+    events = _read_test_event_log(events_path)
+    migration_events = _read_test_event_log(migration_events_path)
+    assert events == ["docker info --format {{.Architecture}}"]
+    assert migration_events == []
+    assert not (base / "previous-image.env").exists()
+    assert not list(base.glob(".previous-image.env.*"))
+    assert not list(base.glob(".image.env.*"))
+    assert not should_not_run.exists()
+    assert (base / "image.env").read_text(encoding="utf-8") == original_image_env
+
+
+@pytest.mark.parametrize(
+    ("nas_architecture", "image_platform"),
+    (
+        ("amd64", "linux/amd64"),
+        ("x86_64", "linux/amd64"),
+        ("arm64", "linux/arm64"),
+        ("aarch64", "linux/arm64"),
+    ),
+)
+def test_deploy_wrapper_rejects_accepted_alias_with_trailing_blank_record(
+    tmp_path: Path,
+    nas_architecture: str,
+    image_platform: str,
+) -> None:
+    reference = "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64
+    deploy, environment, events_path, migration_events_path, base = (
+        _deploy_wrapper_fixture(
+            tmp_path,
+            nas_architecture=nas_architecture,
+            image_platform=image_platform,
+            docker_info_output=nas_architecture + "\n\n",
+        )
+    )
+    original_image_env = (base / "image.env").read_text(encoding="utf-8")
+
+    completed = subprocess.run(
+        [str(deploy), reference],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_NAS_PLATFORM_UNVERIFIED\n"
+    assert _read_test_event_log(events_path) == [
+        "docker info --format {{.Architecture}}"
+    ]
+    assert _read_test_event_log(migration_events_path) == []
+    assert not (base / "previous-image.env").exists()
+    assert not list(base.glob(".previous-image.env.*"))
+    assert not list(base.glob(".image.env.*"))
+    assert (base / "image.env").read_text(encoding="utf-8") == original_image_env
+
+
 def test_reviewed_image_handoff_binds_all_attestation_fields_without_rebuild() -> None:
     publish = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
         encoding="utf-8"
@@ -2920,3 +3081,91 @@ def _isolated_smoke_without_snapshot(tmp_path: Path) -> Path:
     smoke.parent.mkdir(parents=True)
     shutil.copy2(SMOKE, smoke)
     return smoke
+
+
+def _deploy_wrapper_fixture(
+    tmp_path: Path,
+    *,
+    nas_architecture: str,
+    image_platform: str,
+    docker_info_output: str | None = None,
+) -> tuple[Path, dict[str, str], Path, Path, Path]:
+    base = tmp_path / "nas/docker/seoul-education-travel-map"
+    base.mkdir(parents=True)
+    (base / "compose.yml").write_text("services: {}\n", encoding="utf-8")
+    image_env = base / "image.env"
+    image_env.write_text(
+        "TRAVEL_MAP_MANIFEST_DIGEST=" + "b" * 64 + "\n", encoding="utf-8"
+    )
+    image_env.chmod(0o600)
+
+    events_path = tmp_path / "docker-events"
+    migration_events_path = tmp_path / "migration-events"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        """#!/bin/sh
+set -eu
+printf 'docker %s\\n' "$*" >> "$FAKE_DOCKER_EVENTS"
+case "${1-} ${2-}" in
+    info[[:space:]]*) printf '%s' "$FAKE_DOCKER_INFO_OUTPUT" ;;
+    image[[:space:]]inspect) printf '%s\\n' "$FAKE_DOCKER_IMAGE_PLATFORM" ;;
+    pull[[:space:]]*) : ;;
+    compose[[:space:]]*) : ;;
+    *) exit 91 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    fake_mktemp = fake_bin / "mktemp"
+    fake_mktemp.write_text(
+        """#!/bin/sh
+set -eu
+printf 'mktemp %s\\n' "$*" >> "$FAKE_DOCKER_EVENTS"
+exec /usr/bin/mktemp "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_mktemp.chmod(0o755)
+
+    migration = base / "migrate-user-database.sh"
+    migration.write_text(
+        """#!/bin/sh
+set -eu
+printf 'migration %s\\n' "$1" >> "$FAKE_MIGRATION_EVENTS"
+""",
+        encoding="utf-8",
+    )
+    migration.chmod(0o755)
+
+    deploy = tmp_path / "deploy-reviewed-image.sh"
+    deploy.write_text(
+        (Path(__file__).resolve().parents[1] / "deploy/nas/deploy-reviewed-image.sh")
+        .read_text(encoding="utf-8")
+        .replace(
+            "base=/volume1/docker/seoul-education-travel-map",
+            f"base={base}",
+        ),
+        encoding="utf-8",
+    )
+    deploy.chmod(0o755)
+
+    environment = dict(os.environ)
+    environment["PATH"] = str(fake_bin) + ":" + environment.get("PATH", "")
+    environment["FAKE_DOCKER_ARCHITECTURE"] = nas_architecture
+    environment["FAKE_DOCKER_INFO_OUTPUT"] = (
+        nas_architecture if docker_info_output is None else docker_info_output
+    )
+    environment["FAKE_DOCKER_IMAGE_PLATFORM"] = image_platform
+    environment["FAKE_DOCKER_EVENTS"] = str(events_path)
+    environment["FAKE_MIGRATION_EVENTS"] = str(migration_events_path)
+
+    return deploy, environment, events_path, migration_events_path, base
+
+
+def _read_test_event_log(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return path.read_text(encoding="utf-8").splitlines()

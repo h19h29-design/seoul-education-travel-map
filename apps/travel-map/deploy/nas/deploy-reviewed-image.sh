@@ -66,13 +66,26 @@ validate_image_env() {
 
 validate_image_env "$image_env"
 
-docker pull "$reference" >/dev/null || blocked 'BLOCKED_IMAGE_PULL'
-nas_arch=$(docker info --format '{{.Architecture}}') || blocked 'BLOCKED_NAS_PLATFORM_UNVERIFIED'
+architecture_sentinel=$(printf '\001')
+nas_arch=$(
+    if docker info --format '{{.Architecture}}'; then
+        docker_status=0
+    else
+        docker_status=$?
+    fi
+    printf '%s' "$architecture_sentinel"
+    exit "$docker_status"
+) || blocked 'BLOCKED_NAS_PLATFORM_UNVERIFIED'
 case "$nas_arch" in
-    amd64) nas_platform=linux/amd64 ;;
-    arm64) nas_platform=linux/arm64 ;;
+    "amd64$architecture_sentinel"|"amd64
+$architecture_sentinel"|"x86_64$architecture_sentinel"|"x86_64
+$architecture_sentinel") nas_platform=linux/amd64 ;;
+    "arm64$architecture_sentinel"|"arm64
+$architecture_sentinel"|"aarch64$architecture_sentinel"|"aarch64
+$architecture_sentinel") nas_platform=linux/arm64 ;;
     *) blocked 'BLOCKED_NAS_PLATFORM_UNVERIFIED' ;;
 esac
+docker pull "$reference" >/dev/null || blocked 'BLOCKED_IMAGE_PULL'
 actual_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$reference") \
     || blocked 'BLOCKED_IMAGE_PLATFORM_MISMATCH'
 [ "$actual_platform" = "$nas_platform" ] \
