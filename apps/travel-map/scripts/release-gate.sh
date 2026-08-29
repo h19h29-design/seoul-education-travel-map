@@ -169,6 +169,10 @@ node_tool_identity=$(capture_release_tool_identity "$node_tool") \
     || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
 buildx_tool_identity=$(capture_release_tool_identity "$buildx_tool") \
     || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
+sandbox_exec=/usr/bin/sandbox-exec
+[ -x "$sandbox_exec" ] || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
+sandbox_exec_identity=$(capture_release_tool_identity "$sandbox_exec") \
+    || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
 
 bootstrap_python - \
     "$uv_cache" "$playwright_cache" "$pnpm_store" <<'PY' \
@@ -352,6 +356,155 @@ except (OSError, ValueError):
 print(hashlib.sha256(payload).hexdigest())
 PY
 }
+
+# pnpm v10's projects namespace is tool metadata: validate the directory itself,
+# but never enumerate or resolve its untrusted children.
+capture_pnpm_store_identity() {
+    bootstrap_python - "$1" "${2:-source}" "${3:-identity}" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+def safe_directory(details):
+    return (
+        stat.S_ISDIR(details.st_mode)
+        and details.st_uid in {0, os.getuid()}
+        and not details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    )
+
+
+def digest_file(descriptor):
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+
+
+def walk(directory_descriptor, prefix, records):
+    for name in sorted(os.listdir(directory_descriptor)):
+        details = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        relative = f"{prefix}/{name}"
+        mode = stat.S_IMODE(details.st_mode)
+        if stat.S_ISDIR(details.st_mode):
+            if not safe_directory(details):
+                raise ValueError
+            child = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_descriptor,
+            )
+            try:
+                if os.fstat(child) != details:
+                    raise ValueError
+                records.append([relative, "directory", details.st_uid, mode, details.st_dev, details.st_ino])
+                walk(child, relative, records)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(details.st_mode):
+            if (
+                details.st_uid not in {0, os.getuid()}
+                or details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or details.st_nlink != 1
+            ):
+                raise ValueError
+            child = os.open(
+                name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_descriptor
+            )
+            try:
+                opened = os.fstat(child)
+                if opened != details:
+                    raise ValueError
+                records.append(
+                    [relative, "file", details.st_uid, mode, details.st_size, details.st_dev, details.st_ino, digest_file(child)]
+                )
+            finally:
+                os.close(child)
+        else:
+            raise ValueError
+
+
+try:
+    root = Path(sys.argv[1])
+    ancestor_policy = sys.argv[2]
+    identity_policy = sys.argv[3]
+    if ancestor_policy not in {"source", "private"}:
+        raise ValueError
+    if identity_policy not in {"identity", "payload", "combined"}:
+        raise ValueError
+    root_path_details = root.lstat()
+    if (
+        not root.is_absolute()
+        or root.is_symlink()
+        or root.resolve(strict=True) != root
+        or not safe_directory(root_path_details)
+    ):
+        raise ValueError
+    for ancestor in root.parents:
+        details = ancestor.lstat()
+        shared_write = details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        if (
+            ancestor.is_symlink()
+            or ancestor.resolve(strict=True) != ancestor
+            or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid not in {0, os.getuid()}
+            or (shared_write and (ancestor_policy != "private" or not details.st_mode & stat.S_ISVTX))
+        ):
+            raise ValueError
+    root_descriptor = os.open(
+        root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        root_details = os.fstat(root_descriptor)
+        if root_details != root_path_details:
+            raise ValueError
+        names = set(os.listdir(root_descriptor))
+        if names != {"files", "index", "projects"}:
+            raise ValueError
+        records = [[".", "directory", root_details.st_uid, stat.S_IMODE(root_details.st_mode), root_details.st_dev, root_details.st_ino]]
+        for name in ("files", "index", "projects"):
+            details = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+            if not safe_directory(details):
+                raise ValueError
+            child = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_descriptor,
+            )
+            try:
+                if os.fstat(child) != details:
+                    raise ValueError
+                if name == "projects":
+                    records.append([name, "opaque-directory", details.st_uid, stat.S_IMODE(details.st_mode), details.st_dev, details.st_ino])
+                else:
+                    records.append([name, "directory", details.st_uid, stat.S_IMODE(details.st_mode), details.st_dev, details.st_ino])
+                    walk(child, name, records)
+            finally:
+                os.close(child)
+    finally:
+        os.close(root_descriptor)
+    payload_records = [
+            [record[0], record[1], record[-1] if record[1] == "file" else None]
+            for record in records
+            if record[0] != "." and record[0] != "projects"
+        ]
+except (OSError, ValueError):
+    raise SystemExit(2) from None
+identity = hashlib.sha256(json.dumps(records, separators=(",", ":")).encode("ascii")).hexdigest()
+payload = hashlib.sha256(json.dumps(payload_records, separators=(",", ":")).encode("ascii")).hexdigest()
+if identity_policy == "identity":
+    print(identity)
+elif identity_policy == "payload":
+    print(payload)
+else:
+    print(identity, payload)
+PY
+}
 python_runtime_identity=$(capture_trusted_tree_identity "$python_runtime_root") \
     || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
 pnpm_package_root=$(bootstrap_python - "$pnpm_tool" <<'PY'
@@ -390,8 +543,11 @@ pnpm_package_identity=$(capture_trusted_tree_identity "$pnpm_package_root") \
     || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
 playwright_cache_identity=$(capture_trusted_tree_identity "$playwright_cache") \
     || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
-pnpm_store_identity=$(capture_trusted_tree_identity \
-    "$pnpm_store" reject-symlinks) \
+pnpm_store_baseline=$(capture_pnpm_store_identity "$pnpm_store" source combined) \
+    || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
+pnpm_store_identity=${pnpm_store_baseline%% *}
+pnpm_store_payload_identity=${pnpm_store_baseline#* }
+[ "$pnpm_store_identity" != "$pnpm_store_payload_identity" ] \
     || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
 case "${TRAVEL_MAP_RELEASE_CLEAN_ENVIRONMENT:-}" in
     1) PATH=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/trusted-bin:$trusted_path ;;
@@ -584,43 +740,6 @@ PY
 ) || blocked 'BLOCKED_INVALID_DOCKER_CONFIG'
 
 clean_environment_marker=${TRAVEL_MAP_RELEASE_CLEAN_ENVIRONMENT:-}
-case "$clean_environment_marker" in
-    '')
-        docker_host=$(/usr/bin/env -i \
-            HOME=/var/empty PATH="$trusted_path" TMPDIR=/tmp \
-            DOCKER_CONFIG="$docker_config" \
-            "$docker_tool" context inspect \
-            --format '{{.Endpoints.docker.Host}}' 2>/dev/null) \
-            || blocked 'BLOCKED_INVALID_DOCKER_CONFIG'
-        if [ -n "$sanitized_context_host" ] \
-            && [ "$docker_host" != "$sanitized_context_host" ]; then
-            blocked 'BLOCKED_INVALID_DOCKER_CONFIG'
-        fi
-        ;;
-    1) docker_host=${TRAVEL_MAP_RELEASE_DOCKER_HOST:-} ;;
-    *) docker_host= ;;
-esac
-docker_host=$(bootstrap_python - "$docker_host" <<'PY'
-import os
-import sys
-from pathlib import Path
-
-try:
-    raw = sys.argv[1]
-    if not raw.startswith("unix://") or any(ord(character) < 0x20 for character in raw):
-        raise ValueError
-    socket_path = Path(raw.removeprefix("unix://"))
-    if (
-        not socket_path.is_absolute()
-        or str(socket_path) != os.path.normpath(socket_path)
-        or any(part in {"", ".", ".."} for part in socket_path.parts[1:])
-    ):
-        raise ValueError
-except (OSError, ValueError):
-    raise SystemExit(2) from None
-print(raw)
-PY
-) || blocked 'BLOCKED_INVALID_DOCKER_CONFIG'
 
 verify_release_docker_socket() {
     bootstrap_python - "$1" <<'PY'
@@ -676,8 +795,154 @@ except (OSError, ValueError):
     raise SystemExit(2) from None
 PY
 }
-verify_release_docker_socket "$docker_host" \
-    || blocked 'BLOCKED_INVALID_DOCKER_CONFIG'
+
+discard_private_environment() {
+    bootstrap_python - "$1" "$normalized_tmp_root" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+def remove_non_directory(directory_descriptor, name, expected):
+    quarantine_name = None
+    for _ in range(16):
+        candidate = ".release-gate-cleanup-" + os.urandom(16).hex()
+        try:
+            os.mkdir(candidate, 0o700, dir_fd=directory_descriptor)
+        except FileExistsError:
+            continue
+        quarantine_name = candidate
+        break
+    if quarantine_name is None:
+        raise OSError
+    quarantine_descriptor = os.open(
+        quarantine_name,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_descriptor,
+    )
+    quarantine_details = os.fstat(quarantine_descriptor)
+    quarantine_identity = (
+        quarantine_details.st_dev,
+        quarantine_details.st_ino,
+        stat.S_IFMT(quarantine_details.st_mode),
+    )
+    if (
+        (current := os.stat(
+            quarantine_name, dir_fd=directory_descriptor, follow_symlinks=False
+        )).st_dev,
+        current.st_ino,
+        stat.S_IFMT(current.st_mode),
+    ) != quarantine_identity:
+        os.close(quarantine_descriptor)
+        raise OSError
+    try:
+        os.rename(
+            name,
+            name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=quarantine_descriptor,
+        )
+        current = os.stat(name, dir_fd=quarantine_descriptor, follow_symlinks=False)
+        if (
+            current.st_dev,
+            current.st_ino,
+            stat.S_IFMT(current.st_mode),
+        ) != (
+            expected.st_dev,
+            expected.st_ino,
+            stat.S_IFMT(expected.st_mode),
+        ):
+            # Leaving an unexpected entry quarantined is safer than replacing
+            # a name that a concurrent writer may have recreated.
+            raise OSError
+        os.unlink(name, dir_fd=quarantine_descriptor)
+    finally:
+        os.close(quarantine_descriptor)
+        current = os.stat(
+            quarantine_name, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+        if (
+            current.st_dev,
+            current.st_ino,
+            stat.S_IFMT(current.st_mode),
+        ) != quarantine_identity:
+            raise OSError
+        os.rmdir(quarantine_name, dir_fd=directory_descriptor)
+
+
+def remove_contents(directory_descriptor):
+    os.fchmod(directory_descriptor, 0o700)
+    for name in os.listdir(directory_descriptor):
+        details = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(details.st_mode):
+            child = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_descriptor,
+            )
+            try:
+                if os.fstat(child) != details:
+                    raise OSError
+                remove_contents(child)
+            finally:
+                os.close(child)
+            current = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+            if (
+                current.st_dev,
+                current.st_ino,
+                stat.S_IFMT(current.st_mode),
+            ) != (
+                details.st_dev,
+                details.st_ino,
+                stat.S_IFMT(details.st_mode),
+            ):
+                raise OSError
+            os.rmdir(name, dir_fd=directory_descriptor)
+        else:
+            remove_non_directory(directory_descriptor, name, details)
+
+
+try:
+    root = Path(sys.argv[1])
+    parent = Path(sys.argv[2])
+    if root.parent != parent or not root.name.startswith("travel-map-release-environment."):
+        raise OSError
+    parent_descriptor = os.open(
+        parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        expected = os.stat(root, follow_symlinks=False)
+        root_descriptor = os.open(
+            root.name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        try:
+            bound_root = os.fstat(root_descriptor)
+            if bound_root != expected:
+                raise OSError
+            remove_contents(root_descriptor)
+        finally:
+            os.close(root_descriptor)
+        current_root = os.stat(root.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            current_root.st_dev,
+            current_root.st_ino,
+            stat.S_IFMT(current_root.st_mode),
+        ) != (
+            bound_root.st_dev,
+            bound_root.st_ino,
+            stat.S_IFMT(bound_root.st_mode),
+        ):
+            raise OSError
+        os.rmdir(root.name, dir_fd=parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+except OSError:
+    raise SystemExit(2) from None
+PY
+}
 
 case "$clean_environment_marker" in
     '')
@@ -696,17 +961,21 @@ case "$clean_environment_marker" in
         private_trusted_bin=$private_environment/trusted-bin
         private_release_record=$private_environment/release-record
         private_pnpm_package=$private_environment/pnpm-package
+        private_pnpm_store=$private_environment/pnpm-store/v10
         /bin/mkdir -m 0700 \
             "$private_home" "$private_xdg_config" "$private_xdg_cache" \
             "$private_xdg_data" "$private_npm_cache" "$private_pnpm_home" \
             "$private_docker_config" "$private_trusted_bin" \
             "$private_release_record" \
             || blocked 'BLOCKED_PRIVATE_DIRECTORY'
-        bootstrap_python - \
+        if ! bootstrap_python - \
             "$private_docker_config" "$private_trusted_bin" \
             "$uv_tool" "$node_tool" "$docker_tool" "$buildx_tool" \
-            "$pnpm_package_root" "$private_pnpm_package" <<'PY' \
-            || blocked 'BLOCKED_PRIVATE_DIRECTORY'
+            "$pnpm_package_root" "$private_pnpm_package" \
+            "$pnpm_store" "$private_pnpm_store" "$pnpm_store_baseline" <<'PY'
+import ctypes
+import hashlib
+import json
 import os
 import shutil
 import stat
@@ -811,6 +1080,212 @@ def copy_tree(source, destination):
     visit(source, destination)
 
 
+def clone_pnpm_store(source, destination, approved_baseline):
+    clone = ctypes.CDLL(None, use_errno=True).fclonefileat
+    clone.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    clone.restype = ctypes.c_int
+
+    def safe_directory(details):
+        return (
+            stat.S_ISDIR(details.st_mode)
+            and details.st_uid in {0, os.getuid()}
+            and not details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        )
+
+    approved_identity, approved_payload = approved_baseline.split(" ")
+    records = []
+
+    def record_file(descriptor, details, relative):
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        records.append(
+            [
+                relative,
+                "file",
+                details.st_uid,
+                stat.S_IMODE(details.st_mode),
+                details.st_size,
+                details.st_dev,
+                details.st_ino,
+                digest.hexdigest(),
+            ]
+        )
+
+    def clone_tree(source_descriptor, destination_descriptor, prefix):
+        for name in sorted(os.listdir(source_descriptor)):
+            details = os.stat(name, dir_fd=source_descriptor, follow_symlinks=False)
+            relative = f"{prefix}/{name}"
+            if stat.S_ISDIR(details.st_mode):
+                if not safe_directory(details):
+                    raise ValueError
+                os.mkdir(name, 0o700, dir_fd=destination_descriptor)
+                child_source = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=source_descriptor,
+                )
+                child_destination = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=destination_descriptor,
+                )
+                try:
+                    if os.fstat(child_source) != details:
+                        raise ValueError
+                    records.append(
+                        [
+                            relative,
+                            "directory",
+                            details.st_uid,
+                            stat.S_IMODE(details.st_mode),
+                            details.st_dev,
+                            details.st_ino,
+                        ]
+                    )
+                    clone_tree(child_source, child_destination, relative)
+                finally:
+                    os.close(child_destination)
+                    os.close(child_source)
+                os.chmod(name, 0o500, dir_fd=destination_descriptor, follow_symlinks=False)
+            elif stat.S_ISREG(details.st_mode):
+                if (
+                    details.st_uid not in {0, os.getuid()}
+                    or details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or details.st_nlink != 1
+                ):
+                    raise ValueError
+                source_file = os.open(
+                    name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=source_descriptor
+                )
+                try:
+                    if os.fstat(source_file) != details:
+                        raise ValueError
+                    record_file(source_file, details, relative)
+                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:
+                        raise OSError(ctypes.get_errno(), "fclonefileat")
+                finally:
+                    os.close(source_file)
+                cloned = os.stat(name, dir_fd=destination_descriptor, follow_symlinks=False)
+                if not stat.S_ISREG(cloned.st_mode) or cloned.st_nlink != 1:
+                    raise ValueError
+                os.chmod(name, 0o400, dir_fd=destination_descriptor, follow_symlinks=False)
+            else:
+                raise ValueError
+
+    source_root = Path(source)
+    destination_root = Path(destination)
+    source_descriptor = os.open(
+        source_root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        root_details = os.fstat(source_descriptor)
+        source_details = source_root.lstat()
+        if source_details != root_details or not safe_directory(root_details):
+            raise ValueError
+        if set(os.listdir(source_descriptor)) != {"files", "index", "projects"}:
+            raise ValueError
+        records.append(
+            [
+                ".",
+                "directory",
+                root_details.st_uid,
+                stat.S_IMODE(root_details.st_mode),
+                root_details.st_dev,
+                root_details.st_ino,
+            ]
+        )
+        destination_root.parent.mkdir(mode=0o700)
+        destination_root.mkdir(mode=0o700)
+        destination_descriptor = os.open(
+            destination_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            for name in ("files", "index"):
+                details = os.stat(name, dir_fd=source_descriptor, follow_symlinks=False)
+                if not safe_directory(details):
+                    raise ValueError
+                os.mkdir(name, 0o700, dir_fd=destination_descriptor)
+                source_child = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=source_descriptor,
+                )
+                destination_child = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=destination_descriptor,
+                )
+                try:
+                    if os.fstat(source_child) != details:
+                        raise ValueError
+                    records.append(
+                        [
+                            name,
+                            "directory",
+                            details.st_uid,
+                            stat.S_IMODE(details.st_mode),
+                            details.st_dev,
+                            details.st_ino,
+                        ]
+                    )
+                    clone_tree(source_child, destination_child, name)
+                finally:
+                    os.close(destination_child)
+                    os.close(source_child)
+                os.chmod(name, 0o500, dir_fd=destination_descriptor, follow_symlinks=False)
+            project_details = os.stat("projects", dir_fd=source_descriptor, follow_symlinks=False)
+            if not safe_directory(project_details):
+                raise ValueError
+            project_descriptor = os.open(
+                "projects",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=source_descriptor,
+            )
+            try:
+                if os.fstat(project_descriptor) != project_details:
+                    raise ValueError
+            finally:
+                os.close(project_descriptor)
+            records.append(
+                [
+                    "projects",
+                    "opaque-directory",
+                    project_details.st_uid,
+                    stat.S_IMODE(project_details.st_mode),
+                    project_details.st_dev,
+                    project_details.st_ino,
+                ]
+            )
+            os.mkdir("projects", 0o700, dir_fd=destination_descriptor)
+            source_identity = hashlib.sha256(
+                json.dumps(records, separators=(",", ":")).encode("ascii")
+            ).hexdigest()
+            source_payload = hashlib.sha256(
+                json.dumps(
+                    [
+                        [record[0], record[1], record[-1] if record[1] == "file" else None]
+                        for record in records
+                        if record[0] != "." and record[0] != "projects"
+                    ],
+                    separators=(",", ":"),
+                ).encode("ascii")
+            ).hexdigest()
+            if source_identity != approved_identity or source_payload != approved_payload:
+                raise ValueError
+            os.fchmod(destination_descriptor, 0o500)
+        finally:
+            os.close(destination_descriptor)
+    finally:
+        os.close(source_descriptor)
+
+
 try:
     docker_config = Path(sys.argv[1])
     trusted_bin = Path(sys.argv[2])
@@ -832,9 +1307,55 @@ try:
     ):
         copy_exclusive(Path(executable), trusted_bin / name)
     copy_tree(Path(sys.argv[7]), Path(sys.argv[8]))
+    clone_pnpm_store(sys.argv[9], sys.argv[10], sys.argv[11])
 except (OSError, ValueError):
     raise SystemExit(2) from None
 PY
+        then
+            discard_private_environment "$private_environment" \
+                || blocked 'BLOCKED_GATE_CLEANUP_FAILED'
+            blocked 'BLOCKED_PRIVATE_DIRECTORY'
+        fi
+        private_pnpm_store_identity=$(capture_pnpm_store_identity "$private_pnpm_store" private) \
+            || blocked 'BLOCKED_PRIVATE_DIRECTORY'
+        private_pnpm_store_payload_identity=$(capture_pnpm_store_identity \
+            "$private_pnpm_store" private payload) \
+            || blocked 'BLOCKED_PRIVATE_DIRECTORY'
+        [ "$private_pnpm_store_payload_identity" = "$pnpm_store_payload_identity" ] \
+            || blocked 'BLOCKED_PRIVATE_DIRECTORY'
+        docker_host=$(/usr/bin/env -i \
+            HOME=/var/empty PATH="$trusted_path" TMPDIR=/tmp \
+            DOCKER_CONFIG="$docker_config" \
+            "$docker_tool" context inspect \
+            --format '{{.Endpoints.docker.Host}}' 2>/dev/null) \
+            || blocked 'BLOCKED_INVALID_DOCKER_CONFIG'
+        if [ -n "$sanitized_context_host" ] \
+            && [ "$docker_host" != "$sanitized_context_host" ]; then
+            blocked 'BLOCKED_INVALID_DOCKER_CONFIG'
+        fi
+        docker_host=$(bootstrap_python - "$docker_host" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+try:
+    raw = sys.argv[1]
+    if not raw.startswith("unix://") or any(ord(character) < 0x20 for character in raw):
+        raise ValueError
+    socket_path = Path(raw.removeprefix("unix://"))
+    if (
+        not socket_path.is_absolute()
+        or str(socket_path) != os.path.normpath(socket_path)
+        or any(part in {"", ".", ".."} for part in socket_path.parts[1:])
+    ):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(2) from None
+print(raw)
+PY
+) || blocked 'BLOCKED_INVALID_DOCKER_CONFIG'
+        verify_release_docker_socket "$docker_host" \
+            || blocked 'BLOCKED_INVALID_DOCKER_CONFIG'
         exec /usr/bin/env -i \
             HOME=/var/empty PATH=/usr/bin:/bin TMPDIR=/tmp \
             /usr/bin/python3 -I -S - \
@@ -843,13 +1364,15 @@ PY
             "$normalized_tmp_root" "${NAS_PLATFORM:-}" \
             "${RELEASE_GATE_IMAGE_RECORD:-}" "$private_docker_config" \
             "$docker_host" \
-            "$uv_cache" "$playwright_cache" "$pnpm_store" \
+            "$uv_cache" "$playwright_cache" "$private_pnpm_store" \
             "$uv_tool_identity" "$pnpm_tool_identity" \
             "$docker_tool_identity" "$node_tool_identity" \
             "$buildx_tool_identity" "$approved_python" \
             "$python_runtime_root" "$python_runtime_identity" \
             "$pnpm_package_root" "$pnpm_package_identity" \
-            "$playwright_cache_identity" "$pnpm_store_identity" <<'PY'
+            "$playwright_cache_identity" "$pnpm_store" "$pnpm_store_identity" \
+            "$private_pnpm_store_identity" "$sandbox_exec" \
+            "$sandbox_exec_identity" <<'PY'
 from __future__ import annotations
 
 import os
@@ -860,6 +1383,8 @@ import stat
 import subprocess
 import sys
 import time
+import hashlib
+import json
 from pathlib import Path
 
 (
@@ -886,7 +1411,11 @@ from pathlib import Path
     pnpm_package_root,
     pnpm_package_identity,
     playwright_cache_identity,
+    pnpm_source_store,
     pnpm_store_identity,
+    private_pnpm_store_identity,
+    sandbox_exec_raw,
+    sandbox_exec_identity,
 ) = sys.argv[1:]
 private_root = Path(private_root_raw)
 tmp_root = Path(tmp_root_raw)
@@ -901,6 +1430,61 @@ interrupted = False
 termination_deadline: float | None = None
 
 
+def verify_sandbox_exec() -> Path:
+    path = Path(sandbox_exec_raw)
+    expected = sandbox_exec_identity.split(":")
+    if len(expected) != 6 or re.fullmatch(r"[0-9a-f]{64}", expected[5]) is None:
+        raise OSError
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        details = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    if (
+        path != Path("/usr/bin/sandbox-exec")
+        or path.is_symlink()
+        or path.resolve(strict=True) != path
+        or not stat.S_ISREG(details.st_mode)
+        or tuple(expected)
+        != (
+            str(details.st_uid),
+            str(stat.S_IMODE(details.st_mode)),
+            str(details.st_dev),
+            str(details.st_ino),
+            str(details.st_size),
+            digest.hexdigest(),
+        )
+    ):
+        raise OSError
+    return path
+
+
+try:
+    sandbox_exec = verify_sandbox_exec()
+except OSError:
+    print("BLOCKED_UNSAFE_RELEASE_ENVIRONMENT", file=sys.stderr)
+    raise SystemExit(2) from None
+
+private_store = Path(pnpm_store)
+profile = "\n".join(
+    (
+        "(version 1)",
+        "(allow default)",
+        f"(deny file-write* (literal {json.dumps(str(private_store.parent.parent))}))",
+        f"(deny file-write* (literal {json.dumps(str(private_store.parent))}))",
+        f"(deny file-write* (literal {json.dumps(str(private_store))}))",
+        f"(deny file-write* (subpath {json.dumps(str(private_store / 'files'))}))",
+        f"(deny file-write* (subpath {json.dumps(str(private_store / 'index'))}))",
+    )
+)
+
+
 def forward_signal(signum: int, _frame: object) -> None:
     global interrupted, termination_deadline
     interrupted = True
@@ -913,17 +1497,146 @@ def forward_signal(signum: int, _frame: object) -> None:
 
 
 def remove_private_root() -> None:
-    details = private_root.lstat()
-    if (
-        private_root.parent != tmp_root
-        or not private_root.name.startswith("travel-map-release-environment.")
-        or private_root.resolve(strict=True) != private_root
-        or not stat.S_ISDIR(details.st_mode)
-        or stat.S_IMODE(details.st_mode) != 0o700
-        or details.st_uid != os.getuid()
+    def remove_non_directory(directory_descriptor: int, name: str, expected: os.stat_result) -> None:
+        quarantine_name: str | None = None
+        for _ in range(16):
+            candidate = ".release-gate-cleanup-" + os.urandom(16).hex()
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=directory_descriptor)
+            except FileExistsError:
+                continue
+            quarantine_name = candidate
+            break
+        if quarantine_name is None:
+            raise OSError
+        quarantine_descriptor = os.open(
+            quarantine_name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+        quarantine_details = os.fstat(quarantine_descriptor)
+        quarantine_identity = (
+            quarantine_details.st_dev,
+            quarantine_details.st_ino,
+            stat.S_IFMT(quarantine_details.st_mode),
+        )
+        if (
+            (current := os.stat(
+                quarantine_name, dir_fd=directory_descriptor, follow_symlinks=False
+            )).st_dev,
+            current.st_ino,
+            stat.S_IFMT(current.st_mode),
+        ) != quarantine_identity:
+            os.close(quarantine_descriptor)
+            raise OSError
+        try:
+            os.rename(
+                name,
+                name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=quarantine_descriptor,
+            )
+            current = os.stat(name, dir_fd=quarantine_descriptor, follow_symlinks=False)
+            if (
+                current.st_dev,
+                current.st_ino,
+                stat.S_IFMT(current.st_mode),
+            ) != (
+                expected.st_dev,
+                expected.st_ino,
+                stat.S_IFMT(expected.st_mode),
+            ):
+                # Leaving an unexpected entry quarantined is safer than replacing
+                # a name that a concurrent writer may have recreated.
+                raise OSError
+            os.unlink(name, dir_fd=quarantine_descriptor)
+        finally:
+            os.close(quarantine_descriptor)
+            current = os.stat(
+                quarantine_name, dir_fd=directory_descriptor, follow_symlinks=False
+            )
+            if (
+                current.st_dev,
+                current.st_ino,
+                stat.S_IFMT(current.st_mode),
+            ) != quarantine_identity:
+                raise OSError
+            os.rmdir(quarantine_name, dir_fd=directory_descriptor)
+
+    def remove_contents(directory_descriptor: int) -> None:
+        os.fchmod(directory_descriptor, 0o700)
+        for name in os.listdir(directory_descriptor):
+            details = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(details.st_mode):
+                child = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    if os.fstat(child) != details:
+                        raise OSError
+                    remove_contents(child)
+                finally:
+                    os.close(child)
+                current = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+                if (
+                    current.st_dev,
+                    current.st_ino,
+                    stat.S_IFMT(current.st_mode),
+                ) != (
+                    details.st_dev,
+                    details.st_ino,
+                    stat.S_IFMT(details.st_mode),
+                ):
+                    raise OSError
+                os.rmdir(name, dir_fd=directory_descriptor)
+            else:
+                remove_non_directory(directory_descriptor, name, details)
+
+    if private_root.parent != tmp_root or not private_root.name.startswith(
+        "travel-map-release-environment."
     ):
         raise OSError
-    shutil.rmtree(private_root)
+    parent_descriptor = os.open(
+        tmp_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        expected = os.stat(private_root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(expected.st_mode)
+            or stat.S_IMODE(expected.st_mode) != 0o700
+            or expected.st_uid != os.getuid()
+        ):
+            raise OSError
+        root_descriptor = os.open(
+            private_root.name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        try:
+            bound_root = os.fstat(root_descriptor)
+            if bound_root != expected:
+                raise OSError
+            remove_contents(root_descriptor)
+        finally:
+            os.close(root_descriptor)
+        current_root = os.stat(
+            private_root.name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        if (
+            current_root.st_dev,
+            current_root.st_ino,
+            stat.S_IFMT(current_root.st_mode),
+        ) != (
+            bound_root.st_dev,
+            bound_root.st_ino,
+            stat.S_IFMT(bound_root.st_mode),
+        ):
+            raise OSError
+        os.rmdir(private_root.name, dir_fd=parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
 
 
 def open_requested_record_parent(*, require_empty: bool) -> int:
@@ -1246,7 +1959,11 @@ environment = {
     "TRAVEL_MAP_RELEASE_PNPM_PACKAGE": pnpm_package_root,
     "TRAVEL_MAP_RELEASE_PNPM_PACKAGE_IDENTITY": pnpm_package_identity,
     "TRAVEL_MAP_RELEASE_PLAYWRIGHT_IDENTITY": playwright_cache_identity,
+    "TRAVEL_MAP_RELEASE_PNPM_SOURCE_STORE": pnpm_source_store,
     "TRAVEL_MAP_RELEASE_PNPM_STORE_IDENTITY": pnpm_store_identity,
+    "TRAVEL_MAP_RELEASE_PRIVATE_PNPM_STORE_IDENTITY": private_pnpm_store_identity,
+    "TRAVEL_MAP_RELEASE_PNPM_SANDBOX_EXEC": str(sandbox_exec),
+    "TRAVEL_MAP_RELEASE_PNPM_SANDBOX_PROFILE": profile,
 }
 status = 2
 failure_message: str | None = None
@@ -1334,7 +2051,7 @@ unset CPATH LIBRARY_PATH MANPATH SDKROOT __CF_USER_TEXT_ENCODING
 /usr/bin/python3 -I -S - \
     "$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/trusted-bin:$trusted_path" \
     "$normalized_tmp_root" "$DOCKER_CONFIG" "$uv_cache" \
-    "$playwright_cache" "$pnpm_store" "$uv_tool" "$node_tool" \
+    "$playwright_cache" "$PNPM_STORE_DIR" "$uv_tool" "$node_tool" \
     "$TRAVEL_MAP_RELEASE_DOCKER_HOST" \
     "${TRAVEL_MAP_RELEASE_UV_IDENTITY:-}" \
     "${TRAVEL_MAP_RELEASE_PNPM_IDENTITY:-}" \
@@ -1346,8 +2063,12 @@ unset CPATH LIBRARY_PATH MANPATH SDKROOT __CF_USER_TEXT_ENCODING
     "${TRAVEL_MAP_RELEASE_PNPM_PACKAGE:-}" \
     "${TRAVEL_MAP_RELEASE_PNPM_PACKAGE_IDENTITY:-}" \
     "${TRAVEL_MAP_RELEASE_PLAYWRIGHT_IDENTITY:-}" \
+    "${TRAVEL_MAP_RELEASE_PNPM_SOURCE_STORE:-}" \
     "${TRAVEL_MAP_RELEASE_PNPM_STORE_IDENTITY:-}" \
-    "$docker_tool" "$buildx_tool" <<'PY' \
+    "${TRAVEL_MAP_RELEASE_PRIVATE_PNPM_STORE_IDENTITY:-}" \
+    "$docker_tool" "$buildx_tool" \
+    "${TRAVEL_MAP_RELEASE_PNPM_SANDBOX_EXEC:-}" \
+    "${TRAVEL_MAP_RELEASE_PNPM_SANDBOX_PROFILE:-}" <<'PY' \
     || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
 import os
 import hashlib
@@ -1387,7 +2108,11 @@ expected = {
     "TRAVEL_MAP_RELEASE_PNPM_PACKAGE": sys.argv[18],
     "TRAVEL_MAP_RELEASE_PNPM_PACKAGE_IDENTITY": sys.argv[19],
     "TRAVEL_MAP_RELEASE_PLAYWRIGHT_IDENTITY": sys.argv[20],
-    "TRAVEL_MAP_RELEASE_PNPM_STORE_IDENTITY": sys.argv[21],
+    "TRAVEL_MAP_RELEASE_PNPM_SOURCE_STORE": sys.argv[21],
+    "TRAVEL_MAP_RELEASE_PNPM_STORE_IDENTITY": sys.argv[22],
+    "TRAVEL_MAP_RELEASE_PRIVATE_PNPM_STORE_IDENTITY": sys.argv[23],
+    "TRAVEL_MAP_RELEASE_PNPM_SANDBOX_EXEC": sys.argv[26],
+    "TRAVEL_MAP_RELEASE_PNPM_SANDBOX_PROFILE": sys.argv[27],
 }
 private_layout = {
     "HOME": "home",
@@ -1404,6 +2129,7 @@ controlled_layout = {
     "trusted-bin",
     "release-record",
     "pnpm-package",
+    "pnpm-store",
 }
 required_paths = set(private_layout) | set(derived_paths) | {private_root_name}
 allowed_inputs = {"NAS_PLATFORM", "RELEASE_GATE_IMAGE_RECORD"}
@@ -1484,8 +2210,8 @@ try:
     private_tools = (
         ("uv", sys.argv[7], sys.argv[10]),
         ("node", sys.argv[8], sys.argv[13]),
-        ("docker", sys.argv[22], sys.argv[12]),
-        ("docker-buildx", sys.argv[23], sys.argv[14]),
+        ("docker", sys.argv[24], sys.argv[12]),
+        ("docker-buildx", sys.argv[25], sys.argv[14]),
     )
     for name, executable, identity in private_tools:
         path = trusted_bin / name
@@ -1539,7 +2265,9 @@ expected_python_runtime_identity=$TRAVEL_MAP_RELEASE_PYTHON_RUNTIME_IDENTITY
 pnpm_package_root=$TRAVEL_MAP_RELEASE_PNPM_PACKAGE
 expected_pnpm_package_identity=$TRAVEL_MAP_RELEASE_PNPM_PACKAGE_IDENTITY
 expected_playwright_cache_identity=$TRAVEL_MAP_RELEASE_PLAYWRIGHT_IDENTITY
+source_pnpm_store=$TRAVEL_MAP_RELEASE_PNPM_SOURCE_STORE
 expected_pnpm_store_identity=$TRAVEL_MAP_RELEASE_PNPM_STORE_IDENTITY
+expected_private_pnpm_store_identity=$TRAVEL_MAP_RELEASE_PRIVATE_PNPM_STORE_IDENTITY
 unset TRAVEL_MAP_RELEASE_DOCKER_HOST \
     TRAVEL_MAP_RELEASE_UV_IDENTITY TRAVEL_MAP_RELEASE_PNPM_IDENTITY \
     TRAVEL_MAP_RELEASE_DOCKER_IDENTITY TRAVEL_MAP_RELEASE_NODE_IDENTITY \
@@ -1549,7 +2277,9 @@ unset TRAVEL_MAP_RELEASE_DOCKER_HOST \
     TRAVEL_MAP_RELEASE_PNPM_PACKAGE \
     TRAVEL_MAP_RELEASE_PNPM_PACKAGE_IDENTITY \
     TRAVEL_MAP_RELEASE_PLAYWRIGHT_IDENTITY \
-    TRAVEL_MAP_RELEASE_PNPM_STORE_IDENTITY
+    TRAVEL_MAP_RELEASE_PNPM_SOURCE_STORE \
+    TRAVEL_MAP_RELEASE_PNPM_STORE_IDENTITY \
+    TRAVEL_MAP_RELEASE_PRIVATE_PNPM_STORE_IDENTITY
 
 trusted_uv_cache=$UV_CACHE_DIR
 test_uv_environment=$UV_PROJECT_ENVIRONMENT
@@ -1651,7 +2381,9 @@ cleanup() {
 interrupted_cleanup() {
     interrupted=1
     trap - HUP INT TERM
-    exit 2
+    # Let run_untrusted_verified reap its child and perform its mandatory
+    # post-invocation identities before this shell's EXIT cleanup runs.
+    return 0
 }
 
 trap cleanup EXIT
@@ -1881,6 +2613,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 process = None
 interrupted = False
@@ -1935,7 +2668,14 @@ for handled in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
 try:
     if interrupted:
         raise OSError
-    process = subprocess.Popen(sys.argv[1:], start_new_session=True)
+    command = sys.argv[1:]
+    if Path(command[0]).name in {"pnpm", "pnpm.mjs"}:
+        sandbox_exec = os.environ.get("TRAVEL_MAP_RELEASE_PNPM_SANDBOX_EXEC")
+        sandbox_profile = os.environ.get("TRAVEL_MAP_RELEASE_PNPM_SANDBOX_PROFILE")
+        if not sandbox_exec or not sandbox_profile:
+            raise OSError
+        command = [sandbox_exec, "-p", sandbox_profile, *command]
+    process = subprocess.Popen(command, start_new_session=True)
     if interrupted and process.poll() is None:
         os.killpg(process.pid, signal.SIGTERM)
     while True:
@@ -1983,7 +2723,7 @@ verify_runtime_anchors() {
         "$expected_python_runtime_identity" "$pnpm_package_root" \
         "$expected_pnpm_package_identity" "$PLAYWRIGHT_BROWSERS_PATH" \
         "$expected_playwright_cache_identity" "$trusted_uv_cache" \
-        "$PNPM_STORE_DIR" "$expected_pnpm_store_identity" <<'PY'
+        <<'PY'
 import hashlib
 import json
 import os
@@ -2126,8 +2866,6 @@ try:
     playwright_cache = Path(arguments[17])
     expected_playwright_cache_identity = arguments[18]
     trusted_uv_cache = Path(arguments[19])
-    pnpm_store = Path(arguments[20])
-    expected_pnpm_store_identity = arguments[21]
     validate_trusted_root(trusted_uv_cache)
     if (
         approved_python != python_runtime_root / "bin/python3.12"
@@ -2155,12 +2893,6 @@ try:
     if (
         runtime_identity(private_pnpm_package, strict_ancestors=False)
         != expected_pnpm_package_identity
-    ):
-        raise ValueError
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", expected_pnpm_store_identity) is None
-        or runtime_identity(pnpm_store, reject_symlinks=True)
-        != expected_pnpm_store_identity
     ):
         raise ValueError
     for directory in (trusted_bin, docker_config):
@@ -2217,12 +2949,33 @@ except (OSError, ValueError):
 PY
 }
 
+verify_pnpm_stores() {
+    set +e
+    actual_source_pnpm_store_identity=$(capture_pnpm_store_identity \
+        "$source_pnpm_store")
+    source_capture_status=$?
+    actual_private_pnpm_store_identity=$(capture_pnpm_store_identity \
+        "$PNPM_STORE_DIR" private)
+    private_capture_status=$?
+    set -e
+    [ "$source_capture_status" -eq 0 ] \
+        && [ "$private_capture_status" -eq 0 ] || return 1
+    [ "$actual_source_pnpm_store_identity" = "$expected_pnpm_store_identity" ] \
+        && [ "$actual_private_pnpm_store_identity" = "$expected_private_pnpm_store_identity" ]
+}
+
 run_untrusted_verified() {
     verify_runtime_anchors || return 2
+    case "$1" in
+        "$pnpm_tool") verify_pnpm_stores || return 2 ;;
+    esac
     set +e
     run_untrusted "$@"
     untrusted_status=$?
     set -e
+    case "$1" in
+        "$pnpm_tool") verify_pnpm_stores || return 2 ;;
+    esac
     verify_runtime_anchors || return 2
     return "$untrusted_status"
 }

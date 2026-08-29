@@ -387,6 +387,10 @@ if sys.argv[1:] and not sys.argv[1].startswith("--nested-resolution-probe"):
     pnpm_bundle_literal = repr(str(pnpm_bundle.resolve()))
     pnpm_poison_literal = repr(str(events.with_suffix(".pnpm-bundle-poison")))
     pnpm_poisoned_literal = repr(str(events.with_suffix(".pnpm-bundle-poisoned")))
+    pnpm_root_replace_literal = repr(str(events.with_suffix(".pnpm-root-replace")))
+    pnpm_root_replace_result_literal = repr(
+        str(events.with_suffix(".pnpm-root-replace-result"))
+    )
     browser_poison_literal = repr(str(events.with_suffix(".browser-cache-poison")))
     browser_poisoned_literal = repr(str(events.with_suffix(".browser-cache-poisoned")))
     browser_cache = playwright_cache or fake_bin.parent / "playwright-cache"
@@ -649,7 +653,31 @@ import subprocess
 import sys
 from pathlib import Path
 with Path({event_literal}).open("a", encoding="utf-8") as output:
-    output.write(json.dumps({{"tool": "pnpm", "args": sys.argv[1:], "cwd": str(Path.cwd()), "environment": sorted(os.environ), "docker_config_payload": (Path(os.environ["DOCKER_CONFIG"]) / "config.json").read_text(encoding="utf-8"), "executable": sys.argv[0]}}) + "\\n")
+    output.write(json.dumps({{"tool": "pnpm", "args": sys.argv[1:], "cwd": str(Path.cwd()), "environment": dict(sorted(os.environ.items())), "pnpm_store_dir": os.environ["PNPM_STORE_DIR"], "docker_config_payload": (Path(os.environ["DOCKER_CONFIG"]) / "config.json").read_text(encoding="utf-8"), "executable": sys.argv[0]}}) + "\\n")
+if Path({pnpm_root_replace_literal}).exists():
+    store = Path(os.environ["PNPM_STORE_DIR"])
+    files = store / "files"
+    backup = store / "files.replacement"
+    try:
+        if Path({pnpm_root_replace_literal}).read_text(encoding="utf-8").strip() == "chmod":
+            store.chmod(0o700)
+        os.replace(files, backup)
+        if Path({pnpm_root_replace_literal}).read_text(encoding="utf-8").strip() == "chmod":
+            replacement = store / "files.malicious"
+            replacement.mkdir(mode=0o700)
+            marker = replacement / "consumed-marker"
+            marker.write_text("malicious\\n", encoding="utf-8")
+            os.replace(replacement, files)
+            if marker.is_file():
+                Path({pnpm_root_replace_result_literal}).write_text("consumed\\n", encoding="utf-8")
+            os.replace(files, replacement)
+        os.replace(backup, files)
+        if Path({pnpm_root_replace_literal}).read_text(encoding="utf-8").strip() == "chmod":
+            store.chmod(0o500)
+    except OSError:
+        Path({pnpm_root_replace_result_literal}).write_text("chmod-blocked\\n" if Path({pnpm_root_replace_literal}).read_text(encoding="utf-8").strip() == "chmod" else "blocked\\n", encoding="utf-8")
+    else:
+        Path({pnpm_root_replace_result_literal}).write_text("replaced\\n", encoding="utf-8")
 if "install" in sys.argv[1:] and Path({store_attack_literal}).exists():
     payload = Path({pnpm_store_literal}) / "files/malicious-package/install.py"
     if payload.is_file():
@@ -801,6 +829,11 @@ def _release_gate_repository(
     tmp_path: Path,
     *,
     cleanup_pause: tuple[Path, Path] | None = None,
+    cleanup_swap_sync: tuple[Path, Path] | None = None,
+    cleanup_file_swap_sync: tuple[Path, Path] | None = None,
+    cleanup_quarantine_swap_sync: tuple[Path, Path] | None = None,
+    cleanup_quarantine_mismatch_sync: tuple[Path, Path] | None = None,
+    cleanup_root_swap_sync: tuple[Path, Path] | None = None,
     cache_parent: Path | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     repository = tmp_path / "repository"
@@ -871,18 +904,145 @@ def _release_gate_repository(
         PNPM_STORE_ASSIGNMENT,
         f"pnpm_store={pnpm_store}",
     )
+    if cleanup_swap_sync is not None:
+        pause_path, entered_path = cleanup_swap_sync
+        if os.environ.get("TRAVEL_MAP_TEST_LEGACY_PATH_CLEANUP") == "1":
+            start = gate_source.index("def remove_private_root() -> None:\n")
+            end = gate_source.index("\n\ndef open_requested_record_parent", start)
+            legacy_cleanup = f"""def remove_private_root() -> None:
+    details = private_root.lstat()
+    if (
+        private_root.parent != tmp_root
+        or not private_root.name.startswith("travel-map-release-environment.")
+        or private_root.resolve(strict=True) != private_root
+        or not stat.S_ISDIR(details.st_mode)
+        or stat.S_IMODE(details.st_mode) != 0o700
+        or details.st_uid != os.getuid()
+    ):
+        raise OSError
+    for directory, _children, _files in os.walk(
+        private_root, topdown=True, followlinks=False
+    ):
+        directory = Path(directory)
+        details = directory.lstat()
+        if directory.name == "projects":
+            Path({str(entered_path)!r}).write_text(
+                str(private_root), encoding="utf-8"
+            )
+            while Path({str(pause_path)!r}).exists():
+                time.sleep(0.01)
+        directory.chmod(0o700)
+    shutil.rmtree(private_root)
+"""
+            gate_source = gate_source[:start] + legacy_cleanup + gate_source[end:]
+        else:
+            gate_source = _replace_once(
+                gate_source,
+                (
+                    "                    if os.fstat(child) != details:\n"
+                    "                        raise OSError\n"
+                    "                    remove_contents(child)\n"
+                ),
+                (
+                    "                    if os.fstat(child) != details:\n"
+                    "                        raise OSError\n"
+                    '                    if name == "projects":\n'
+                    f"                        Path({str(entered_path)!r}).write_text(\n"
+                    '                            str(private_root), encoding="utf-8"\n'
+                    "                        )\n"
+                    f"                        while Path({str(pause_path)!r}).exists():\n"
+                    "                            time.sleep(0.01)\n"
+                    "                    remove_contents(child)\n"
+                ),
+            )
+    if cleanup_file_swap_sync is not None:
+        pause_path, entered_path = cleanup_file_swap_sync
+        start = gate_source.index("def remove_private_root() -> None:\n")
+        anchor = (
+            "            details = os.stat(name, dir_fd=directory_descriptor, "
+            "follow_symlinks=False)\n"
+        )
+        position = gate_source.index(anchor, start)
+        gate_source = (
+            gate_source[:position]
+            + anchor
+            + '            if name == "cleanup-regular-entry" and not stat.S_ISDIR(details.st_mode):\n'
+            + f"                Path({str(entered_path)!r}).write_text(\n"
+            + '                    str(private_root), encoding="utf-8"\n'
+            + "                )\n"
+            + f"                while Path({str(pause_path)!r}).exists():\n"
+            + "                    time.sleep(0.01)\n"
+            + gate_source[position + len(anchor) :]
+        )
+    if cleanup_quarantine_swap_sync is not None:
+        pause_path, entered_path = cleanup_quarantine_swap_sync
+        start = gate_source.index("def remove_private_root() -> None:\n")
+        anchor = "        try:\n            os.rename(\n"
+        position = gate_source.index(anchor, start)
+        gate_source = (
+            gate_source[:position]
+            + '        if name == "cleanup-regular-entry":\n'
+            + f"            Path({str(entered_path)!r}).write_text(\n"
+            + '                str(private_root), encoding="utf-8"\n'
+            + "            )\n"
+            + f"            while Path({str(pause_path)!r}).exists():\n"
+            + "                time.sleep(0.01)\n"
+            + gate_source[position:]
+        )
+    if cleanup_quarantine_mismatch_sync is not None:
+        pause_path, entered_path = cleanup_quarantine_mismatch_sync
+        start = gate_source.index("def remove_private_root() -> None:\n")
+        anchor = (
+            "            ):\n                # Leaving an unexpected entry quarantined"
+        )
+        position = gate_source.index(anchor, start)
+        gate_source = (
+            gate_source[:position]
+            + "            ):\n"
+            + f"                Path({str(entered_path)!r}).write_text(\n"
+            + '                    str(private_root), encoding="utf-8"\n'
+            + "                )\n"
+            + f"                while Path({str(pause_path)!r}).exists():\n"
+            + "                    time.sleep(0.01)\n"
+            + gate_source[position + len("            ):\n") :]
+        )
+    if cleanup_root_swap_sync is not None:
+        pause_path, entered_path = cleanup_root_swap_sync
+        root_cleanup = gate_source.index("def remove_private_root() -> None:\n")
+        pause_anchor = "            if bound_root != expected:\n"
+        pause_position = gate_source.index(pause_anchor, root_cleanup)
+        original = (
+            pause_anchor
+            + "                raise OSError\n"
+            + "            remove_contents(root_descriptor)\n"
+        )
+        replacement = (
+            pause_anchor
+            + "                raise OSError\n"
+            + f"            Path({str(entered_path)!r}).write_text(\n"
+            + '                str(private_root), encoding="utf-8"\n'
+            + "            )\n"
+            + f"            while Path({str(pause_path)!r}).exists():\n"
+            + "                time.sleep(0.01)\n"
+            + "            remove_contents(root_descriptor)\n"
+        )
+        gate_source = (
+            gate_source[:pause_position]
+            + replacement
+            + gate_source[pause_position + len(original) :]
+        )
     if cleanup_pause is not None:
         pause_path, entered_path = cleanup_pause
         gate_source = _replace_once(
             gate_source,
-            "    shutil.rmtree(private_root)\n",
+            "def remove_private_root() -> None:\n",
             (
+                "def remove_private_root() -> None:\n"
                 f"    Path({str(entered_path)!r}).write_text(\n"
                 '        str(private_root), encoding="utf-8"\n'
                 "    )\n"
                 f"    while Path({str(pause_path)!r}).exists():\n"
                 "        time.sleep(0.01)\n"
-                "    shutil.rmtree(private_root)\n"
             ),
         )
         gate_source = _replace_once(
@@ -1282,7 +1442,7 @@ def test_release_gate_rejects_unsafe_local_docker_socket(
 def test_release_gate_rejects_stale_uv_lock_without_rewriting_it(
     tmp_path: Path,
 ) -> None:
-    _, gate, _, events_path = _release_gate_repository(tmp_path)
+    _repository, gate, _, events_path = _release_gate_repository(tmp_path)
     events_path.with_suffix(".stale-lock").write_text("stale\n", encoding="utf-8")
 
     completed, record = _run_release_gate(
@@ -2490,14 +2650,1161 @@ def test_release_gate_accepts_standard_cache_metadata_without_opening_projects(
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     pnpm_events = [event for event in events if event["tool"] == "pnpm"]
     assert pnpm_events
-    assert str(pnpm_store) not in json.dumps(pnpm_events)
+    pnpm_payload = json.dumps(pnpm_events)
+    assert str(pnpm_store) not in pnpm_payload
+    assert str(pnpm_store / "projects") not in pnpm_payload
+    assert all(
+        event["pnpm_store_dir"] != str(pnpm_store)
+        and event["pnpm_store_dir"] != str(pnpm_store / "projects")
+        for event in pnpm_events
+    )
+    assert all(
+        str(pnpm_store) not in value and str(pnpm_store / "projects") not in value
+        for event in pnpm_events
+        for value in [*event["args"], *event["environment"].values()]
+    )
 
 
-def test_release_gate_rejects_extra_pnpm_store_top_level_entry(
+def test_release_gate_rejects_source_store_swap_during_private_materialization(
+    tmp_path: Path,
+) -> None:
+    repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    pnpm_store = tmp_path / "pnpm-store"
+    reviewed_files = tmp_path / "files.reviewed"
+    reviewed_index = tmp_path / "index.reviewed"
+    malicious_files = tmp_path / "files.malicious"
+    malicious_index = tmp_path / "index.malicious"
+    shutil.copytree(pnpm_store / "files", malicious_files)
+    shutil.copytree(pnpm_store / "index", malicious_index)
+    (malicious_files / "reviewed-store-entry").write_text(
+        "transient malicious store payload\n", encoding="utf-8"
+    )
+    (malicious_index / "reviewed-index-entry").write_text(
+        "transient malicious index payload\n", encoding="utf-8"
+    )
+    for directory in (malicious_files, malicious_index):
+        directory.chmod(0o700)
+        for child in directory.iterdir():
+            child.chmod(0o600)
+
+    source = gate.read_text(encoding="utf-8")
+    source = _replace_once(
+        source,
+        "        destination_root.parent.mkdir(mode=0o700)\n",
+        (
+            f"        os.replace(Path({str(pnpm_store / 'files')!r}), Path({str(reviewed_files)!r}))\n"
+            f"        os.replace(Path({str(malicious_files)!r}), Path({str(pnpm_store / 'files')!r}))\n"
+            f"        os.replace(Path({str(pnpm_store / 'index')!r}), Path({str(reviewed_index)!r}))\n"
+            f"        os.replace(Path({str(malicious_index)!r}), Path({str(pnpm_store / 'index')!r}))\n"
+            "        destination_root.parent.mkdir(mode=0o700)\n"
+        ),
+    )
+    source = _replace_once(
+        source,
+        "    clone_pnpm_store(sys.argv[9], sys.argv[10], sys.argv[11])\n",
+        (
+            "    clone_pnpm_store(sys.argv[9], sys.argv[10], sys.argv[11])\n"
+            f"    os.replace(Path({str(pnpm_store / 'files')!r}), Path({str(malicious_files)!r}))\n"
+            f"    os.replace(Path({str(reviewed_files)!r}), Path({str(pnpm_store / 'files')!r}))\n"
+            f"    os.replace(Path({str(pnpm_store / 'index')!r}), Path({str(malicious_index)!r}))\n"
+            f"    os.replace(Path({str(reviewed_index)!r}), Path({str(pnpm_store / 'index')!r}))\n"
+        ),
+    )
+    _write_executable(gate, source)
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", "instrument materialization race")
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_PRIVATE_DIRECTORY\n"
+    assert not record.exists()
+    assert not events_path.exists()
+
+
+def test_release_gate_private_pnpm_store_root_rejects_atomic_files_replacement(
     tmp_path: Path,
 ) -> None:
     _, gate, _, events_path = _release_gate_repository(tmp_path)
-    (tmp_path / "pnpm-store/ambient").mkdir(mode=0o700)
+    replacement = events_path.with_suffix(".pnpm-root-replace")
+    result = events_path.with_suffix(".pnpm-root-replace-result")
+    replacement.write_text("replace\n", encoding="utf-8")
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "ENCRYPTED_STORAGE_IMAGE_GATE_OK\n"
+    assert completed.stderr == ""
+    assert record.is_file()
+    assert result.read_text(encoding="utf-8") == "blocked\n"
+
+
+def test_release_gate_sandboxes_same_uid_pnpm_chmod_and_replacement(
+    tmp_path: Path,
+) -> None:
+    _, gate, _, events_path = _release_gate_repository(tmp_path)
+    replacement = events_path.with_suffix(".pnpm-root-replace")
+    result = events_path.with_suffix(".pnpm-root-replace-result")
+    replacement.write_text("chmod\n", encoding="utf-8")
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "ENCRYPTED_STORAGE_IMAGE_GATE_OK\n"
+    assert completed.stderr == ""
+    assert record.is_file()
+    assert result.read_text(encoding="utf-8") == "chmod-blocked\n"
+
+
+def test_release_gate_sandbox_blocks_pnpm_store_ancestor_exchange(
+    tmp_path: Path,
+) -> None:
+    _, gate, fake_bin, events_path = _release_gate_repository(tmp_path)
+    result = events_path.with_suffix(".pnpm-ancestor-exchange-result")
+    consumed = events_path.with_suffix(".pnpm-ancestor-marker-consumed")
+    pnpm_program = fake_bin / "pnpm-package/bin/pnpm.mjs"
+    pnpm_source = pnpm_program.read_text(encoding="utf-8")
+    injected = f"""
+store = Path(os.environ["PNPM_STORE_DIR"])
+canonical = store.parent
+private_root = canonical.parent
+malicious = private_root / "pnpm-store.malicious"
+reviewed = private_root / "pnpm-store.reviewed"
+renamed_reviewed = False
+renamed_malicious = False
+try:
+    for section in ("files", "index", "projects"):
+        (malicious / "v10" / section).mkdir(mode=0o700, parents=True, exist_ok=False)
+    marker = malicious / "v10/files/malicious-marker"
+    marker.write_text("malicious\\n", encoding="utf-8")
+    os.replace(canonical, reviewed)
+    renamed_reviewed = True
+    os.replace(malicious, canonical)
+    renamed_malicious = True
+    if (Path(os.environ["PNPM_STORE_DIR"]) / "files/malicious-marker").is_file():
+        Path({str(consumed)!r}).write_text("consumed\\n", encoding="utf-8")
+except OSError:
+    Path({str(result)!r}).write_text("blocked\\n", encoding="utf-8")
+else:
+    Path({str(result)!r}).write_text("exchanged\\n", encoding="utf-8")
+finally:
+    if renamed_malicious:
+        os.replace(canonical, malicious)
+    if renamed_reviewed:
+        os.replace(reviewed, canonical)
+"""
+    _write_executable(pnpm_program, pnpm_source + "\n" + injected)
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "ENCRYPTED_STORAGE_IMAGE_GATE_OK\n"
+    assert completed.stderr == ""
+    assert record.is_file()
+    assert result.read_text(encoding="utf-8") == "blocked\n"
+    assert not consumed.exists()
+
+
+@pytest.mark.parametrize("failure", ("missing",))
+def test_release_gate_blocks_before_pnpm_when_sandbox_is_unavailable(
+    tmp_path: Path, failure: str
+) -> None:
+    repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    source = gate.read_text(encoding="utf-8")
+    if failure == "missing":
+        source = _replace_once(
+            source,
+            "sandbox_exec=/usr/bin/sandbox-exec\n",
+            "sandbox_exec=/private/tmp/missing-release-sandbox-exec\n",
+        )
+    else:
+        source = source.replace(
+            "+    || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'\n",
+            "    || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'\n",
+        )
+        source = source.replace(
+            'sandbox_exec_identity=$(capture_release_tool_identity "$sandbox_exec")',
+            "sandbox_exec_identity=not-a-pinned-identity #",
+            1,
+        )
+    _write_executable(gate, source)
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", "inject unavailable pnpm sandbox")
+
+    completed, record = _run_release_gate(
+        tmp_path, gate, docker_config=_protected_docker_config(tmp_path)
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert not record.exists()
+    events = (
+        [json.loads(line) for line in events_path.read_text().splitlines()]
+        if events_path.exists()
+        else []
+    )
+    assert not [event for event in events if event["tool"] == "pnpm"]
+
+
+def test_release_gate_checks_pnpm_stores_immediately_before_pnpm(
+    tmp_path: Path,
+) -> None:
+    repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    source = gate.read_text(encoding="utf-8")
+    mutation = f'    if [ "$1" = "$pnpm_tool" ]; then printf %s injected > {str(tmp_path / "pnpm-store/files/reviewed-store-entry")!r}; fi\n'
+    if '    verify_runtime_anchors || return 2\n    case "$1" in\n' in source:
+        old = '    verify_runtime_anchors || return 2\n    case "$1" in\n'
+        new = (
+            "    verify_runtime_anchors || return 2\n" + mutation + '    case "$1" in\n'
+        )
+    elif (
+        "    verify_pnpm_stores || return 2\n    verify_runtime_anchors || return 2\n"
+        in source
+    ):
+        old = "    verify_pnpm_stores || return 2\n    verify_runtime_anchors || return 2\n"
+        new = (
+            "    verify_pnpm_stores || return 2\n"
+            + mutation
+            + "    verify_runtime_anchors || return 2\n"
+        )
+    else:
+        old = "    verify_runtime_anchors || return 2\n    verify_pnpm_stores || return 2\n"
+        new = (
+            "    verify_runtime_anchors || return 2\n"
+            + mutation
+            + "    verify_pnpm_stores || return 2\n"
+        )
+    source = _replace_once(
+        source,
+        old,
+        new,
+    )
+    _write_executable(gate, source)
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", "instrument pnpm verification gap")
+
+    completed, record = _run_release_gate(
+        tmp_path, gate, docker_config=_protected_docker_config(tmp_path)
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_INVALID_RELEASE_ARTIFACT\n"
+    assert not record.exists()
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert not [event for event in events if event["tool"] == "pnpm"]
+
+
+@pytest.mark.parametrize(
+    "termination_signal",
+    (signal.SIGHUP, signal.SIGINT, signal.SIGTERM),
+)
+def test_release_gate_recaptures_both_pnpm_stores_after_signal(
+    tmp_path: Path,
+    termination_signal: signal.Signals,
+) -> None:
+    repository, gate, fake_bin, events_path = _release_gate_repository(tmp_path)
+    pnpm_event = events_path.with_suffix(".pnpm-signal-event")
+    mutated = events_path.with_suffix(".pnpm-signal-mutated")
+    captures = events_path.with_suffix(".pnpm-signal-captures")
+    pid_path = events_path.with_suffix(".pnpm-signal-pid")
+    source = gate.read_text(encoding="utf-8")
+    original = """verify_pnpm_stores() {
+    set +e
+    actual_source_pnpm_store_identity=$(capture_pnpm_store_identity \\
+        \"$source_pnpm_store\")
+    source_capture_status=$?
+    actual_private_pnpm_store_identity=$(capture_pnpm_store_identity \\
+        \"$PNPM_STORE_DIR\" private)
+    private_capture_status=$?
+    set -e
+    [ \"$source_capture_status\" -eq 0 ] \\
+        && [ \"$private_capture_status\" -eq 0 ] || return 1
+    [ \"$actual_source_pnpm_store_identity\" = \"$expected_pnpm_store_identity\" ] \\
+        && [ \"$actual_private_pnpm_store_identity\" = \"$expected_private_pnpm_store_identity\" ]
+}
+"""
+    instrumented = f"""verify_pnpm_stores() {{
+    set +e
+    actual_source_pnpm_store_identity=$(capture_pnpm_store_identity \\
+        \"$source_pnpm_store\")
+    source_capture_status=$?
+    if [ -f {str(pnpm_event)!r} ]; then printf '%s\\n' source >> {str(captures)!r}; fi
+    actual_private_pnpm_store_identity=$(capture_pnpm_store_identity \\
+        \"$PNPM_STORE_DIR\" private)
+    private_capture_status=$?
+    if [ -f {str(pnpm_event)!r} ]; then printf '%s\\n' private >> {str(captures)!r}; fi
+    set -e
+    [ \"$source_capture_status\" -eq 0 ] \\
+        && [ \"$private_capture_status\" -eq 0 ] || return 1
+    [ \"$actual_source_pnpm_store_identity\" = \"$expected_pnpm_store_identity\" ] \\
+        && [ \"$actual_private_pnpm_store_identity\" = \"$expected_private_pnpm_store_identity\" ]
+}}
+"""
+    source = _replace_once(source, original, instrumented)
+    source = _replace_once(
+        source,
+        '        command = [sandbox_exec, "-p", sandbox_profile, *command]\n',
+        "        command = command\n",
+    )
+    _write_executable(gate, source)
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", "instrument post-signal pnpm checks")
+
+    pnpm_program = fake_bin / "pnpm-package/bin/pnpm.mjs"
+    pnpm_source = pnpm_program.read_text(encoding="utf-8")
+    injected = f"""
+event = Path({str(pnpm_event)!r})
+event.write_text(os.environ["PNPM_STORE_DIR"], encoding="utf-8")
+source_marker = Path({str(tmp_path / "pnpm-store/files/reviewed-store-entry")!r})
+source_marker.write_text("mutated after pnpm event\\n", encoding="utf-8")
+(Path(os.environ["PNPM_STORE_DIR"]) / "projects").chmod(0o750)
+Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding="ascii")
+Path({str(mutated)!r}).write_text("mutated\\n", encoding="utf-8")
+import time
+while True:
+    time.sleep(1)
+"""
+    _write_executable(pnpm_program, pnpm_source + "\n" + injected)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 90
+        while not mutated.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError("fake pnpm did not mutate after its event")
+            time.sleep(0.05)
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(f"fake pnpm exited before mutation: {stderr!r}")
+        process.send_signal(termination_signal)
+        stdout, stderr = process.communicate(timeout=20)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+    assert process.returncode == 2
+    assert stdout == ""
+    assert not record.exists()
+    assert not Path(pnpm_event.read_text(encoding="utf-8")).parent.parent.exists()
+    assert captures.read_text(encoding="utf-8").splitlines() == ["source", "private"]
+    pnpm_pid = int(pid_path.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pnpm_pid, 0)
+
+
+@pytest.mark.parametrize(
+    "termination_signal",
+    (signal.SIGHUP, signal.SIGINT, signal.SIGTERM),
+)
+def test_release_gate_recaptures_private_store_when_source_capture_fails_after_signal(
+    tmp_path: Path,
+    termination_signal: signal.Signals,
+) -> None:
+    repository, gate, fake_bin, events_path = _release_gate_repository(tmp_path)
+    pnpm_event = events_path.with_suffix(".pnpm-capture-error-event")
+    mutated = events_path.with_suffix(".pnpm-capture-error-mutated")
+    captures = events_path.with_suffix(".pnpm-capture-error-captures")
+    pid_path = events_path.with_suffix(".pnpm-capture-error-pid")
+    source = gate.read_text(encoding="utf-8")
+    source = _replace_once(
+        source,
+        "capture_pnpm_store_identity() {\n",
+        "capture_pnpm_store_identity_real() {\n",
+    )
+    source = _replace_once(
+        source,
+        "PY\n}\npython_runtime_identity=",
+        f"""PY
+}}
+
+capture_pnpm_store_identity() {{
+    set +e
+    captured=$(capture_pnpm_store_identity_real "$@")
+    capture_status=$?
+    set -e
+    if [ -f {str(pnpm_event)!r} ]; then
+        if [ "$1" = "$source_pnpm_store" ]; then
+            printf '%s\\n' source >> {str(captures)!r}
+        else
+            printf '%s\\n' private >> {str(captures)!r}
+        fi
+    fi
+    printf '%s' "$captured"
+    return "$capture_status"
+}}
+
+python_runtime_identity=""",
+    )
+    source = _replace_once(
+        source,
+        '        command = [sandbox_exec, "-p", sandbox_profile, *command]\n',
+        "        command = command\n",
+    )
+    _write_executable(gate, source)
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", "instrument failed post-signal source capture")
+
+    pnpm_program = fake_bin / "pnpm-package/bin/pnpm.mjs"
+    pnpm_source = pnpm_program.read_text(encoding="utf-8")
+    injected = f"""
+event = Path({str(pnpm_event)!r})
+event.write_text(os.environ["PNPM_STORE_DIR"], encoding="utf-8")
+source_files = Path({str(tmp_path / "pnpm-store/files")!r})
+reviewed_files = source_files.with_name("files.reviewed")
+invalid_files = source_files.with_name("files.invalid")
+os.replace(source_files, reviewed_files)
+invalid_files.symlink_to(source_files.parent / "index")
+os.replace(invalid_files, source_files)
+(Path(os.environ["PNPM_STORE_DIR"]) / "projects").chmod(0o750)
+Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding="ascii")
+Path({str(mutated)!r}).write_text("mutated\\n", encoding="utf-8")
+import time
+while True:
+    time.sleep(1)
+"""
+    _write_executable(pnpm_program, pnpm_source + "\n" + injected)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 90
+        while not mutated.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "fake pnpm did not invalidate source after its event"
+                )
+            time.sleep(0.05)
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(f"fake pnpm exited before mutation: {stderr!r}")
+        process.send_signal(termination_signal)
+        stdout, stderr = process.communicate(timeout=20)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+    assert process.returncode == 2
+    assert stdout == ""
+    assert not record.exists()
+    assert not Path(pnpm_event.read_text(encoding="utf-8")).parent.parent.exists()
+    assert captures.read_text(encoding="utf-8").splitlines() == ["source", "private"]
+    pnpm_pid = int(pid_path.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pnpm_pid, 0)
+
+
+def test_release_gate_removes_private_root_after_partial_pnpm_clone_failure(
+    tmp_path: Path,
+) -> None:
+    repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    private_tmp = Path("/private/tmp")
+    before = set(private_tmp.glob("travel-map-release-environment.*"))
+    source = gate.read_text(encoding="utf-8")
+    source = _replace_once(
+        source,
+        "                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:\n"
+        '                        raise OSError(ctypes.get_errno(), "fclonefileat")\n',
+        "                    if clone(source_file, destination_descriptor, name.encode(), 0) != 0:\n"
+        '                        raise OSError(ctypes.get_errno(), "fclonefileat")\n'
+        '                    raise OSError(95, "injected partial fclone failure")\n',
+    )
+    _write_executable(gate, source)
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", "inject partial pnpm clone failure")
+
+    completed, record = _run_release_gate(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_PRIVATE_DIRECTORY\n"
+    assert not record.exists()
+    assert not events_path.exists()
+    assert set(private_tmp.glob("travel-map-release-environment.*")) == before
+
+
+def _run_private_projects_cleanup_swap_attack(
+    tmp_path: Path,
+    *,
+    terminate: bool,
+) -> None:
+    pause_path = tmp_path / "cleanup-projects.pause"
+    entered_path = tmp_path / "cleanup-projects.entered"
+    pause_path.write_text("pause\n", encoding="utf-8")
+    _, gate, fake_bin, events_path = _release_gate_repository(
+        tmp_path,
+        cleanup_swap_sync=(pause_path, entered_path),
+    )
+    failure_marker = events_path.with_suffix(".pnpm-cleanup-failure")
+    pid_path = events_path.with_suffix(".pnpm-cleanup-pid")
+    failure_marker.write_text("fail\n", encoding="utf-8")
+    pnpm_program = fake_bin / "pnpm-package/bin/pnpm.mjs"
+    source = pnpm_program.read_text(encoding="utf-8")
+    if terminate:
+        injected = (
+            f"if Path({str(failure_marker)!r}).exists():\n"
+            f"    Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='ascii')\n"
+            "    import time\n"
+            "    while True:\n"
+            "        time.sleep(1)\n"
+        )
+    else:
+        injected = (
+            f"if Path({str(failure_marker)!r}).exists():\n"
+            f"    Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='ascii')\n"
+            "    raise SystemExit(31)\n"
+        )
+    _write_executable(pnpm_program, source + "\n" + injected)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    private_root: Path | None = None
+    displaced_projects = tmp_path / "attacker-displaced-projects"
+    sentinel = tmp_path / "outside-sentinel"
+    sentinel.mkdir(mode=0o751)
+    sentinel_payload = sentinel / "preserve.txt"
+    sentinel_payload.write_text("outside sentinel contents\n", encoding="utf-8")
+    sentinel_before = (
+        sentinel.stat().st_dev,
+        sentinel.stat().st_ino,
+        stat.S_IMODE(sentinel.stat().st_mode),
+        sentinel_payload.read_text(encoding="utf-8"),
+    )
+    try:
+        if terminate:
+            deadline = time.monotonic() + 90
+            while not pid_path.exists() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        "fake pnpm did not enter the TERM cleanup case"
+                    )
+                time.sleep(0.05)
+            assert process.poll() is None
+            process.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + 90
+        while not entered_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "cleanup did not open the private projects directory"
+                )
+            time.sleep(0.05)
+        assert process.poll() is None
+        private_root = Path(entered_path.read_text(encoding="utf-8"))
+        projects = private_root / "pnpm-store/v10/projects"
+        assert projects.is_dir() and not projects.is_symlink()
+        os.replace(projects, displaced_projects)
+        projects.symlink_to(sentinel, target_is_directory=True)
+        pause_path.unlink()
+        stdout, stderr = process.communicate(timeout=15)
+    finally:
+        pause_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        if private_root is not None and private_root.exists():
+            swapped_projects = private_root / "pnpm-store/v10/projects"
+            if swapped_projects.is_symlink():
+                swapped_projects.unlink()
+            for directory, _children, _files in os.walk(
+                private_root, topdown=False, followlinks=False
+            ):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(private_root)
+
+    assert process.returncode == 2
+    assert stdout == ""
+    assert "Traceback" not in stderr
+    assert not record.exists()
+    assert private_root is not None and not private_root.exists()
+    assert displaced_projects.is_dir()
+    assert (
+        sentinel.stat().st_dev,
+        sentinel.stat().st_ino,
+        stat.S_IMODE(sentinel.stat().st_mode),
+        sentinel_payload.read_text(encoding="utf-8"),
+    ) == sentinel_before
+    pnpm_pid = int(pid_path.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pnpm_pid, 0)
+
+
+def test_release_gate_cleanup_does_not_follow_swapped_private_projects_on_failure(
+    tmp_path: Path,
+) -> None:
+    _run_private_projects_cleanup_swap_attack(tmp_path, terminate=False)
+
+
+def test_release_gate_cleanup_does_not_follow_swapped_private_projects_on_term(
+    tmp_path: Path,
+) -> None:
+    _run_private_projects_cleanup_swap_attack(tmp_path, terminate=True)
+
+
+def _run_private_empty_directory_cleanup_swap_attack(
+    tmp_path: Path,
+    *,
+    target: str,
+    terminate: bool,
+) -> None:
+    pause_path = tmp_path / f"cleanup-{target}.pause"
+    entered_path = tmp_path / f"cleanup-{target}.entered"
+    pause_path.write_text("pause\n", encoding="utf-8")
+    fixture_kwargs: dict[str, tuple[Path, Path]] = {}
+    if target == "projects":
+        fixture_kwargs["cleanup_swap_sync"] = (pause_path, entered_path)
+    else:
+        fixture_kwargs["cleanup_root_swap_sync"] = (pause_path, entered_path)
+    _, gate, fake_bin, events_path = _release_gate_repository(
+        tmp_path, **fixture_kwargs
+    )
+    failure_marker = events_path.with_suffix(".pnpm-empty-swap-failure")
+    pid_path = events_path.with_suffix(".pnpm-empty-swap-pid")
+    failure_marker.write_text("fail\n", encoding="utf-8")
+    pnpm_program = fake_bin / "pnpm-package/bin/pnpm.mjs"
+    pnpm_source = pnpm_program.read_text(encoding="utf-8")
+    if terminate:
+        injected = (
+            f"if Path({str(failure_marker)!r}).exists():\n"
+            f"    Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='ascii')\n"
+            "    import time\n"
+            "    while True:\n"
+            "        time.sleep(1)\n"
+        )
+    else:
+        injected = (
+            f"if Path({str(failure_marker)!r}).exists():\n"
+            f"    Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='ascii')\n"
+            "    raise SystemExit(31)\n"
+        )
+    _write_executable(pnpm_program, pnpm_source + "\n" + injected)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    private_root: Path | None = None
+    displaced = tmp_path / f"attacker-displaced-{target}"
+    replacement: Path | None = None
+    sentinel_parent: Path | None = None
+    sentinel_payload: Path | None = None
+    try:
+        if terminate:
+            deadline = time.monotonic() + 90
+            while not pid_path.exists() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        "fake pnpm did not enter the TERM cleanup case"
+                    )
+                time.sleep(0.05)
+            assert process.poll() is None
+            process.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + 90
+        while not entered_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError("cleanup did not bind the target directory")
+            time.sleep(0.05)
+        assert process.poll() is None
+        private_root = Path(entered_path.read_text(encoding="utf-8"))
+        sentinel_parent = private_root.parent / f"outside-sentinel-{target}"
+        sentinel_parent.mkdir(mode=0o751)
+        sentinel_payload = sentinel_parent / "preserve.txt"
+        sentinel_payload.write_text("outside sentinel contents\n", encoding="utf-8")
+        replacement = private_root.parent / f"empty-replacement-{target}"
+        replacement.mkdir(mode=0o751)
+        replacement_before = (
+            replacement.stat().st_dev,
+            replacement.stat().st_ino,
+            stat.S_IMODE(replacement.stat().st_mode),
+        )
+        sentinel_before = (
+            sentinel_parent.stat().st_dev,
+            sentinel_parent.stat().st_ino,
+            stat.S_IMODE(sentinel_parent.stat().st_mode),
+            sentinel_payload.read_text(encoding="utf-8"),
+        )
+        victim = (
+            private_root / "pnpm-store/v10/projects"
+            if target == "projects"
+            else private_root
+        )
+        assert victim.is_dir() and not victim.is_symlink()
+        os.replace(victim, displaced)
+        os.replace(replacement, victim)
+        pause_path.unlink()
+        stdout, stderr = process.communicate(timeout=20)
+
+        assert process.returncode == 2
+        assert stdout == ""
+        assert "BLOCKED_GATE_CLEANUP_FAILED" in stderr
+        assert not record.exists()
+        replacement_now = victim.stat()
+        assert (
+            replacement_now.st_dev,
+            replacement_now.st_ino,
+            stat.S_IMODE(replacement_now.st_mode),
+        ) == replacement_before
+        assert (
+            sentinel_parent.stat().st_dev,
+            sentinel_parent.stat().st_ino,
+            stat.S_IMODE(sentinel_parent.stat().st_mode),
+            sentinel_payload.read_text(encoding="utf-8"),
+        ) == sentinel_before
+        pnpm_pid = int(pid_path.read_text(encoding="ascii"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(pnpm_pid, 0)
+    finally:
+        pause_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        for directory in (displaced, private_root):
+            if directory is None or not directory.exists():
+                continue
+            for current, _children, _files in os.walk(
+                directory, topdown=False, followlinks=False
+            ):
+                Path(current).chmod(0o700)
+            shutil.rmtree(directory)
+        if replacement is not None and replacement.exists():
+            replacement.rmdir()
+        if sentinel_parent is not None and sentinel_parent.exists():
+            shutil.rmtree(sentinel_parent)
+
+
+@pytest.mark.parametrize("target", ("projects", "root"))
+@pytest.mark.parametrize("terminate", (False, True))
+def test_release_gate_cleanup_does_not_remove_empty_directory_replacement(
+    tmp_path: Path,
+    target: str,
+    terminate: bool,
+) -> None:
+    _run_private_empty_directory_cleanup_swap_attack(
+        tmp_path, target=target, terminate=terminate
+    )
+
+
+def _run_private_regular_file_cleanup_swap_attack(
+    tmp_path: Path,
+    *,
+    terminate: bool,
+) -> None:
+    pause_path = tmp_path / "cleanup-regular-file.pause"
+    entered_path = tmp_path / "cleanup-regular-file.entered"
+    mismatch_pause_path = tmp_path / "cleanup-regular-file-mismatch.pause"
+    mismatch_entered_path = tmp_path / "cleanup-regular-file-mismatch.entered"
+    pause_path.write_text("pause\n", encoding="utf-8")
+    mismatch_pause_path.write_text("pause\n", encoding="utf-8")
+    repository, gate, fake_bin, events_path = _release_gate_repository(
+        tmp_path,
+        cleanup_file_swap_sync=(pause_path, entered_path),
+        cleanup_quarantine_mismatch_sync=(mismatch_pause_path, mismatch_entered_path),
+    )
+    source = _replace_once(
+        gate.read_text(encoding="utf-8"),
+        '        command = [sandbox_exec, "-p", sandbox_profile, *command]\n',
+        "        command = command\n",
+    )
+    source = _replace_once(
+        source,
+        """    set -e
+    case "$1" in
+        "$pnpm_tool") verify_pnpm_stores || return 2 ;;
+    esac
+    verify_runtime_anchors || return 2
+""",
+        """    set -e
+    verify_runtime_anchors || return 2
+""",
+    )
+    _write_executable(gate, source)
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", "instrument regular-file cleanup race")
+    pid_path = events_path.with_suffix(".pnpm-regular-file-cleanup-pid")
+    pnpm_program = fake_bin / "pnpm-package/bin/pnpm.mjs"
+    pnpm_source = pnpm_program.read_text(encoding="utf-8")
+    if terminate:
+        injected = (
+            "entry = Path(os.environ['PNPM_STORE_DIR']) / 'projects/cleanup-regular-entry'\n"
+            "entry.write_text('gate-owned entry\\n', encoding='utf-8')\n"
+            "entry.chmod(0o600)\n"
+            f"Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='ascii')\n"
+            "import time\n"
+            "while True:\n"
+            "    time.sleep(1)\n"
+        )
+    else:
+        injected = (
+            "entry = Path(os.environ['PNPM_STORE_DIR']) / 'projects/cleanup-regular-entry'\n"
+            "entry.write_text('gate-owned entry\\n', encoding='utf-8')\n"
+            "entry.chmod(0o600)\n"
+            f"Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='ascii')\n"
+            "raise SystemExit(31)\n"
+        )
+    _write_executable(pnpm_program, pnpm_source + "\n" + injected)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    private_root: Path | None = None
+    displaced = tmp_path / "attacker-displaced-regular-entry"
+    sentinel = tmp_path / "outside-regular-sentinel"
+    sentinel.write_text("outside sentinel contents\n", encoding="utf-8")
+    sentinel.chmod(0o640)
+    sentinel_before = (
+        sentinel.stat().st_dev,
+        sentinel.stat().st_ino,
+        stat.S_IMODE(sentinel.stat().st_mode),
+        sentinel.read_text(encoding="utf-8"),
+    )
+    replacement: Path | None = None
+    quarantine_entry: Path | None = None
+    replacement_victim_before: tuple[int, int, int, str] | None = None
+    try:
+        if terminate:
+            deadline = time.monotonic() + 90
+            while not pid_path.exists() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        "fake pnpm did not enter the TERM cleanup case"
+                    )
+                time.sleep(0.05)
+            assert process.poll() is None
+            process.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + 90
+        while not entered_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError("cleanup did not inspect the private regular file")
+            time.sleep(0.05)
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"cleanup exited before the regular-file swap: {stderr!r}"
+            )
+        private_root = Path(entered_path.read_text(encoding="utf-8"))
+        replacement = private_root / "pnpm-store/v10/projects/cleanup-regular-entry"
+        assert replacement.is_file() and not replacement.is_symlink()
+        os.replace(replacement, displaced)
+        os.replace(sentinel, replacement)
+        pause_path.unlink()
+        deadline = time.monotonic() + 90
+        while not mismatch_entered_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError("cleanup did not detect the regular-file mismatch")
+            time.sleep(0.05)
+        assert process.poll() is None
+        quarantine = next(
+            (private_root / "pnpm-store/v10/projects").glob(".release-gate-cleanup-*")
+        )
+        quarantine_entry = quarantine / "cleanup-regular-entry"
+        assert quarantine_entry.is_file()
+        quarantine_now = quarantine_entry.stat()
+        assert (
+            quarantine_now.st_dev,
+            quarantine_now.st_ino,
+            stat.S_IMODE(quarantine_now.st_mode),
+            quarantine_entry.read_text(encoding="utf-8"),
+        ) == sentinel_before
+        replacement.write_text("recreated victim\n", encoding="utf-8")
+        replacement.chmod(0o600)
+        replacement_now = replacement.stat()
+        replacement_victim_before = (
+            replacement_now.st_dev,
+            replacement_now.st_ino,
+            stat.S_IMODE(replacement_now.st_mode),
+            replacement.read_text(encoding="utf-8"),
+        )
+        mismatch_pause_path.unlink()
+        stdout, stderr = process.communicate(timeout=20)
+
+        assert process.returncode == 2
+        assert stdout == ""
+        assert "BLOCKED_GATE_CLEANUP_FAILED" in stderr
+        assert not record.exists()
+        assert replacement.is_file()
+        replacement_now = replacement.stat()
+        assert (
+            replacement_now.st_dev,
+            replacement_now.st_ino,
+            stat.S_IMODE(replacement_now.st_mode),
+            replacement.read_text(encoding="utf-8"),
+        ) == replacement_victim_before
+        assert quarantine_entry.is_file()
+        quarantine_now = quarantine_entry.stat()
+        assert (
+            quarantine_now.st_dev,
+            quarantine_now.st_ino,
+            stat.S_IMODE(quarantine_now.st_mode),
+            quarantine_entry.read_text(encoding="utf-8"),
+        ) == sentinel_before
+        pnpm_pid = int(pid_path.read_text(encoding="ascii"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(pnpm_pid, 0)
+    finally:
+        pause_path.unlink(missing_ok=True)
+        mismatch_pause_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        if private_root is not None and private_root.exists():
+            for directory, _children, _files in os.walk(
+                private_root, topdown=False, followlinks=False
+            ):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(private_root)
+        if displaced.exists():
+            displaced.unlink()
+        sentinel.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("terminate", (False, True))
+def test_release_gate_cleanup_does_not_unlink_swapped_private_regular_file(
+    tmp_path: Path,
+    terminate: bool,
+) -> None:
+    _run_private_regular_file_cleanup_swap_attack(tmp_path, terminate=terminate)
+
+
+def _run_private_quarantine_name_swap_attack(
+    tmp_path: Path,
+    *,
+    terminate: bool,
+) -> None:
+    pause_path = tmp_path / "cleanup-quarantine-name.pause"
+    entered_path = tmp_path / "cleanup-quarantine-name.entered"
+    pause_path.write_text("pause\n", encoding="utf-8")
+    repository, gate, fake_bin, events_path = _release_gate_repository(
+        tmp_path,
+        cleanup_quarantine_swap_sync=(pause_path, entered_path),
+    )
+    source = _replace_once(
+        gate.read_text(encoding="utf-8"),
+        '        command = [sandbox_exec, "-p", sandbox_profile, *command]\n',
+        "        command = command\n",
+    )
+    source = _replace_once(
+        source,
+        """    set -e
+    case "$1" in
+        "$pnpm_tool") verify_pnpm_stores || return 2 ;;
+    esac
+    verify_runtime_anchors || return 2
+""",
+        """    set -e
+    verify_runtime_anchors || return 2
+""",
+    )
+    _write_executable(gate, source)
+    _git(repository, "add", str(gate.relative_to(repository)))
+    _git(repository, "commit", "-qm", "instrument quarantine-name cleanup race")
+    pid_path = events_path.with_suffix(".pnpm-quarantine-name-pid")
+    pnpm_program = fake_bin / "pnpm-package/bin/pnpm.mjs"
+    pnpm_source = pnpm_program.read_text(encoding="utf-8")
+    if terminate:
+        injected = (
+            "entry = Path(os.environ['PNPM_STORE_DIR']) / 'projects/cleanup-regular-entry'\n"
+            "entry.write_text('gate-owned entry\\n', encoding='utf-8')\n"
+            "entry.chmod(0o600)\n"
+            f"Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='ascii')\n"
+            "import time\n"
+            "while True:\n"
+            "    time.sleep(1)\n"
+        )
+    else:
+        injected = (
+            "entry = Path(os.environ['PNPM_STORE_DIR']) / 'projects/cleanup-regular-entry'\n"
+            "entry.write_text('gate-owned entry\\n', encoding='utf-8')\n"
+            "entry.chmod(0o600)\n"
+            f"Path({str(pid_path)!r}).write_text(str(os.getpid()), encoding='ascii')\n"
+            "raise SystemExit(31)\n"
+        )
+    _write_executable(pnpm_program, pnpm_source + "\n" + injected)
+
+    command, cwd, environment, record = _release_gate_invocation(
+        tmp_path,
+        gate,
+        docker_config=_protected_docker_config(tmp_path),
+    )
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    private_root: Path | None = None
+    sentinel = tmp_path / "outside-empty-directory-sentinel"
+    displaced: Path | None = None
+    quarantine_name: Path | None = None
+    sentinel_before: tuple[int, int, int] | None = None
+    try:
+        if terminate:
+            deadline = time.monotonic() + 90
+            while not pid_path.exists() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        "fake pnpm did not enter the TERM cleanup case"
+                    )
+                time.sleep(0.05)
+            assert process.poll() is None
+            process.send_signal(signal.SIGTERM)
+        deadline = time.monotonic() + 90
+        while not entered_path.exists() and process.poll() is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError("cleanup did not bind its quarantine directory")
+            time.sleep(0.05)
+        assert process.poll() is None
+        private_root = Path(entered_path.read_text(encoding="utf-8"))
+        projects = private_root / "pnpm-store/v10/projects"
+        quarantine_name = next(projects.glob(".release-gate-cleanup-*"))
+        assert quarantine_name.is_dir() and not quarantine_name.is_symlink()
+        sentinel.mkdir(mode=0o750)
+        sentinel_details = sentinel.stat()
+        sentinel_before = (
+            sentinel_details.st_dev,
+            sentinel_details.st_ino,
+            stat.S_IMODE(sentinel_details.st_mode),
+        )
+        displaced = projects / ".attacker-displaced-quarantine"
+        os.replace(quarantine_name, displaced)
+        os.replace(sentinel, quarantine_name)
+        pause_path.unlink()
+        stdout, stderr = process.communicate(timeout=20)
+
+        assert process.returncode == 2
+        assert stdout == ""
+        assert "BLOCKED_GATE_CLEANUP_FAILED" in stderr
+        assert not record.exists()
+        assert quarantine_name.is_dir() and not quarantine_name.is_symlink()
+        sentinel_details = quarantine_name.stat()
+        assert (
+            sentinel_details.st_dev,
+            sentinel_details.st_ino,
+            stat.S_IMODE(sentinel_details.st_mode),
+        ) == sentinel_before
+        pnpm_pid = int(pid_path.read_text(encoding="ascii"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(pnpm_pid, 0)
+    finally:
+        pause_path.unlink(missing_ok=True)
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        if private_root is not None and private_root.exists():
+            for directory, _children, _files in os.walk(
+                private_root, topdown=False, followlinks=False
+            ):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(private_root)
+        if sentinel.exists():
+            sentinel.rmdir()
+
+
+@pytest.mark.parametrize("terminate", (False, True))
+def test_release_gate_cleanup_does_not_remove_replaced_quarantine_name(
+    tmp_path: Path,
+    terminate: bool,
+) -> None:
+    _run_private_quarantine_name_swap_attack(tmp_path, terminate=terminate)
+
+
+@pytest.mark.parametrize("extra_kind", ("directory", "regular", "symlink", "fifo"))
+def test_release_gate_rejects_extra_pnpm_store_top_level_entry(
+    tmp_path: Path,
+    extra_kind: str,
+) -> None:
+    _, gate, _, events_path = _release_gate_repository(tmp_path)
+    extra = tmp_path / "pnpm-store/ambient"
+    if extra_kind == "directory":
+        extra.mkdir(mode=0o700)
+    elif extra_kind == "regular":
+        extra.write_text("ambient\n", encoding="utf-8")
+    elif extra_kind == "symlink":
+        extra.symlink_to("files/reviewed-store-entry")
+    else:
+        os.mkfifo(extra, mode=0o600)
 
     completed, record = _run_release_gate(
         tmp_path,
