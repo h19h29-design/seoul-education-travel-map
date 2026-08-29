@@ -1,7 +1,9 @@
 import hashlib
 import json
 import os
+import pwd
 import runpy
+import shlex
 import shutil
 import socket
 import subprocess
@@ -32,6 +34,28 @@ SMOKE = ROOT / "scripts/smoke-live.py"
 PREPARE_CONTEXT = ROOT / "scripts/prepare-release-context.py"
 SYNC = ROOT / "scripts/sync-institutions.py"
 FIXTURE_SNAPSHOT = ROOT / "tests/fixtures/institutions/snapshot"
+ROLLBACK_PUBLISH = ROOT / "deploy/nas/publish-rollback-baseline.sh"
+ROLLBACK_REVIEW_COMMIT = "3d4d25dd249e69aaf8a25e2bcb7267b3f296c0c6"
+ROLLBACK_PUBLISH_BLOB_SHA = "0227f8a202464dc0874b1ba64c71d504a57ee5cd"
+ROLLBACK_SHA = "469c13f5afbc13af3ed9e91eaf43c20825163c6e"
+ROLLBACK_IMAGE_ID = "sha256:" + "1" * 64
+ROLLBACK_MANIFEST = "sha256:" + "2" * 64
+ROLLBACK_PLATFORM_MANIFEST = "sha256:" + "4" * 64
+ROLLBACK_CONFIG_DIGEST = "sha256:" + "5" * 64
+ROLLBACK_ATTESTATION_MANIFEST = "sha256:" + "6" * 64
+ROLLBACK_EXTRA_PLATFORM_MANIFEST = "sha256:" + "7" * 64
+ROLLBACK_SECOND_ATTESTATION_MANIFEST = "sha256:" + "8" * 64
+ROLLBACK_ATTESTATION_CONFIG = "sha256:" + "9" * 64
+ROLLBACK_ATTESTATION_LAYER = "sha256:" + "a" * 64
+ROLLBACK_CONTAINER_ID = "b" * 64
+ROLLBACK_REGISTRY = "ghcr.io/h19h29-design/seoul-education-travel-map"
+ROLLBACK_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+ROLLBACK_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
+ROLLBACK_TAG = (
+    f"{ROLLBACK_REGISTRY}:rollback-baseline-{ROLLBACK_SHA}-"
+    f"{ROLLBACK_IMAGE_ID.removeprefix('sha256:')}"
+)
+ROLLBACK_LEGACY_TAG = "seoul-education-travel-map:0.1.0"
 
 
 # Production break caught: a release check treating the intentionally absent
@@ -3051,6 +3075,477 @@ def test_deploy_wrapper_treats_interruption_during_env_swap_as_failure() -> None
     assert '[ "$interrupted" -eq 1 ]' in deploy
 
 
+# Production break caught: an operator can otherwise publish an unreviewed,
+# mutable, wrong-platform image while believing it is the deployed rollback.
+def test_rollback_baseline_publisher_is_tracked_from_the_reviewed_git_object() -> None:
+    object_path = f"{ROLLBACK_REVIEW_COMMIT}:apps/travel-map/deploy/nas/publish-rollback-baseline.sh"
+    blob = subprocess.run(
+        ["git", "rev-parse", object_path],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert blob.returncode == 0
+    assert blob.stdout.strip() == ROLLBACK_PUBLISH_BLOB_SHA
+    assert ROLLBACK_PUBLISH.is_file()
+    publisher = ROLLBACK_PUBLISH.read_text(encoding="utf-8")
+    assert f"rollback_sha={ROLLBACK_SHA}" in publisher
+    assert "rollback_platform=linux/amd64" in publisher
+
+
+def test_rollback_baseline_publisher_emits_only_the_verified_immutable_digest(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path)
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}\n"
+    assert not result.python_injection_marker.exists()
+    assert "test-only-docker-auth-marker" not in (
+        result.completed.stdout + result.completed.stderr
+    )
+    gate_fields = result.gate_log.read_text(encoding="utf-8").strip().split("|")
+    assert gate_fields[:5] == ["1", "error", "linux/amd64", "linux/amd64", "0"]
+    assert Path(gate_fields[5]).name == "pinned-source"
+    assert Path(gate_fields[5]) != result.source
+    docker_calls = result.docker_log.read_text(encoding="utf-8")
+    assert (
+        docker_calls.count(
+            "buildx imagetools inspect --format {{json .Manifest}} " + ROLLBACK_TAG
+        )
+        == 4
+    )
+    run_call = next(
+        line for line in docker_calls.splitlines() if line.startswith("run -d ")
+    )
+    for required in (
+        "--user 10001:10001",
+        "--network none",
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+        "--env-file ",
+        ROLLBACK_IMAGE_ID,
+    ):
+        assert required in run_call
+    assert f"tag {ROLLBACK_IMAGE_ID} {ROLLBACK_TAG}" in docker_calls
+    assert f"push {ROLLBACK_TAG}" in docker_calls
+    assert "image rm " not in docker_calls
+    assert not list(result.temporary_root.glob("travel-map-rollback-publish.*"))
+    for retained_tag in ("legacy-created", "rollback-created"):
+        assert (result.docker_state / retained_tag).exists()
+        assert (result.docker_state / f"{retained_tag}.identity").read_text(
+            encoding="utf-8"
+        ).strip() == ROLLBACK_IMAGE_ID
+    assert os.access(ROLLBACK_PUBLISH, os.X_OK)
+
+
+# Production break caught: ambient Git and Docker control variables can redirect
+# the publisher's source proof or registry operations before the release gate.
+def test_rollback_baseline_publisher_scrubs_outer_git_and_docker_environment(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, inject_ambient_controls=True)
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}\n"
+
+
+# Production break caught: repository-local accelerators can make a nominally
+# clean worktree status omit changes unless each source proof disables them.
+def test_rollback_baseline_publisher_disables_repo_local_git_accelerators(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, require_hardened_git=True)
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}\n"
+
+
+# Production break caught: refs/replace can retain the approved SHA spelling
+# while substituting a different commit/tree for archive and ls-tree.
+def test_rollback_baseline_publisher_disables_git_replace_objects(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, require_no_replace_objects=True)
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}\n"
+
+
+# Production break caught: ignored pytest/Playwright/venv/node_modules files in
+# the operator worktree can execute inside the historical release gate.
+def test_rollback_baseline_publisher_runs_gate_from_the_pinned_tree(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, git_state="ignored-gate-input")
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}\n"
+    gate_cwd = Path(result.gate_log.read_text(encoding="utf-8").strip().split("|")[5])
+    assert gate_cwd.name == "pinned-source"
+    assert gate_cwd != result.source
+
+
+# Production break caught: `git archive` applies tar.umask and commonly emits
+# tracked 100755/100644 blobs as 0775/0664. The private pinned tree must restore
+# exact executable modes before the historical gate is instrumented and run.
+def test_rollback_baseline_publisher_normalizes_git_archive_modes(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path)
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}\n"
+
+
+# Production break caught: retrying a completed one-time publication can
+# overwrite the fixed remote tag even though the identical artifact is present.
+def test_rollback_baseline_publisher_accepts_an_identical_remote_without_push(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(
+        tmp_path,
+        docker_scenario="remote-existing-identical",
+    )
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}\n"
+    docker_calls = result.docker_log.read_text(encoding="utf-8")
+    assert f"push {ROLLBACK_TAG}" not in docker_calls
+    assert f"tag {ROLLBACK_IMAGE_ID} {ROLLBACK_TAG}" not in docker_calls
+
+
+# Production break caught: buildx may report a genuinely absent top-level tag
+# as an exact `<reference>: not found` line instead of `manifest unknown`.
+def test_rollback_baseline_publisher_accepts_exact_top_level_tag_absence(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(
+        tmp_path,
+        docker_scenario="exact-top-level-not-found",
+    )
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}\n"
+    docker_calls = result.docker_log.read_text(encoding="utf-8")
+    assert f"push {ROLLBACK_TAG}" in docker_calls
+
+
+# `docker buildx imagetools inspect --format '{{json .Manifest}}'` returns an
+# OCI descriptor, not a raw manifest with schemaVersion.
+def test_rollback_baseline_publisher_accepts_the_real_buildx_descriptor_shape(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path)
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}\n"
+
+
+# The fake historical gate must exercise the exact legacy build tag so the
+# publisher test cannot silently drift back to a nonexistent attestation file.
+def test_rollback_publisher_fixture_builds_the_exact_historical_legacy_tag(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path)
+
+    assert result.completed.returncode == 0
+    docker_calls = result.docker_log.read_text(encoding="utf-8").splitlines()
+    build_calls = [line for line in docker_calls if line.startswith("build ")]
+    assert len(build_calls) == 1
+    assert build_calls[0].startswith("build --iidfile ")
+    assert (
+        " --build-arg SNAPSHOT_ID=fake-snapshot "
+        f"-t {ROLLBACK_LEGACY_TAG} fake-release-context"
+    ) in build_calls[0]
+
+
+# Production break caught: containerd image storage reports the loaded OCI index
+# digest as .Id, so treating every .Id as a config digest blocks the reviewed image.
+def test_rollback_baseline_publisher_proves_a_containerd_descriptor_id(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, docker_scenario="containerd-index")
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_IMAGE_ID}\n"
+    docker_calls = result.docker_log.read_text(encoding="utf-8")
+    assert (
+        f"buildx imagetools inspect --raw {ROLLBACK_REGISTRY}@{ROLLBACK_IMAGE_ID}"
+        in docker_calls
+    )
+    assert (
+        "buildx imagetools inspect --raw "
+        f"{ROLLBACK_REGISTRY}@{ROLLBACK_PLATFORM_MANIFEST}" in docker_calls
+    )
+
+
+@pytest.mark.parametrize(
+    "docker_scenario",
+    ("containerd-zero-attestation", "containerd-multiple-attestations"),
+)
+def test_rollback_baseline_publisher_accepts_zero_or_multiple_valid_attestations(
+    tmp_path: Path,
+    docker_scenario: str,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, docker_scenario=docker_scenario)
+
+    assert result.completed.returncode == 0
+    assert result.completed.stdout == f"{ROLLBACK_REGISTRY}@{ROLLBACK_IMAGE_ID}\n"
+
+
+@pytest.mark.parametrize(
+    ("git_state", "link_source"),
+    (
+        ("wrong-sha", False),
+        ("dirty", False),
+        ("attached", False),
+        ("assume-unchanged", False),
+        ("skip-worktree", False),
+        ("ignored-allowed-suffix", False),
+        ("clean", True),
+    ),
+)
+def test_rollback_baseline_publisher_rejects_an_unfixed_or_dirty_source(
+    tmp_path: Path,
+    git_state: str,
+    link_source: bool,
+) -> None:
+    result = _run_rollback_publisher(
+        tmp_path,
+        git_state=git_state,
+        link_source=link_source,
+    )
+
+    assert result.completed.returncode == 2
+    assert result.completed.stdout == ""
+    assert result.completed.stderr == "BLOCKED_INVALID_ROLLBACK_SOURCE\n"
+    assert not result.gate_log.exists()
+    assert not result.docker_log.exists()
+
+
+@pytest.mark.parametrize(
+    ("directory_mode", "config_mode"),
+    ((0o755, 0o600), (0o700, 0o644)),
+)
+def test_rollback_baseline_publisher_requires_private_owned_docker_configuration(
+    tmp_path: Path,
+    directory_mode: int,
+    config_mode: int,
+) -> None:
+    result = _run_rollback_publisher(
+        tmp_path,
+        docker_directory_mode=directory_mode,
+        docker_config_mode=config_mode,
+    )
+
+    assert result.completed.returncode == 2
+    assert result.completed.stdout == ""
+    assert result.completed.stderr == "BLOCKED_INVALID_DOCKER_CONFIG\n"
+    assert not result.gate_log.exists()
+    assert not result.docker_log.exists()
+
+
+@pytest.mark.parametrize(
+    ("docker_scenario", "expected_error", "expected_gate_calls"),
+    (
+        ("local-existing", "BLOCKED_LEGACY_TAG_EXISTS", 0),
+        ("local-rollback-existing", "BLOCKED_ROLLBACK_TAG_EXISTS", 1),
+        ("remote-existing", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("remote-malformed-descriptor", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("remote-descriptor-media-type-invalid", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("remote-descriptor-size-zero", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("remote-descriptor-kind-mismatch", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("remote-raw-media-type-mismatch", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("remote-referenced-manifest-missing", "BLOCKED_REMOTE_TAG_UNVERIFIED", 1),
+        ("remote-ambiguous", "BLOCKED_REMOTE_TAG_UNVERIFIED", 1),
+        ("remote-helper-missing", "BLOCKED_REMOTE_TAG_UNVERIFIED", 1),
+        ("remote-race", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("local-platform-mismatch", "BLOCKED_INVALID_GATE_ATTESTATION", 1),
+        ("tagged-id-mismatch", "BLOCKED_ROLLBACK_IMAGE_TAGGING", 1),
+        ("remote-config-mismatch", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("remote-malformed-config-shape", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("remote-invalid-config-descriptor", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("remote-platform-mismatch", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("containerd-index-id-mismatch", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("containerd-extra-runnable", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("containerd-unlinked-attestation", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("containerd-attestation-missing", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("containerd-attestation-not-attestation", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        ("containerd-malformed-child-config", "BLOCKED_REMOTE_IMAGE_MISMATCH", 1),
+        (
+            "containerd-invalid-child-config-descriptor",
+            "BLOCKED_REMOTE_IMAGE_MISMATCH",
+            1,
+        ),
+    ),
+)
+def test_rollback_baseline_publisher_fails_closed_at_each_image_boundary(
+    tmp_path: Path,
+    docker_scenario: str,
+    expected_error: str,
+    expected_gate_calls: int,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, docker_scenario=docker_scenario)
+
+    assert result.completed.returncode == 2
+    assert result.completed.stdout == ""
+    assert result.completed.stderr.endswith(f"{expected_error}\n")
+    assert "Traceback" not in result.completed.stderr
+    actual_gate_calls = (
+        len(result.gate_log.read_text(encoding="utf-8").splitlines())
+        if result.gate_log.exists()
+        else 0
+    )
+    assert actual_gate_calls == expected_gate_calls
+    assert not list(result.temporary_root.glob("travel-map-rollback-publish.*"))
+
+
+@pytest.mark.parametrize(
+    ("docker_scenario", "expected_error", "competitor_marker"),
+    (
+        ("legacy-build-race", "BLOCKED_ROLLBACK_RELEASE_GATE", "legacy-created"),
+        ("rollback-tag-race", "BLOCKED_ROLLBACK_IMAGE_TAGGING", "rollback-created"),
+        (
+            "container-name-race",
+            "BLOCKED_ROLLBACK_RUNTIME_SMOKE",
+            "competitor-container",
+        ),
+    ),
+)
+def test_rollback_baseline_publisher_never_removes_an_unowned_local_resource(
+    tmp_path: Path,
+    docker_scenario: str,
+    expected_error: str,
+    competitor_marker: str,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, docker_scenario=docker_scenario)
+
+    assert result.completed.returncode == 2
+    assert result.completed.stderr.endswith(f"{expected_error}\n")
+    assert (result.docker_state / competitor_marker).exists()
+
+
+def test_rollback_baseline_publisher_cleans_a_failed_owned_container_start(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(
+        tmp_path,
+        docker_scenario="container-start-failure-owned",
+    )
+
+    assert result.completed.returncode == 2
+    assert result.completed.stderr.endswith("BLOCKED_ROLLBACK_RUNTIME_SMOKE\n")
+    assert not (result.docker_state / "owned-container").exists()
+    assert f"rm -f {ROLLBACK_CONTAINER_ID}" in result.docker_log.read_text(
+        encoding="utf-8"
+    )
+
+
+# Production break caught: the historical gate's fixed legacy tag is mutable.
+# A successful build must be bound to its immutable iidfile before that name can
+# be retagged by another Docker client.
+def test_rollback_baseline_publisher_rejects_a_post_gate_legacy_retag(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(
+        tmp_path,
+        docker_scenario="legacy-retag-after-gate",
+    )
+
+    assert result.completed.returncode == 2
+    assert result.completed.stderr.endswith("BLOCKED_INVALID_GATE_ATTESTATION\n")
+    docker_calls = result.docker_log.read_text(encoding="utf-8")
+    assert "run -d" not in docker_calls
+    assert "image rm " not in docker_calls
+    assert (result.docker_state / "legacy-created").exists()
+    assert (result.docker_state / "legacy-created.identity").read_text(
+        encoding="utf-8"
+    ).strip() == f"sha256:{'3' * 64}"
+
+
+# Production break caught: Docker tag overwrites a target that appears after an
+# earlier absence check. The publisher must recheck under its canonical lock.
+def test_rollback_baseline_publisher_does_not_overwrite_a_racing_local_tag(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(
+        tmp_path,
+        docker_scenario="rollback-tag-overwrite-race",
+    )
+
+    assert result.completed.returncode == 2
+    assert result.completed.stderr.endswith("BLOCKED_ROLLBACK_TAG_EXISTS\n")
+    docker_calls = result.docker_log.read_text(encoding="utf-8")
+    assert f"tag {ROLLBACK_IMAGE_ID} {ROLLBACK_TAG}" not in docker_calls
+    assert "image rm " not in docker_calls
+    assert (result.docker_state / "rollback-created.identity").read_text(
+        encoding="utf-8"
+    ).strip() == f"sha256:{'3' * 64}"
+
+
+# Production break caught: a signal can arrive after Docker writes a cidfile but
+# before the shell records it. Cleanup must recover the immutable ID from cidfile.
+def test_rollback_baseline_publisher_recovers_cidfile_ownership_on_signal(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(
+        tmp_path,
+        docker_scenario="container-signal-after-cidfile",
+    )
+
+    assert result.completed.returncode == 2
+    assert not (result.docker_state / "owned-container").exists()
+    docker_calls = result.docker_log.read_text(encoding="utf-8")
+    assert f"rm -f {ROLLBACK_CONTAINER_ID}" in docker_calls
+    assert "image rm " not in docker_calls
+    assert (result.docker_state / "legacy-created").exists()
+
+
+@pytest.mark.parametrize(
+    ("docker_scenario", "competitor_marker"),
+    (
+        ("legacy-replaced-before-cleanup", "legacy-created"),
+        ("rollback-replaced-before-cleanup", "rollback-created"),
+    ),
+)
+def test_rollback_baseline_publisher_retains_racing_local_tags_during_cleanup(
+    tmp_path: Path,
+    docker_scenario: str,
+    competitor_marker: str,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, docker_scenario=docker_scenario)
+
+    assert result.completed.returncode == 2
+    assert result.completed.stdout == ""
+    assert result.completed.stderr.endswith("BLOCKED_RETAINED_LOCAL_TAG_MISMATCH\n")
+    assert (result.docker_state / competitor_marker).exists()
+    assert "image rm " not in result.docker_log.read_text(encoding="utf-8")
+
+
+def test_rollback_baseline_publisher_rechecks_remote_immediately_before_push(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, docker_scenario="remote-prepush-race")
+
+    assert result.completed.returncode == 2
+    assert result.completed.stderr.endswith("BLOCKED_REMOTE_IMAGE_MISMATCH\n")
+    assert f"push {ROLLBACK_TAG}" not in result.docker_log.read_text(encoding="utf-8")
+
+
+def test_rollback_baseline_publisher_accepts_no_positional_input(
+    tmp_path: Path,
+) -> None:
+    result = _run_rollback_publisher(tmp_path, arguments=("unexpected",))
+
+    assert result.completed.returncode == 64
+    assert result.completed.stdout == ""
+    assert result.completed.stderr == "usage: publish-rollback-baseline.sh\n"
+    assert not result.gate_log.exists()
+    assert not result.docker_log.exists()
+
+
 def _run_smoke(
     extra_environment: dict[str, str],
     *,
@@ -3169,3 +3664,846 @@ def _read_test_event_log(path: Path) -> list[str]:
     if not path.exists():
         return []
     return path.read_text(encoding="utf-8").splitlines()
+
+
+def _run_rollback_publisher(
+    tmp_path: Path,
+    *,
+    git_state: str = "clean",
+    link_source: bool = False,
+    docker_directory_mode: int = 0o700,
+    docker_config_mode: int = 0o600,
+    docker_scenario: str = "success",
+    arguments: tuple[str, ...] = (),
+    inject_ambient_controls: bool = False,
+    require_hardened_git: bool = False,
+    require_no_replace_objects: bool = False,
+) -> SimpleNamespace:
+    # Unit 4 deliberately starts RED: keep the missing tracked publisher as a
+    # controlled process result so every historical contract test fails by
+    # assertion, never by fixture/setup error.
+    if not ROLLBACK_PUBLISH.is_file():
+        return SimpleNamespace(
+            completed=subprocess.CompletedProcess(
+                ["/bin/sh", str(ROLLBACK_PUBLISH), *arguments],
+                127,
+                "",
+                "BLOCKED_MISSING_ROLLBACK_PUBLISHER\n",
+            ),
+            source=tmp_path / "rollback-source-real",
+            configured_source=tmp_path / "rollback-source-real",
+            gate_log=tmp_path / "gate.log",
+            docker_log=tmp_path / "docker.log",
+            docker_state=tmp_path / "docker-state",
+            temporary_root=tmp_path / "temporary",
+            python_injection_marker=tmp_path / "python-injection-ran",
+        )
+    canonical_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    production_safe_path = (
+        f"{canonical_home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
+        "/usr/bin:/bin:/usr/sbin:/sbin"
+    )
+    gate_log = tmp_path / "gate.log"
+    docker_log = tmp_path / "docker.log"
+    docker_state = tmp_path / "docker-state"
+    docker_state.mkdir()
+    source = tmp_path / "rollback-source-real"
+    gate = source / "apps/travel-map/scripts/release-gate.sh"
+    gate.parent.mkdir(parents=True)
+    tracked_app = source / "apps/travel-map/app/main.py"
+    tracked_app.parent.mkdir(parents=True)
+    tracked_app.write_text("# tracked app fixture\n", encoding="utf-8")
+    if git_state == "ignored-allowed-suffix":
+        injected = source / "apps/travel-map/app/static/injected.js"
+        injected.parent.mkdir(parents=True)
+        injected.write_text("globalThis.injected = true;\n", encoding="utf-8")
+    if git_state == "ignored-gate-input":
+        ignored_inputs = {
+            "apps/travel-map/tests/conftest.py": "raise RuntimeError('injected')\n",
+            "apps/travel-map/e2e/injected.spec.ts": "throw new Error('injected');\n",
+            "apps/travel-map/.venv/lib/python/sitecustomize.py": (
+                "raise RuntimeError('injected')\n"
+            ),
+            "apps/travel-map/node_modules/injected/package.json": "{}\n",
+            ".git/config": "[core]\n\tfsmonitor = injected\n",
+        }
+        for relative_path, payload in ignored_inputs.items():
+            candidate = source / relative_path
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_text(payload, encoding="utf-8")
+    configured_source = source
+    if link_source:
+        configured_source = tmp_path / "rollback-source-link"
+        configured_source.symlink_to(source, target_is_directory=True)
+
+    docker_config = tmp_path / "docker-config"
+    docker_config.mkdir(mode=docker_directory_mode)
+    docker_config.chmod(docker_directory_mode)
+    docker_configuration = docker_config / "config.json"
+    docker_configuration.write_text(
+        '{"auths":{"ghcr.io":{"auth":"test-only-docker-auth-marker"}}}\n',
+        encoding="utf-8",
+    )
+    docker_configuration.chmod(docker_config_mode)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    test_safe_path = f"{fake_bin}:{production_safe_path}"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        _fake_rollback_git(
+            git_state,
+            canonical_home,
+            test_safe_path,
+            require_hardened_git,
+            require_no_replace_objects,
+        ),
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        _fake_rollback_docker(
+            docker_log,
+            docker_state,
+            docker_scenario,
+            canonical_home,
+            test_safe_path,
+            docker_config,
+        ),
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    gate.write_text(
+        _fake_rollback_release_gate(
+            gate_log,
+            docker_log,
+            docker_state,
+            canonical_home,
+            test_safe_path,
+            docker_scenario,
+        ),
+        encoding="utf-8",
+    )
+    gate.chmod(0o755)
+
+    publisher_under_test = tmp_path / "publish-rollback-baseline.sh"
+    publisher_source = ROLLBACK_PUBLISH.read_text(encoding="utf-8")
+    safe_path_anchor = (
+        "safe_path=$canonical_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
+        "/usr/bin:/bin:/usr/sbin:/sbin"
+    )
+    assert publisher_source.count(safe_path_anchor) == 1
+    publisher_under_test.write_text(
+        publisher_source.replace(
+            safe_path_anchor,
+            f"safe_path={shlex.quote(str(fake_bin))}:$canonical_home/.local/bin:"
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        ),
+        encoding="utf-8",
+    )
+    publisher_under_test.chmod(0o755)
+
+    temporary_root = tmp_path / "temporary"
+    temporary_root.mkdir()
+    python_injection = tmp_path / "python-injection"
+    python_injection.mkdir()
+    python_injection_marker = tmp_path / "python-injection-ran"
+    (python_injection / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(python_injection_marker)!r}).write_text('injected')\n",
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "ROLLBACK_SOURCE_DIRECTORY": str(configured_source),
+            "DOCKER_CONFIG": str(docker_config),
+            "TMPDIR": str(temporary_root),
+            "KAKAO_JAVASCRIPT_KEY": "must-be-unset",
+            "NEIS_API_KEY": "must-be-unset",
+            "KINDERGARTEN_API_KEY": "must-be-unset",
+            "PYTEST_ADDOPTS": "--collect-only",
+            "PYTEST_PLUGINS": "must_not_be_imported",
+            "PYTHONPATH": str(python_injection),
+        }
+    )
+    if inject_ambient_controls:
+        environment.update(
+            {
+                "HOME": str(tmp_path / "ambient-home-must-not-be-used"),
+                "GIT_DIR": str(tmp_path / "ambient-git-dir"),
+                "GIT_WORK_TREE": str(tmp_path / "ambient-work-tree"),
+                "GIT_INDEX_FILE": str(tmp_path / "ambient-index"),
+                "GIT_CONFIG_GLOBAL": str(tmp_path / "ambient-global-config"),
+                "GIT_CONFIG_SYSTEM": str(tmp_path / "ambient-system-config"),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": str(tmp_path / "ambient-hooks"),
+                "DOCKER_HOST": "tcp://127.0.0.1:1",
+                "DOCKER_CONTEXT": "ambient-context",
+                "DOCKER_CERT_PATH": str(tmp_path / "ambient-certificates"),
+                "DOCKER_TLS_VERIFY": "1",
+                "BUILDX_CONFIG": str(tmp_path / "ambient-buildx"),
+            }
+        )
+    completed = subprocess.run(
+        ["/bin/sh", str(publisher_under_test), *arguments],
+        cwd=Path.cwd(),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return SimpleNamespace(
+        completed=completed,
+        source=source,
+        configured_source=configured_source,
+        gate_log=gate_log,
+        docker_log=docker_log,
+        docker_state=docker_state,
+        temporary_root=temporary_root,
+        python_injection_marker=python_injection_marker,
+    )
+
+
+def _fake_rollback_release_gate(
+    gate_log: Path,
+    docker_log: Path,
+    docker_state: Path,
+    canonical_home: Path,
+    expected_gate_path: str,
+    docker_scenario: str,
+) -> str:
+    gate_log_path = shlex.quote(str(gate_log))
+    legacy_state_path = shlex.quote(str(docker_state / "legacy-created"))
+    uv_cache_path = shlex.quote(str(canonical_home / ".cache/uv"))
+    playwright_path = shlex.quote(str(canonical_home / "Library/Caches/ms-playwright"))
+    gate_path = shlex.quote(expected_gate_path)
+    scenario = shlex.quote(docker_scenario)
+    return f"""#!/bin/sh
+set -eu
+umask 077
+[ -z "${{RELEASE_GATE_IMAGE_RECORD:-}}" ] || exit 97
+[ -z "${{KAKAO_JAVASCRIPT_KEY:-}}${{NEIS_API_KEY:-}}${{KINDERGARTEN_API_KEY:-}}" ] \
+    || exit 98
+[ -z "${{PYTEST_ADDOPTS:-}}${{PYTEST_PLUGINS:-}}${{PYTHONPATH:-}}" ] || exit 99
+[ "$PATH" = {gate_path} ] || exit 100
+private_root=${{TMPDIR%/release-gate-tmp}}
+[ "$HOME" = "$private_root/release-gate-home" ] || exit 101
+[ "$XDG_CONFIG_HOME" = "$HOME/xdg-config" ] || exit 102
+[ "$XDG_CACHE_HOME" = "$HOME/xdg-cache" ] || exit 103
+[ "$XDG_DATA_HOME" = "$HOME/xdg-data" ] || exit 104
+[ "$NPM_CONFIG_CACHE" = "$HOME/npm-cache" ] || exit 105
+[ "$NPM_CONFIG_STORE_DIR" = "$HOME/pnpm-store" ] || exit 106
+[ "$UV_CACHE_DIR" = {uv_cache_path} ] || exit 107
+[ "$PLAYWRIGHT_BROWSERS_PATH" = {playwright_path} ] || exit 108
+for forbidden in \
+    .git \
+    apps/travel-map/tests/conftest.py \
+    apps/travel-map/e2e/injected.spec.ts \
+    apps/travel-map/.venv/lib/python/sitecustomize.py \
+    apps/travel-map/node_modules/injected/package.json
+do
+    [ ! -e "$forbidden" ] || exit 109
+done
+gate_mode=$(stat -f '%Lp' "$0" 2>/dev/null || stat -c '%a' "$0")
+main_mode=$(stat -f '%Lp' apps/travel-map/app/main.py 2>/dev/null \
+    || stat -c '%a' apps/travel-map/app/main.py)
+[ "$gate_mode" = 755 ] && [ "$main_mode" = 644 ] || exit 110
+printf '%s\\n' "$CI|$PYTHONWARNINGS|$DOCKER_DEFAULT_PLATFORM|$NAS_PLATFORM|$#|$(pwd -P)" >> {gate_log_path}
+if [ {scenario} = legacy-build-race ]; then
+    printf '%s\\n' 'sha256:{"3" * 64}' > {legacy_state_path}.identity
+    : > {legacy_state_path}
+    exit 1
+fi
+snapshot_id=fake-snapshot
+context_root=fake-release-context
+docker build --build-arg SNAPSHOT_ID="$snapshot_id" -t seoul-education-travel-map:0.1.0 "$context_root"
+[ {scenario} != legacy-retag-after-gate ] \\
+    || printf '%s\\n' 'sha256:{"3" * 64}' > {legacy_state_path}.identity
+printf '%s\\n' 'RELEASE_GATE_TRANSCRIPT'
+"""
+
+
+def _fake_rollback_git(
+    git_state: str,
+    canonical_home: Path,
+    expected_path: str,
+    require_hardened_git: bool,
+    require_no_replace_objects: bool,
+) -> str:
+    state = shlex.quote(git_state)
+    home = shlex.quote(str(canonical_home))
+    path = shlex.quote(expected_path)
+    hardened = 1 if require_hardened_git else 0
+    no_replace = 1 if require_no_replace_objects else 0
+    return f"""#!/bin/sh
+set -eu
+[ "$PATH" = {path} ] || exit 80
+[ "$HOME" = {home} ] || exit 81
+[ "${{GIT_CONFIG_GLOBAL:-}}" = /dev/null ] || exit 82
+[ "${{GIT_CONFIG_NOSYSTEM:-}}" = 1 ] || exit 83
+[ -z "${{GIT_DIR:-}}${{GIT_WORK_TREE:-}}${{GIT_INDEX_FILE:-}}" ] || exit 84
+[ -z "${{GIT_CONFIG_SYSTEM:-}}${{GIT_CONFIG_COUNT:-}}" ] || exit 85
+[ -z "${{GIT_CONFIG_KEY_0:-}}${{GIT_CONFIG_VALUE_0:-}}" ] || exit 86
+FAKE_GIT_STATE={state}
+REQUIRE_HARDENED_GIT={hardened}
+REQUIRE_NO_REPLACE_OBJECTS={no_replace}
+[ "$REQUIRE_NO_REPLACE_OBJECTS" -eq 0 ] \
+    || [ "${{GIT_NO_REPLACE_OBJECTS:-}}" = 1 ] \
+    || exit 89
+[ "$1" = '-C' ] || exit 90
+source_directory=$2
+shift 2
+fsmonitor_fixed=0
+untracked_cache_fixed=0
+while [ "${{1:-}}" = '-c' ]; do
+    case "${{2:-}}" in
+        core.fsmonitor=false) fsmonitor_fixed=1 ;;
+        core.untrackedCache=false) untracked_cache_fixed=1 ;;
+    esac
+    shift 2
+done
+if [ "$REQUIRE_HARDENED_GIT" -eq 1 ]; then
+    [ "$fsmonitor_fixed" -eq 1 ] || exit 87
+    [ "$untracked_cache_fixed" -eq 1 ] || exit 88
+fi
+case "$1:$2" in
+    rev-parse:--show-toplevel)
+        printf '%s\\n' "$source_directory"
+        ;;
+    rev-parse:HEAD)
+        if [ "$FAKE_GIT_STATE" = 'wrong-sha' ]; then
+            printf '%s\\n' '{"a" * 40}'
+        else
+            printf '%s\\n' '{ROLLBACK_SHA}'
+        fi
+        ;;
+    rev-parse:--is-inside-work-tree)
+        printf '%s\\n' 'true'
+        ;;
+    symbolic-ref:--quiet)
+        [ "$FAKE_GIT_STATE" = 'attached' ] && exit 0
+        exit 1
+        ;;
+    status:--porcelain=v1)
+        [ "$FAKE_GIT_STATE" = 'dirty' ] && printf '%s\\n' ' M tracked-file'
+        exit 0
+        ;;
+    ls-files:-v)
+        case "$FAKE_GIT_STATE" in
+            assume-unchanged) prefix=h ;;
+            skip-worktree) prefix=S ;;
+            *) prefix=H ;;
+        esac
+        printf '%s\\n' "$prefix apps/travel-map/Dockerfile"
+        ;;
+    ls-tree:-r)
+        case "$*" in
+            *--name-only*)
+                printf 'apps/travel-map/app/main.py\\0'
+                ;;
+            *)
+                gate_id=$(/usr/bin/git hash-object \
+                    "$source_directory/apps/travel-map/scripts/release-gate.sh")
+                main_id=$(/usr/bin/git hash-object \
+                    "$source_directory/apps/travel-map/app/main.py")
+                printf '100755 blob %s\\tapps/travel-map/scripts/release-gate.sh\\0' \
+                    "$gate_id"
+                printf '100644 blob %s\\tapps/travel-map/app/main.py\\0' "$main_id"
+                ;;
+        esac
+        ;;
+    archive:--format=tar)
+        case "${{3:-}}" in
+            --output=*) archive_output=${{3#--output=}} ;;
+            *) exit 92 ;;
+        esac
+        [ "${{4:-}}" = '{ROLLBACK_SHA}' ] || exit 93
+        archive_stage=$archive_output.stage
+        mkdir -p "$archive_stage/apps/travel-map/scripts" \
+            "$archive_stage/apps/travel-map/app"
+        /bin/cp -p "$source_directory/apps/travel-map/scripts/release-gate.sh" \
+            "$archive_stage/apps/travel-map/scripts/release-gate.sh"
+        /bin/cp -p "$source_directory/apps/travel-map/app/main.py" \
+            "$archive_stage/apps/travel-map/app/main.py"
+        chmod 0775 "$archive_stage/apps/travel-map/scripts/release-gate.sh"
+        chmod 0664 "$archive_stage/apps/travel-map/app/main.py"
+        COPYFILE_DISABLE=1 /usr/bin/tar -cf "$archive_output" \
+            -C "$archive_stage" apps
+        ;;
+    *)
+        exit 91
+        ;;
+esac
+"""
+
+
+def _fake_rollback_docker(
+    docker_log: Path,
+    docker_state: Path,
+    docker_scenario: str,
+    canonical_home: Path,
+    expected_path: str,
+    docker_config: Path,
+) -> str:
+    docker_log_path = shlex.quote(str(docker_log))
+    docker_state_path = shlex.quote(str(docker_state))
+    scenario = shlex.quote(docker_scenario)
+    home = shlex.quote(str(canonical_home))
+    path = shlex.quote(expected_path)
+    config = shlex.quote(str(docker_config))
+    return f"""#!/bin/sh
+set -eu
+[ "$PATH" = {path} ] || exit 80
+case "$HOME" in
+    {home}|*/release-gate-home) ;;
+    *) exit 81 ;;
+esac
+[ "$DOCKER_CONFIG" = {config} ] || exit 82
+[ -z "${{DOCKER_HOST:-}}${{DOCKER_CONTEXT:-}}${{DOCKER_CERT_PATH:-}}" ] || exit 83
+[ -z "${{DOCKER_TLS_VERIFY:-}}${{BUILDX_CONFIG:-}}" ] || exit 84
+FAKE_DOCKER_LOG={docker_log_path}
+FAKE_DOCKER_STATE_DIRECTORY={docker_state_path}
+FAKE_DOCKER_SCENARIO={scenario}
+mkdir -p "$FAKE_DOCKER_STATE_DIRECTORY"
+printf '%s' "$1" >> "$FAKE_DOCKER_LOG"
+shift
+for argument in "$@"; do
+    printf ' %s' "$argument" >> "$FAKE_DOCKER_LOG"
+done
+printf '\\n' >> "$FAKE_DOCKER_LOG"
+built_image_id='{ROLLBACK_IMAGE_ID}'
+image_id="$built_image_id"
+competitor_id='sha256:{"3" * 64}'
+container_id='{ROLLBACK_CONTAINER_ID}'
+legacy_tag='{ROLLBACK_LEGACY_TAG}'
+rollback_tag='{ROLLBACK_TAG}'
+repo_digest='{ROLLBACK_REGISTRY}@{ROLLBACK_MANIFEST}'
+platform_manifest='{ROLLBACK_REGISTRY}@{ROLLBACK_PLATFORM_MANIFEST}'
+config_digest='{ROLLBACK_CONFIG_DIGEST}'
+[ "$FAKE_DOCKER_SCENARIO" != 'legacy-retag-after-gate' ] \
+    || image_id="$competitor_id"
+if [ "$FAKE_DOCKER_SCENARIO" = 'legacy-retag-after-gate' ]; then
+    rollback_tag='{ROLLBACK_REGISTRY}:rollback-baseline-{ROLLBACK_SHA}-'${{image_id#sha256:}}
+fi
+case "$FAKE_DOCKER_SCENARIO" in
+    containerd-index|containerd-extra-runnable|containerd-unlinked-attestation|containerd-zero-attestation|containerd-multiple-attestations|containerd-attestation-missing|containerd-attestation-not-attestation|containerd-malformed-child-config|containerd-invalid-child-config-descriptor)
+        repo_digest='{ROLLBACK_REGISTRY}@{ROLLBACK_IMAGE_ID}'
+        ;;
+esac
+case "${{1-}}" in
+    '') : ;;
+esac
+command_name=$(sed -n '$p' "$FAKE_DOCKER_LOG" | cut -d ' ' -f 1)
+case "$command_name" in
+    version)
+        exit 0
+        ;;
+    image)
+        subcommand=$1
+        shift
+        case "$subcommand" in
+            ls)
+                case "$*" in
+                    *"reference=$legacy_tag"*)
+                        if [ "$FAKE_DOCKER_SCENARIO" = 'local-existing' ] \\
+                            || [ -f "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created" ]; then
+                            if [ -f "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created.identity" ]; then
+                                sed -n '1p' "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created.identity"
+                            else
+                                printf '%s\\n' "$image_id"
+                            fi
+                        fi
+                        ;;
+                    *"reference=$rollback_tag"*)
+                        if [ "$FAKE_DOCKER_SCENARIO" = \
+                            'rollback-tag-overwrite-race' ]; then
+                            rollback_lookup_count_file="$FAKE_DOCKER_STATE_DIRECTORY/rollback-local-lookup-count"
+                            rollback_lookup_count=0
+                            [ ! -f "$rollback_lookup_count_file" ] \
+                                || rollback_lookup_count=$(sed -n '1p' \
+                                    "$rollback_lookup_count_file")
+                            rollback_lookup_count=$((rollback_lookup_count + 1))
+                            printf '%s\\n' "$rollback_lookup_count" \
+                                > "$rollback_lookup_count_file"
+                            if [ "$rollback_lookup_count" -ge 2 ]; then
+                                printf '%s\\n' "$competitor_id" \
+                                    > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity"
+                                : > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created"
+                            fi
+                        fi
+                        if [ "$FAKE_DOCKER_SCENARIO" = 'local-rollback-existing' ] \\
+                            || [ -f "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created" ]; then
+                            if [ -f "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity" ]; then
+                                sed -n '1p' "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity"
+                            else
+                                printf '%s\\n' "$image_id"
+                            fi
+                        fi
+                        ;;
+                esac
+                exit 0
+                ;;
+            inspect)
+                inspected_reference=
+                for inspected_argument in "$@"; do
+                    inspected_reference=$inspected_argument
+                done
+                case "$inspected_reference" in
+                    "$legacy_tag"|"$built_image_id"|"$image_id")
+                        [ -f "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created" ] \
+                            || exit 98
+                        ;;
+                    "$rollback_tag")
+                        [ -f "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created" ] \
+                            || exit 98
+                        ;;
+                    *) exit 98 ;;
+                esac
+                case "$*" in
+                    *RepoDigests*) printf '%s\\n' "$repo_digest" ;;
+                    *)
+                        platform='linux/amd64'
+                        inspected_id="$image_id"
+                        if [ "$FAKE_DOCKER_SCENARIO" = \
+                            'rollback-retag-during-cleanup' ] \\
+                            && [ "$inspected_reference" = "$rollback_tag" ]; then
+                            rollback_inspect_count_file="$FAKE_DOCKER_STATE_DIRECTORY/rollback-inspect-count"
+                            rollback_inspect_count=0
+                            [ ! -f "$rollback_inspect_count_file" ] \
+                                || rollback_inspect_count=$(sed -n '1p' \
+                                    "$rollback_inspect_count_file")
+                            rollback_inspect_count=$((rollback_inspect_count + 1))
+                            printf '%s\\n' "$rollback_inspect_count" \
+                                > "$rollback_inspect_count_file"
+                            if [ "$rollback_inspect_count" -ge 3 ]; then
+                                printf '%s\\n' "$competitor_id" \
+                                    > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity"
+                            fi
+                        fi
+                        case "$inspected_reference" in
+                            "$built_image_id")
+                                inspected_id="$built_image_id"
+                                ;;
+                            "$legacy_tag")
+                                inspected_id=$(sed -n '1p' \
+                                    "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created.identity")
+                                ;;
+                            "$rollback_tag")
+                                inspected_id=$(sed -n '1p' \
+                                    "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity")
+                                ;;
+                        esac
+                        [ "$FAKE_DOCKER_SCENARIO" = 'local-platform-mismatch' ] \\
+                            && platform='linux/arm64'
+                        case "$FAKE_DOCKER_SCENARIO:$*" in
+                            tagged-id-mismatch:*"$rollback_tag"*)
+                                inspected_id='sha256:{"3" * 64}'
+                                ;;
+                        esac
+                        case "$*" in
+                            *'{{{{.Id}}}} {{{{.Os}}}}/{{{{.Architecture}}}}'*)
+                                printf '%s %s\\n' "$inspected_id" "$platform"
+                                ;;
+                            *'{{{{.Id}}}}'*) printf '%s\\n' "$inspected_id" ;;
+                            *) exit 99 ;;
+                        esac
+                        ;;
+                esac
+                ;;
+            rm)
+                [ "$FAKE_DOCKER_SCENARIO" = 'cleanup-failure' ] && exit 1
+                case "$*" in
+                    *"$legacy_tag"*)
+                        rm -f "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created" \
+                            "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created.identity"
+                        ;;
+                    *"$rollback_tag"*)
+                        if [ "$FAKE_DOCKER_SCENARIO" = \
+                            'rollback-retag-during-cleanup' ]; then
+                            printf '%s\\n' "$competitor_id" \
+                                > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity"
+                            : > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created"
+                        fi
+                        rm -f "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created" \
+                            "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity"
+                        ;;
+                esac
+                exit 0
+                ;;
+            *) exit 92 ;;
+        esac
+        ;;
+    build)
+        [ "$1" = '--iidfile' ] || exit 97
+        build_iid_file=$2
+        shift 2
+        [ "$*" = "--build-arg SNAPSHOT_ID=fake-snapshot -t $legacy_tag fake-release-context" ] \
+            || exit 97
+        printf '%s\\n' "$built_image_id" > "$build_iid_file"
+        chmod 0600 "$build_iid_file"
+        printf '%s\\n' "$built_image_id" \
+            > "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created.identity"
+        : > "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created"
+        ;;
+    buildx)
+        [ "$1" = 'imagetools' ] && [ "$2" = 'inspect' ] || exit 93
+        case "$*" in
+            *"$rollback_tag"*)
+                lookup_count_file="$FAKE_DOCKER_STATE_DIRECTORY/remote-lookup-count"
+                lookup_count=0
+                [ ! -f "$lookup_count_file" ] \
+                    || lookup_count=$(sed -n '1p' "$lookup_count_file")
+                lookup_count=$((lookup_count + 1))
+                printf '%s\\n' "$lookup_count" > "$lookup_count_file"
+                remote_present=0
+                case "$FAKE_DOCKER_SCENARIO" in
+                    remote-ambiguous)
+                        printf '%s\\n' 'ERROR: request failed: network timeout' >&2
+                        exit 1
+                        ;;
+                    remote-helper-missing)
+                        printf '%s\\n' \\
+                            "ERROR: $rollback_tag: credential helper executable not found" >&2
+                        exit 1
+                        ;;
+                    remote-referenced-manifest-missing)
+                        printf '%s\\n' \\
+                            "ERROR: $rollback_tag: referenced manifest sha256:{"7" * 64} not found" >&2
+                        exit 1
+                        ;;
+                    remote-existing|remote-existing-identical)
+                        remote_present=1
+                        ;;
+                    remote-prepush-race)
+                        [ "$lookup_count" -lt 2 ] || remote_present=1
+                        ;;
+                    remote-malformed-descriptor)
+                        printf '%s\\n' '[]'
+                        exit 0
+                        ;;
+                    exact-top-level-not-found)
+                        if [ ! -f "$FAKE_DOCKER_STATE_DIRECTORY/remote-pushed" ]; then
+                            printf '%s\\n' "ERROR: $rollback_tag: not found" >&2
+                            exit 1
+                        fi
+                        remote_present=1
+                        ;;
+                    *)
+                        [ ! -f "$FAKE_DOCKER_STATE_DIRECTORY/remote-pushed" ] \\
+                            || remote_present=1
+                        ;;
+                esac
+                if [ "$remote_present" -eq 0 ]; then
+                    printf '%s\\n' 'ERROR: manifest unknown: not found' >&2
+                    exit 1
+                fi
+                case "$FAKE_DOCKER_SCENARIO" in
+                    containerd-index|containerd-extra-runnable|containerd-unlinked-attestation|containerd-zero-attestation|containerd-multiple-attestations|containerd-attestation-missing|containerd-attestation-not-attestation|containerd-malformed-child-config|containerd-invalid-child-config-descriptor)
+                        remote_digest="$image_id"
+                        remote_media_type='{ROLLBACK_INDEX_MEDIA_TYPE}'
+                        ;;
+                    *)
+                        remote_digest='{ROLLBACK_MANIFEST}'
+                        remote_media_type='{ROLLBACK_MANIFEST_MEDIA_TYPE}'
+                        ;;
+                esac
+                remote_size=1234
+                case "$FAKE_DOCKER_SCENARIO" in
+                    remote-descriptor-media-type-invalid)
+                        remote_media_type='application/json'
+                        ;;
+                    remote-descriptor-size-zero)
+                        remote_size=0
+                        ;;
+                    remote-descriptor-kind-mismatch)
+                        remote_media_type='{ROLLBACK_INDEX_MEDIA_TYPE}'
+                        ;;
+                esac
+                printf '{{"mediaType":"%s","digest":"%s","size":%s}}\\n' \\
+                    "$remote_media_type" "$remote_digest" "$remote_size"
+                ;;
+            *"$platform_manifest"*)
+                case "$*" in
+                    *--raw*)
+                        if [ "$FAKE_DOCKER_SCENARIO" = \\
+                            'containerd-malformed-child-config' ]; then
+                            printf '%s\\n' '{{"schemaVersion":2,"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","config":[]}}'
+                        elif [ "$FAKE_DOCKER_SCENARIO" = \\
+                            'containerd-invalid-child-config-descriptor' ]; then
+                            printf '{{"schemaVersion":2,"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","config":{{"digest":"%s"}}}}\\n' \\
+                                "$config_digest"
+                        else
+                            printf '{{"schemaVersion":2,"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":222}}}}\\n' \\
+                                "$config_digest"
+                        fi
+                        ;;
+                    *--format*)
+                        printf '%s\\n' '{{"architecture":"amd64","os":"linux"}}'
+                        ;;
+                    *) exit 94 ;;
+                esac
+                ;;
+            *'{ROLLBACK_REGISTRY}@{ROLLBACK_ATTESTATION_MANIFEST}'*)
+                [ "$FAKE_DOCKER_SCENARIO" != 'containerd-attestation-missing' ] \
+                    || exit 94
+                if [ "$FAKE_DOCKER_SCENARIO" = \
+                    'containerd-attestation-not-attestation' ]; then
+                    printf '%s\n' \
+                        '{{"schemaVersion":2,"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{ROLLBACK_ATTESTATION_CONFIG}","size":100}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{ROLLBACK_ATTESTATION_LAYER}","size":101}}]}}'
+                else
+                    printf '%s\n' \
+                        '{{"schemaVersion":2,"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{ROLLBACK_ATTESTATION_CONFIG}","size":100}},"layers":[{{"mediaType":"application/vnd.in-toto+json","digest":"{ROLLBACK_ATTESTATION_LAYER}","size":101,"annotations":{{"in-toto.io/predicate-type":"https://slsa.dev/provenance/v0.2"}}}}]}}'
+                fi
+                ;;
+            *'{ROLLBACK_REGISTRY}@{ROLLBACK_SECOND_ATTESTATION_MANIFEST}'*)
+                printf '%s\n' \
+                    '{{"schemaVersion":2,"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{ROLLBACK_ATTESTATION_CONFIG}","size":100}},"layers":[{{"mediaType":"application/vnd.in-toto+json","digest":"{ROLLBACK_ATTESTATION_LAYER}","size":101,"annotations":{{"in-toto.io/predicate-type":"https://spdx.dev/Document"}}}}]}}'
+                ;;
+            *"$repo_digest"*)
+                case "$FAKE_DOCKER_SCENARIO" in
+                    containerd-extra-runnable)
+                        printf '%s\\n' \\
+                            '{{"schemaVersion":2,"mediaType":"{ROLLBACK_INDEX_MEDIA_TYPE}","manifests":[{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_PLATFORM_MANIFEST}","size":111,"platform":{{"architecture":"amd64","os":"linux"}}}},{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_EXTRA_PLATFORM_MANIFEST}","size":112,"platform":{{"architecture":"arm64","os":"linux"}}}},{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_ATTESTATION_MANIFEST}","size":113,"annotations":{{"vnd.docker.reference.digest":"{ROLLBACK_PLATFORM_MANIFEST}","vnd.docker.reference.type":"attestation-manifest"}},"platform":{{"architecture":"unknown","os":"unknown"}}}}]}}'
+                        ;;
+                    containerd-unlinked-attestation)
+                        printf '%s\\n' \\
+                            '{{"schemaVersion":2,"mediaType":"{ROLLBACK_INDEX_MEDIA_TYPE}","manifests":[{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_PLATFORM_MANIFEST}","size":111,"platform":{{"architecture":"amd64","os":"linux"}}}},{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_ATTESTATION_MANIFEST}","size":113,"annotations":{{"vnd.docker.reference.digest":"{ROLLBACK_EXTRA_PLATFORM_MANIFEST}","vnd.docker.reference.type":"attestation-manifest"}},"platform":{{"architecture":"unknown","os":"unknown"}}}}]}}'
+                        ;;
+                    containerd-zero-attestation)
+                        printf '%s\n' \
+                            '{{"schemaVersion":2,"mediaType":"{ROLLBACK_INDEX_MEDIA_TYPE}","manifests":[{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_PLATFORM_MANIFEST}","size":111,"platform":{{"architecture":"amd64","os":"linux"}}}}]}}'
+                        ;;
+                    containerd-multiple-attestations)
+                        printf '%s\n' \
+                            '{{"schemaVersion":2,"mediaType":"{ROLLBACK_INDEX_MEDIA_TYPE}","manifests":[{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_PLATFORM_MANIFEST}","size":111,"platform":{{"architecture":"amd64","os":"linux"}}}},{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_ATTESTATION_MANIFEST}","size":113,"annotations":{{"vnd.docker.reference.digest":"{ROLLBACK_PLATFORM_MANIFEST}","vnd.docker.reference.type":"attestation-manifest"}},"platform":{{"architecture":"unknown","os":"unknown"}}}},{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_SECOND_ATTESTATION_MANIFEST}","size":114,"annotations":{{"vnd.docker.reference.digest":"{ROLLBACK_PLATFORM_MANIFEST}","vnd.docker.reference.type":"attestation-manifest"}},"platform":{{"architecture":"unknown","os":"unknown"}}}}]}}'
+                        ;;
+                    containerd-index|containerd-index-id-mismatch|containerd-attestation-missing|containerd-attestation-not-attestation|containerd-malformed-child-config|containerd-invalid-child-config-descriptor)
+                        printf '%s\\n' \\
+                            '{{"schemaVersion":2,"mediaType":"{ROLLBACK_INDEX_MEDIA_TYPE}","manifests":[{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_PLATFORM_MANIFEST}","size":111,"platform":{{"architecture":"amd64","os":"linux"}}}},{{"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","digest":"{ROLLBACK_ATTESTATION_MANIFEST}","size":113,"annotations":{{"vnd.docker.reference.digest":"{ROLLBACK_PLATFORM_MANIFEST}","vnd.docker.reference.type":"attestation-manifest"}},"platform":{{"architecture":"unknown","os":"unknown"}}}}]}}'
+                        ;;
+                    *)
+                        case "$*" in
+                            *--raw*)
+                                if [ "$FAKE_DOCKER_SCENARIO" = \
+                                    'remote-malformed-config-shape' ]; then
+                                    printf '%s\\n' '{{"schemaVersion":2,"mediaType":"{ROLLBACK_MANIFEST_MEDIA_TYPE}","config":[]}}'
+                                    exit 0
+                                fi
+                                remote_id="$image_id"
+                                case "$FAKE_DOCKER_SCENARIO" in
+                                    remote-config-mismatch|remote-existing|remote-race|remote-prepush-race)
+                                        remote_id='sha256:{"3" * 64}'
+                                        ;;
+                                esac
+                                raw_media_type='{ROLLBACK_MANIFEST_MEDIA_TYPE}'
+                                [ "$FAKE_DOCKER_SCENARIO" != \\
+                                    'remote-raw-media-type-mismatch' ] \\
+                                    || raw_media_type='application/vnd.docker.distribution.manifest.v2+json'
+                                if [ "$FAKE_DOCKER_SCENARIO" = \\
+                                    'remote-invalid-config-descriptor' ]; then
+                                    printf '{{"schemaVersion":2,"mediaType":"%s","config":{{"digest":"%s"}}}}\\n' \\
+                                        "$raw_media_type" "$remote_id"
+                                else
+                                    printf '{{"schemaVersion":2,"mediaType":"%s","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"%s","size":222}}}}\\n' \\
+                                        "$raw_media_type" "$remote_id"
+                                fi
+                                ;;
+                            *--format*)
+                                architecture='amd64'
+                                [ "$FAKE_DOCKER_SCENARIO" = 'remote-platform-mismatch' ] \\
+                                    && architecture='arm64'
+                                printf '{{"architecture":"%s","os":"linux"}}\\n' \\
+                                    "$architecture"
+                                ;;
+                            *) exit 94 ;;
+                        esac
+                        ;;
+                esac
+                ;;
+            *) exit 95 ;;
+        esac
+        ;;
+    run)
+        cidfile=
+        previous=
+        for argument in "$@"; do
+            [ "$previous" != '--cidfile' ] || cidfile=$argument
+            previous=$argument
+        done
+        if [ -z "$cidfile" ]; then
+            if [ "$FAKE_DOCKER_SCENARIO" = 'container-name-race' ]; then
+                : > "$FAKE_DOCKER_STATE_DIRECTORY/competitor-container"
+                exit 1
+            fi
+            printf '%s\\n' 'fake-container-id'
+            exit 0
+        fi
+        if [ "$FAKE_DOCKER_SCENARIO" = 'container-name-race' ]; then
+            : > "$FAKE_DOCKER_STATE_DIRECTORY/competitor-container"
+            exit 1
+        fi
+        printf '%s\\n' "$container_id" > "$cidfile"
+        chmod 0600 "$cidfile"
+        if [ "$FAKE_DOCKER_SCENARIO" = 'container-start-failure-owned' ]; then
+            : > "$FAKE_DOCKER_STATE_DIRECTORY/owned-container"
+            exit 1
+        fi
+        if [ "$FAKE_DOCKER_SCENARIO" = 'container-signal-after-cidfile' ]; then
+            : > "$FAKE_DOCKER_STATE_DIRECTORY/owned-container"
+            kill -TERM "$PPID"
+            exit 0
+        fi
+        printf '%s\\n' "$container_id"
+        ;;
+    exec)
+        cat >/dev/null
+        ;;
+    rm)
+        if [ "$FAKE_DOCKER_SCENARIO" = 'container-name-race' ]; then
+            rm -f "$FAKE_DOCKER_STATE_DIRECTORY/competitor-container"
+        fi
+        case "$FAKE_DOCKER_SCENARIO" in
+            container-start-failure-owned|container-signal-after-cidfile)
+                rm -f "$FAKE_DOCKER_STATE_DIRECTORY/owned-container"
+                ;;
+        esac
+        ;;
+    tag)
+        if [ "$FAKE_DOCKER_SCENARIO" = 'rollback-tag-race' ]; then
+            printf '%s\\n' "$competitor_id" \
+                > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity"
+            : > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created"
+            exit 1
+        fi
+        if [ "$FAKE_DOCKER_SCENARIO" = 'rollback-tag-overwrite-race' ]; then
+            printf '%s\\n' "$competitor_id" \
+                > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity"
+            : > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created"
+        fi
+        printf '%s\\n' "$image_id" \
+            > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity"
+        : > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created"
+        ;;
+    push)
+        case "$FAKE_DOCKER_SCENARIO" in
+            legacy-replaced-before-cleanup)
+                printf '%s\\n' "$competitor_id" \
+                    > "$FAKE_DOCKER_STATE_DIRECTORY/legacy-created.identity"
+                ;;
+            rollback-replaced-before-cleanup)
+                printf '%s\\n' "$competitor_id" \
+                    > "$FAKE_DOCKER_STATE_DIRECTORY/rollback-created.identity"
+                ;;
+        esac
+        : > "$FAKE_DOCKER_STATE_DIRECTORY/remote-pushed"
+        printf '%s\\n' 'PUSH_TRANSCRIPT'
+        ;;
+    *)
+        exit 96
+        ;;
+esac
+"""
