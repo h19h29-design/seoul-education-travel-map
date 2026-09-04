@@ -203,8 +203,12 @@ socket context and must contain no `auths`, `credsStore`, `credHelpers`, or
 read-only NAS platform inspection.
 
 Every release tool executable and every directory in its physical path must be
-owned by root or the caller and must not be group- or world-writable. A default
-Homebrew tree with a group-writable `Cellar` therefore fails closed; use a
+owned by root or the caller. Tool executables must not be group- or
+world-writable. A shared-writable ancestor is accepted only when that ancestor
+is root- or caller-owned and has the sticky bit; this permits an owner-private
+`0700` tool directory below `/tmp` while preventing cross-user sibling
+replacement. A
+group-writable non-sticky Homebrew `Cellar` therefore fails closed; use a
 separately reviewed non-writable tool installation or an explicitly reviewed,
 temporary mode-hardening procedure that is restored after the gate.
 

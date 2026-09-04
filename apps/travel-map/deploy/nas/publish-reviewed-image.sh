@@ -2172,6 +2172,63 @@ import sys
 import time
 from pathlib import Path
 
+STAGE_B_CHILD_LAUNCHER = """\
+import fcntl
+import os
+import signal
+import stat
+import sys
+
+try:
+    pid_fd_text = sys.argv[1]
+    tag_fd_text = os.environ["TRAVEL_MAP_PUBLISH_TAG_ARM_FD"]
+    fallback_fd_text = os.environ[
+        "TRAVEL_MAP_PUBLISH_FALLBACK_TAG_ARM_FD"
+    ]
+    if not all(value.isdecimal() for value in (
+        pid_fd_text, tag_fd_text, fallback_fd_text
+    )):
+        raise OSError
+    pid_fd, tag_fd, fallback_fd = (
+        int(pid_fd_text), int(tag_fd_text), int(fallback_fd_text)
+    )
+    source_descriptors = (pid_fd, tag_fd, fallback_fd)
+    if (
+        any(descriptor <= 2 for descriptor in source_descriptors)
+        or len(set(source_descriptors)) != len(source_descriptors)
+        or any(
+            not stat.S_ISFIFO(os.fstat(descriptor).st_mode)
+            for descriptor in source_descriptors
+        )
+    ):
+        raise OSError
+    pid_payload = f"{os.getpid()}\\n".encode("ascii")
+    if os.write(pid_fd, pid_payload) != len(pid_payload):
+        raise OSError
+    os.close(pid_fd)
+
+    copies = []
+    targets = (8, 9)
+    try:
+        for descriptor in (tag_fd, fallback_fd):
+            copies.append(
+                fcntl.fcntl(descriptor, fcntl.F_DUPFD_CLOEXEC, 10)
+            )
+        for descriptor, target in zip(copies, targets):
+            os.dup2(descriptor, target, inheritable=True)
+    finally:
+        for descriptor in set((tag_fd, fallback_fd, *copies)) - set(targets):
+            os.close(descriptor)
+    os.environ["TRAVEL_MAP_PUBLISH_TAG_ARM_FD"] = str(targets[0])
+    os.environ["TRAVEL_MAP_PUBLISH_FALLBACK_TAG_ARM_FD"] = str(targets[1])
+    signal.pthread_sigmask(
+        signal.SIG_UNBLOCK, {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+    )
+    os.execve("/bin/sh", sys.argv[2:], os.environ)
+except (KeyError, OSError, ValueError):
+    raise SystemExit(2) from None
+"""
+
 handled_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
 signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
 
@@ -3767,7 +3824,12 @@ def finish_resource_broker(request: bytes) -> bool:
     if broker_pid is not None and broker_exit_status is None:
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
-            waited, raw_status = os.waitpid(broker_pid, os.WNOHANG)
+            try:
+                waited, raw_status = os.waitpid(broker_pid, os.WNOHANG)
+            except ChildProcessError:
+                if broker_exit_status is None:
+                    broker_exit_status = 2
+                break
             if waited == broker_pid:
                 broker_exit_status = os.waitstatus_to_exitcode(raw_status)
                 break
@@ -3987,13 +4049,7 @@ try:
             "-I",
             "-S",
             "-c",
-            "import os, signal, sys; "
-            "pid_fd=int(sys.argv[1]); "
-            "os.write(pid_fd, f'{os.getpid()}\\n'.encode('ascii')); "
-            "os.close(pid_fd); "
-            "signal.pthread_sigmask(signal.SIG_UNBLOCK, "
-            "{signal.SIGHUP, signal.SIGINT, signal.SIGTERM}); "
-            "os.execve('/bin/sh', sys.argv[2:], os.environ)",
+            STAGE_B_CHILD_LAUNCHER,
             str(broker_pid_write),
             "/bin/sh",
             "-c",
@@ -4602,6 +4658,8 @@ remove_owned_tag() {
 }
 
 arm_owned_tag() {
+    [ "$tag_arm_fd" = 8 ] || return 1
+    [ "$fallback_tag_arm_fd" = 9 ] || return 1
     case "$tag_arm_fd" in
         ''|*[!0-9]*) return 1 ;;
     esac
@@ -4626,9 +4684,9 @@ try:
 except (OSError, ValueError):
     raise SystemExit(2) from None
 PY
-    eval "exec ${fallback_tag_arm_fd}>&-"
+    exec 9>&-
     fallback_tag_arm_fd=
-    eval "exec ${tag_arm_fd}>&-"
+    exec 8>&-
     tag_arm_fd=
 }
 

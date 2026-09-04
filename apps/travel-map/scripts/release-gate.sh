@@ -343,10 +343,11 @@ try:
         raise ValueError
     for parent in resolved.parents:
         parent_details = parent.stat()
+        shared_write = parent_details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         if (
             not stat.S_ISDIR(parent_details.st_mode)
             or parent_details.st_uid not in {0, os.getuid()}
-            or parent_details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or (shared_write and not parent_details.st_mode & stat.S_ISVTX)
         ):
             raise ValueError
 except (OSError, ValueError):

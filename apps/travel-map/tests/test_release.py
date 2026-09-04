@@ -1593,9 +1593,16 @@ DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
 IN_TOTO_LAYER = "application/vnd.in-toto+json"
 
 
+def _short_system_tmp_root() -> Path:
+    for candidate in (Path("/private/tmp"), Path("/tmp")):
+        if candidate.is_dir():
+            return candidate.resolve(strict=True)
+    raise AssertionError("no supported short system temporary directory")
+
+
 def _publisher_socket_path(tmp_path: Path) -> Path:
     suffix = hashlib.sha256(str(tmp_path).encode("utf-8")).hexdigest()[:16]
-    return Path("/private/tmp") / f"tm-publisher-{suffix}.sock"
+    return _short_system_tmp_root() / f"tm-publisher-{suffix}.sock"
 
 
 def _safe_recorded_root(raw: str, prefixes: tuple[str, ...]) -> Path:
@@ -2096,7 +2103,7 @@ def _run_publish_reviewed_image(
     repository = tmp_path / "repository"
     test_root = repository / "apps/travel-map"
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
+    fake_bin.mkdir(mode=0o700)
 
     publisher = test_root / "deploy/nas/publish-reviewed-image.sh"
     publisher.parent.mkdir(parents=True)
@@ -2810,7 +2817,7 @@ def test_publish_reviewed_image_runs_approved_private_launcher_copy(
     assert source_launcher == (
         tmp_path / "repository/apps/travel-map/deploy/nas/publish-reviewed-image.sh"
     )
-    assert private_launcher.parent.parent == Path("/private/tmp")
+    assert private_launcher.parent.parent == _short_system_tmp_root()
     assert private_launcher.parent.name.startswith("travel-map-publish-launcher.")
     assert private_launcher.name == "publish-reviewed-image.sh"
     assert modes[2]["path"] == modes[1]["path"]
@@ -3027,7 +3034,7 @@ def test_publish_reviewed_image_cleans_root_when_setup_fails(
 def test_publish_reviewed_image_tolerates_unrelated_parent_entry_disappearing(
     tmp_path: Path,
 ) -> None:
-    probe = Path("/private/tmp") / f"travel-map-publish-unrelated-{os.getpid()}"
+    probe = _short_system_tmp_root() / f"travel-map-publish-unrelated-{os.getpid()}"
     probe.mkdir(mode=0o700)
     completed = _run_publish_reviewed_image(
         tmp_path,
@@ -3520,9 +3527,9 @@ def test_publish_reviewed_image_reclaims_resources_when_broker_dies_at_each_phas
         source = source.replace(arm_anchor, arm_anchor + arm_probe, 1)
         if broker_kill_phase == "tag-armed":
             tag_anchor = (
-                "    eval \"exec ${fallback_tag_arm_fd}>&-\"\n"
+                "    exec 9>&-\n"
                 "    fallback_tag_arm_fd=\n"
-                "    eval \"exec ${tag_arm_fd}>&-\"\n"
+                "    exec 8>&-\n"
                 "    tag_arm_fd=\n"
             )
             assert source.count(tag_anchor) == 1
@@ -4180,7 +4187,7 @@ def test_publish_reviewed_image_rejects_empty_broker_process_snapshot(
 
 
 def test_release_fixture_exact_root_teardown_preserves_replacement() -> None:
-    owned = Path("/private/tmp") / (
+    owned = _short_system_tmp_root() / (
         f"travel-map-publish.teardown-{os.getpid()}-{time.monotonic_ns()}"
     )
     displaced = owned.with_name(owned.name + ".owned")
@@ -4203,7 +4210,7 @@ def test_release_fixture_exact_root_teardown_preserves_replacement() -> None:
         assert replacement_marker.read_text(encoding="ascii") == "replacement\n"
     finally:
         for root in (owned, displaced):
-            assert root.parent == Path("/private/tmp")
+            assert root.parent == _short_system_tmp_root()
             assert root.name.startswith("travel-map-publish.teardown-")
             if root.exists():
                 assert root.is_dir() and not root.is_symlink()

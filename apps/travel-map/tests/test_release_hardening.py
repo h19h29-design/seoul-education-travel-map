@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import io
 import json
@@ -10,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
@@ -17,7 +19,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from tests.test_release import _image_manifest, _run_publish_reviewed_image
+from tests.test_release import (
+    _image_manifest,
+    _run_publish_reviewed_image,
+    _short_system_tmp_root,
+)
 
 ROOT = Path("apps/travel-map")
 MATERIALIZE = ROOT / "scripts/materialize-pinned-source.py"
@@ -38,7 +44,9 @@ _TEST_SOCKETS: dict[Path, socket.socket | None] = {}
 
 def _release_test_socket_path(tmp_path: Path, suffix: str = "") -> Path:
     digest = hashlib.sha256(str(tmp_path).encode("utf-8")).hexdigest()[:12]
-    path = Path("/private/tmp") / f"tm-release-{os.getpid()}-{digest}{suffix}.sock"
+    path = _short_system_tmp_root() / (
+        f"tm-release-{os.getpid()}-{digest}{suffix}.sock"
+    )
     if path not in _TEST_SOCKETS:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -73,7 +81,7 @@ def _cleanup_release_test_sockets():
             _TEST_SOCKETS.pop(path, None)
             continue
         if (
-            path.parent == Path("/private/tmp")
+            path.parent == _short_system_tmp_root()
             and path.name.startswith("tm-release-")
             and (
                 stat.S_ISREG(details.st_mode)
@@ -357,7 +365,7 @@ def _cleanup_exact_owned_root(
 
 
 def test_cleanup_recorded_root_preserves_replacement_inode(tmp_path: Path) -> None:
-    root = Path("/private/tmp") / (
+    root = _short_system_tmp_root() / (
         f"travel-map-publish-launcher.teardown-{os.getpid()}-{time.monotonic_ns()}"
     )
     displaced = root.with_name(root.name + ".owned")
@@ -651,22 +659,25 @@ def _write_gate_fake_tools(
     playwright_cache: Path | None = None,
     pnpm_store: Path | None = None,
 ) -> None:
-    fake_bin.mkdir()
+    fake_bin.mkdir(mode=0o700)
     python_runtime = fake_bin.parent / "approved-python-runtime"
     python_executable = python_runtime / "bin/python3.12"
-    python_executable.parent.mkdir(parents=True)
+    python_executable.parent.mkdir(mode=0o700, parents=True)
+    python_runtime.chmod(0o700)
     _write_executable(python_executable, "#!/bin/sh\nexit 0\n")
     python_stdlib = python_runtime / "lib/python3.12"
-    python_stdlib.mkdir(parents=True)
+    python_stdlib.mkdir(mode=0o700, parents=True)
+    python_stdlib.parent.chmod(0o700)
     (python_stdlib / "os.py").write_text(
         "# reviewed Python 3.12 standard library fixture\n",
         encoding="utf-8",
     )
     pnpm_root = fake_bin / "pnpm-package"
     pnpm_executable = pnpm_root / "bin/pnpm.mjs"
-    pnpm_executable.parent.mkdir(parents=True)
+    pnpm_executable.parent.mkdir(mode=0o700, parents=True)
+    pnpm_root.chmod(0o700)
     pnpm_bundle = pnpm_root / "dist/pnpm.mjs"
-    pnpm_bundle.parent.mkdir(parents=True)
+    pnpm_bundle.parent.mkdir(mode=0o700, parents=True)
     pnpm_bundle.write_text("// reviewed pnpm bundle fixture\n", encoding="utf-8")
     (pnpm_root / "package.json").write_text(
         '{"name":"pnpm","version":"fixture"}\n',
@@ -1804,7 +1815,7 @@ def test_release_gate_tolerates_unrelated_tmp_entry_disappearing_during_bootstra
 ) -> None:
     repository, gate, _, _ = _release_gate_repository(tmp_path)
     probe = (
-        Path("/private/tmp")
+        _short_system_tmp_root()
         / f"travel-map-release-unrelated-{os.getpid()}-{tmp_path.name}"
     )
     with probe.open("x", encoding="ascii") as output:
@@ -3114,7 +3125,7 @@ def _publisher_signal_fixture(
     publisher = travel_root / "deploy/nas/publish-reviewed-image.sh"
     publisher.parent.mkdir(parents=True)
     fake_bin = tmp_path / "publisher-safe-bin"
-    fake_bin.mkdir()
+    fake_bin.mkdir(mode=0o700)
     _write_executable(
         fake_bin / "python3",
         "#!/bin/sh\nprintf '%s\\n' 'ambient PATH python3 executed' >&2\nexit 97\n",
@@ -4239,7 +4250,7 @@ def test_publisher_never_leaks_digest_to_late_output_hardlink(
         assert "valid_output = re.fullmatch(" in publisher_source
         return
     sentinel = tmp_path / "late-output-sentinel"
-    leak_path = Path("/private/tmp") / (
+    leak_path = _short_system_tmp_root() / (
         f"travel-map-publish-late-output-{os.getpid()}-{hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]}"
     )
     leak_path.unlink(missing_ok=True)
@@ -4603,6 +4614,64 @@ def test_release_gate_rejects_group_writable_tool_ancestor_before_execution(
     assert completed.stderr == "BLOCKED_UNSAFE_RELEASE_ENVIRONMENT\n"
     assert not record.exists()
     assert not events_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("shared_mode", "expected_returncode"),
+    ((0o1777, 0), (0o0777, 2)),
+    ids=("root-sticky", "non-sticky"),
+)
+def test_release_tool_resolver_allows_only_sticky_shared_ancestors(
+    tmp_path: Path,
+    shared_mode: int,
+    expected_returncode: int,
+) -> None:
+    source = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+    function = source.split("resolve_release_tool() {\n", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    resolver = function.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+    if stat.S_ISVTX & shared_mode:
+        shared_root = _short_system_tmp_root()
+        shared_details = shared_root.stat()
+        assert shared_details.st_uid in {0, os.getuid()}
+        assert shared_details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        assert shared_details.st_mode & stat.S_ISVTX
+        tool_root = Path(tempfile.mkdtemp(prefix="tm-release-tool-", dir=shared_root))
+    else:
+        shared_root = tmp_path / "shared-tool-root"
+        shared_root.mkdir(mode=0o700)
+        shared_root.chmod(shared_mode)
+        assert stat.S_IMODE(shared_root.stat().st_mode) == shared_mode
+        tool_root = shared_root / "private"
+        tool_root.mkdir(mode=0o700)
+    tool = tool_root / "reviewed-tool"
+    _write_executable(tool, "#!/bin/sh\nexit 0\n")
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-S",
+                "-",
+                str(tool_root),
+                tool.name,
+            ],
+            input=resolver,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        shutil.rmtree(tool_root)
+
+    assert completed.returncode == expected_returncode
+    if expected_returncode == 0:
+        assert completed.stdout.strip() == str(tool.resolve(strict=False))
+        assert completed.stderr == ""
+    else:
+        assert completed.stdout == ""
+    assert "parent_details.st_uid not in {0, os.getuid()}" in resolver
 
 
 @pytest.mark.parametrize(
@@ -5228,7 +5297,7 @@ def test_release_gate_removes_private_root_after_partial_pnpm_clone_failure(
     tmp_path: Path,
 ) -> None:
     repository, gate, _, events_path = _release_gate_repository(tmp_path)
-    private_tmp = Path("/private/tmp")
+    private_tmp = _short_system_tmp_root()
     before = set(private_tmp.glob("travel-map-release-environment.*"))
     source = gate.read_text(encoding="utf-8")
     pnpm_clone_start = source.index("def clone_pnpm_store")
@@ -8575,6 +8644,151 @@ def test_publisher_broker_tree_rejects_shell_pid_colliding_with_protected_pid() 
 
     with pytest.raises(OSError):
         namespace["extend_broker_owned_tree"](shell, (), (protected,))
+
+
+@pytest.mark.parametrize(
+    ("tag_source", "fallback_source"),
+    ((12, 13), (8, 9), (9, 8)),
+)
+def test_stage_b_launcher_maps_arm_pipes_to_dash_portable_fds_without_leaks(
+    tmp_path: Path,
+    tag_source: int,
+    fallback_source: int,
+) -> None:
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(encoding="utf-8")
+    start = source.index("STAGE_B_CHILD_LAUNCHER = ")
+    end = source.index("\nhandled_signals =", start)
+    assignment = ast.parse(source[start:end]).body[0]
+    assert isinstance(assignment, ast.Assign)
+    launcher = ast.literal_eval(assignment.value)
+    shell_probe = """\
+[ "$TRAVEL_MAP_PUBLISH_TAG_ARM_FD" = 8 ] || exit 31
+[ "$TRAVEL_MAP_PUBLISH_FALLBACK_TAG_ARM_FD" = 9 ] || exit 32
+printf 'TAG\\n' >&8 || exit 33
+printf 'TAG\\n' >&9 || exit 34
+exec 9>&-
+exec 8>&-
+/bin/sleep 1
+"""
+    probe = textwrap.dedent(
+        f"""
+        import fcntl
+        import json
+        import os
+        import select
+        import subprocess
+        import sys
+        import time
+
+        launcher = {launcher!r}
+        tag_source = int(sys.argv[1])
+        fallback_source = int(sys.argv[2])
+
+        def protected_pipe():
+            read_descriptor, write_descriptor = os.pipe()
+            protected_read = fcntl.fcntl(
+                read_descriptor, fcntl.F_DUPFD_CLOEXEC, 20
+            )
+            protected_write = fcntl.fcntl(
+                write_descriptor, fcntl.F_DUPFD_CLOEXEC, 20
+            )
+            os.close(read_descriptor)
+            os.close(write_descriptor)
+            return protected_read, protected_write
+
+        pid_read, pid_write_saved = protected_pipe()
+        tag_read, tag_write_saved = protected_pipe()
+        fallback_read, fallback_write_saved = protected_pipe()
+        pid_source = 7
+        for saved, target in (
+            (pid_write_saved, pid_source),
+            (tag_write_saved, tag_source),
+            (fallback_write_saved, fallback_source),
+        ):
+            os.dup2(saved, target, inheritable=True)
+        for descriptor in (pid_write_saved, tag_write_saved, fallback_write_saved):
+            os.close(descriptor)
+
+        environment = dict(os.environ)
+        environment["TRAVEL_MAP_PUBLISH_TAG_ARM_FD"] = str(tag_source)
+        environment["TRAVEL_MAP_PUBLISH_FALLBACK_TAG_ARM_FD"] = str(
+            fallback_source
+        )
+        shell_probe = {shell_probe!r}
+        process = subprocess.Popen(
+            [
+                "/usr/bin/python3", "-I", "-S", "-c", launcher,
+                str(pid_source), "/bin/sh", "-c", shell_probe,
+            ],
+            env=environment,
+            pass_fds=(pid_source, tag_source, fallback_source),
+            close_fds=True,
+            stderr=subprocess.PIPE,
+        )
+        for descriptor in {{pid_source, tag_source, fallback_source}}:
+            os.close(descriptor)
+
+        def read_until_eof(descriptor):
+            chunks = []
+            deadline = time.monotonic() + 0.75
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([descriptor], [], [], 0.05)
+                if not readable:
+                    continue
+                chunk = os.read(descriptor, 4096)
+                if not chunk:
+                    return b"".join(chunks), process.poll() is None
+                chunks.append(chunk)
+            raise AssertionError("arm pipe did not reach EOF before shell exit")
+
+        pid_payload, pid_eof_before_exit = read_until_eof(pid_read)
+        tag_payload, tag_eof_before_exit = read_until_eof(tag_read)
+        fallback_payload, fallback_eof_before_exit = read_until_eof(fallback_read)
+        for descriptor in (pid_read, tag_read, fallback_read):
+            os.close(descriptor)
+        returncode = process.wait(timeout=3)
+        stderr = process.stderr.read().decode("utf-8")
+        print(json.dumps({{
+            "returncode": returncode,
+            "stderr": stderr,
+            "pid_matches": pid_payload == f"{{process.pid}}\\n".encode("ascii"),
+            "pid_eof_before_exit": pid_eof_before_exit,
+            "tag_payload": tag_payload.decode("ascii"),
+            "tag_eof_before_exit": tag_eof_before_exit,
+            "fallback_payload": fallback_payload.decode("ascii"),
+            "fallback_eof_before_exit": fallback_eof_before_exit,
+        }}))
+        """
+    )
+
+    completed = subprocess.run(
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-S",
+            "-c",
+            probe,
+            str(tag_source),
+            str(fallback_source),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    observed = json.loads(completed.stdout)
+    assert observed == {
+        "returncode": 0,
+        "stderr": "",
+        "pid_matches": True,
+        "pid_eof_before_exit": True,
+        "tag_payload": "TAG\n",
+        "tag_eof_before_exit": True,
+        "fallback_payload": "TAG\n",
+        "fallback_eof_before_exit": True,
+    }
 
 
 @pytest.mark.parametrize("signum", (signal.SIGTERM, signal.SIGKILL))
