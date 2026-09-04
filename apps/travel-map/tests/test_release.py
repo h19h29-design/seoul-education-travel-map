@@ -5,17 +5,17 @@ import pwd
 import re
 import runpy
 import shlex
-import signal
 import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable
 
 import pytest
 from app.contracts import TripPreviewResponse
@@ -2168,8 +2168,8 @@ PY"""
             record_anchor, record_attack + record_anchor, 1
         )
         outer_attack = (
-            "    if [ -n \"$private_environment\" ] && [ -n \"$launcher_root\" ]; then\n"
-            "    /usr/bin/python3 -I -S - \"$private_environment\" \"$launcher_root\" <<'PY'\n"
+            '    if [ -n "$private_environment" ] && [ -n "$launcher_root" ]; then\n'
+            '    /usr/bin/python3 -I -S - "$private_environment" "$launcher_root" <<\'PY\'\n'
             "import json\nimport sys\nfrom pathlib import Path\n\n"
             "records = []\n"
             "for kind, raw in (('private', sys.argv[1]), ('launcher', sys.argv[2])):\n"
@@ -2276,9 +2276,7 @@ PY"""
             "        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)\n"
             in publisher_source
         ):
-            child_anchor = (
-                "        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)\n"
-            )
+            child_anchor = "        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)\n"
             child_attack = textwrap.indent(
                 (
                     f"if name == 'publish-reviewed-image.sh' and not Path({str(child_replacements)!r}).exists():\n"
@@ -2320,26 +2318,34 @@ PY"""
     if creation_replacement_attack is not None:
         anchors = {
             "launcher": (
-                '                [ -n "$launcher_root" ] && [ -n "$launcher_root_identity" ] \\\n'
-                "                    || blocked 'BLOCKED_INVALID_PUBLISH_CONTEXT'\n",
+                (
+                    '                [ -n "$launcher_root" ] && [ -n "$launcher_root_identity" ] \\\n'
+                    "                    || blocked 'BLOCKED_INVALID_PUBLISH_CONTEXT'\n"
+                ),
                 '"$launcher_root"',
                 "                ",
             ),
             "environment": (
-                '        [ -n "$private_environment" ] && [ -n "$private_environment_identity" ] \\\n'
-                "            || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n",
+                (
+                    '        [ -n "$private_environment" ] && [ -n "$private_environment_identity" ] \\\n'
+                    "            || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
+                ),
                 '"$private_environment"',
                 "        ",
             ),
             "record": (
-                '[ -n "$record_parent" ] && [ -n "$record_parent_identity" ] \\\n'
-                "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n",
+                (
+                    '[ -n "$record_parent" ] && [ -n "$record_parent_identity" ] \\\n'
+                    "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
+                ),
                 '"$record_parent"',
                 "",
             ),
         }
         try:
-            creation_anchor, root_variable, indentation = anchors[creation_replacement_attack]
+            creation_anchor, root_variable, indentation = anchors[
+                creation_replacement_attack
+            ]
         except KeyError as error:
             raise ValueError("unknown creation replacement attack") from error
         assert publisher_source.count(creation_anchor) == 1
@@ -2361,23 +2367,31 @@ PY"""
     if rename_without_replacement_attack is not None:
         rename_anchors = {
             "launcher": (
-                '                [ -n "$launcher_root" ] && [ -n "$launcher_root_identity" ] \\\n'
-                "                    || blocked 'BLOCKED_INVALID_PUBLISH_CONTEXT'\n",
+                (
+                    '                [ -n "$launcher_root" ] && [ -n "$launcher_root_identity" ] \\\n'
+                    "                    || blocked 'BLOCKED_INVALID_PUBLISH_CONTEXT'\n"
+                ),
                 "$launcher_root",
             ),
             "environment": (
-                '        [ -n "$private_environment" ] && [ -n "$private_environment_identity" ] \\\n'
-                "            || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n",
+                (
+                    '        [ -n "$private_environment" ] && [ -n "$private_environment_identity" ] \\\n'
+                    "            || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
+                ),
                 "$private_environment",
             ),
             "record": (
-                '[ -n "$record_parent" ] && [ -n "$record_parent_identity" ] \\\n'
-                "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n",
+                (
+                    '[ -n "$record_parent" ] && [ -n "$record_parent_identity" ] \\\n'
+                    "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
+                ),
                 "$record_parent",
             ),
         }
         try:
-            rename_anchor, rename_variable = rename_anchors[rename_without_replacement_attack]
+            rename_anchor, rename_variable = rename_anchors[
+                rename_without_replacement_attack
+            ]
         except KeyError as error:
             raise ValueError("unknown rename attack") from error
         assert publisher_source.count(rename_anchor) == 1
@@ -2444,9 +2458,7 @@ PY"""
         matching_body = matching_body.replace(
             loop_anchor,
             (
-                loop_anchor
-                +
-                "        if candidate == probe.name:\n"
+                loop_anchor + "        if candidate == probe.name:\n"
                 "            os.rmdir(candidate, dir_fd=parent_fd)\n"
             ),
             1,
@@ -2750,16 +2762,18 @@ PY"""
     listener.listen(1)
     try:
         command = [
-                str(publisher),
-                str(approved_record.resolve(strict=True)),
-                image_tag,
-                image_id,
-                platform,
-                git_sha,
-                approved_record_sha256,
-            ]
+            str(publisher),
+            str(approved_record.resolve(strict=True)),
+            image_tag,
+            image_id,
+            platform,
+            git_sha,
+            approved_record_sha256,
+        ]
         if publisher_runner is not None:
-            return publisher_runner(command, publisher.parents[4], environment, docker_state)
+            return publisher_runner(
+                command, publisher.parents[4], environment, docker_state
+            )
         return subprocess.run(
             command,
             check=False,
@@ -2866,8 +2880,10 @@ def test_publish_reviewed_image_preserves_replaced_owned_cleanup_roots(
         assert completed.stdout == ""
         assert completed.stderr == ""
         assert all(
-            root.is_dir() and not root.is_symlink()
-            and (root / "replacement-marker").read_text(encoding="ascii") == "replacement\n"
+            root.is_dir()
+            and not root.is_symlink()
+            and (root / "replacement-marker").read_text(encoding="ascii")
+            == "replacement\n"
             for root in roots
         )
     finally:
@@ -2911,7 +2927,9 @@ def test_publish_reviewed_image_binds_private_root_identity_at_creation(
     try:
         assert completed.returncode == 2
         assert completed.stdout == ""
-        assert (root / "replacement-marker").read_text(encoding="ascii") == "replacement\n"
+        assert (root / "replacement-marker").read_text(
+            encoding="ascii"
+        ) == "replacement\n"
         assert not displaced.exists()
     finally:
         for cleanup_root in (root, displaced):
@@ -2958,8 +2976,13 @@ def test_publish_reviewed_image_preserves_replaced_cleanup_child(
         ]
         assert len(preserved) == 1
     finally:
-        assert root.is_absolute() and root.parent in {Path("/tmp"), Path("/private/tmp")}
-        assert root.name.startswith(("travel-map-publish.", "travel-map-publish-launcher."))
+        assert root.is_absolute() and root.parent in {
+            Path("/tmp"),
+            Path("/private/tmp"),
+        }
+        assert root.name.startswith(
+            ("travel-map-publish.", "travel-map-publish-launcher.")
+        )
         if root.exists():
             assert root.is_dir() and not root.is_symlink()
             shutil.rmtree(root)
@@ -3356,7 +3379,11 @@ def test_publish_reviewed_image_blocks_stale_canonical_lock_without_removing_it(
 
 def _assert_publish_not_mutated(tmp_path: Path) -> None:
     state_path = tmp_path / "docker-state.json"
-    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    state = (
+        json.loads(state_path.read_text(encoding="utf-8"))
+        if state_path.exists()
+        else {}
+    )
     assert state.get("tag_created", False) is False
     assert state.get("pushed", False) is False
 
@@ -3370,13 +3397,13 @@ def test_publish_reviewed_image_rejects_renamed_canonical_lock_leaf_after_valida
     def transform(source: str) -> str:
         anchor = (
             "validate_owned_private_directory \\\n"
-            "    \"$lock_directory\" \"$lock_directory_identity\" \"$lock_parent\" \"$git_sha\" \\\n"
+            '    "$lock_directory" "$lock_directory_identity" "$lock_parent" "$git_sha" \\\n'
             "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
         )
         assert source.count(anchor) == 1
         attack = (
-            "/bin/mv \"$lock_directory\" \"$lock_directory.renamed\"\n"
-            f"/usr/bin/printf '%s\\n' \"$lock_directory\" \"$lock_directory.renamed\" > {str(marker)!r}\n"
+            '/bin/mv "$lock_directory" "$lock_directory.renamed"\n'
+            f'/usr/bin/printf \'%s\\n\' "$lock_directory" "$lock_directory.renamed" > {str(marker)!r}\n'
         )
         return source.replace(anchor, anchor + attack, 1)
 
@@ -3418,15 +3445,15 @@ def test_publish_reviewed_image_rejects_replaced_canonical_lock_parent_after_val
     def transform(source: str) -> str:
         anchor = (
             "validate_owned_private_directory \\\n"
-            "    \"$lock_directory\" \"$lock_directory_identity\" \"$lock_parent\" \"$git_sha\" \\\n"
+            '    "$lock_directory" "$lock_directory_identity" "$lock_parent" "$git_sha" \\\n'
             "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
         )
         assert source.count(anchor) == 1
         attack = (
-            "/bin/mv \"$lock_parent\" \"$lock_parent.displaced\"\n"
-            "(umask 077 && /bin/mkdir \"$lock_parent\")\n"
-            "(umask 077 && /bin/mkdir \"$lock_parent/$git_sha\")\n"
-            f"/usr/bin/printf '%s\\n' \"$lock_parent\" \"$lock_parent.displaced\" > {str(marker)!r}\n"
+            '/bin/mv "$lock_parent" "$lock_parent.displaced"\n'
+            '(umask 077 && /bin/mkdir "$lock_parent")\n'
+            '(umask 077 && /bin/mkdir "$lock_parent/$git_sha")\n'
+            f'/usr/bin/printf \'%s\\n\' "$lock_parent" "$lock_parent.displaced" > {str(marker)!r}\n'
         )
         return source.replace(anchor, anchor + attack, 1)
 
@@ -3464,10 +3491,10 @@ def test_publish_reviewed_image_rejects_replaced_canonical_lock_parent_after_val
             shutil.rmtree(displaced)
 
 
-def test_publish_reviewed_image_binds_record_creation_to_first_opened_descriptor() -> None:
-    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
-        encoding="utf-8"
-    )
+def test_publish_reviewed_image_binds_record_creation_to_first_opened_descriptor() -> (
+    None
+):
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(encoding="utf-8")
     body = source.split("def create_broker_directory(", 1)[1].split(
         "\n\ndef create_broker_lock", 1
     )[0]
@@ -3479,10 +3506,10 @@ def test_publish_reviewed_image_binds_record_creation_to_first_opened_descriptor
     assert "created_expected = descriptor_identity(os.fstat(descriptor))" in body
 
 
-def test_publish_reviewed_image_publishes_preopened_random_lock_parent_no_replace() -> None:
-    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
-        encoding="utf-8"
-    )
+def test_publish_reviewed_image_publishes_preopened_random_lock_parent_no_replace() -> (
+    None
+):
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(encoding="utf-8")
     body = source.split("def create_broker_lock()", 1)[1].split(
         "\n\ndef descriptor_identity", 1
     )[0]
@@ -3520,10 +3547,7 @@ def test_publish_reviewed_image_reclaims_resources_when_broker_dies_at_each_phas
             "    )\n"
         )
         if broker_kill_phase == "arm":
-            arm_probe += (
-                "    os.kill(broker_pid, signal.SIGKILL)\n"
-                "    raise OSError\n"
-            )
+            arm_probe += "    os.kill(broker_pid, signal.SIGKILL)\n    raise OSError\n"
         source = source.replace(arm_anchor, arm_anchor + arm_probe, 1)
         if broker_kill_phase == "tag-armed":
             tag_anchor = (
@@ -3550,9 +3574,7 @@ def test_publish_reviewed_image_reclaims_resources_when_broker_dies_at_each_phas
                 1,
             )
         elif broker_kill_phase == "tag-created":
-            tag_anchor = (
-                '    run_docker tag "$image_id" "$tagged" || blocked \'BLOCKED_IMAGE_TAGGING\'\n'
-            )
+            tag_anchor = '    run_docker tag "$image_id" "$tagged" || blocked \'BLOCKED_IMAGE_TAGGING\'\n'
             assert source.count(tag_anchor) == 1
             kill_code = (
                 f"    /usr/bin/python3 -I -S - {str(marker)!r} <<'PY'\n"
@@ -3576,9 +3598,9 @@ def test_publish_reviewed_image_reclaims_resources_when_broker_dies_at_each_phas
         publisher_source_transform=transform,
     )
 
-    broker_pid_raw, record_raw, record_identity_raw, lock_raw, lock_identity_raw = marker.read_text(
-        encoding="ascii"
-    ).splitlines()
+    broker_pid_raw, record_raw, record_identity_raw, lock_raw, lock_identity_raw = (
+        marker.read_text(encoding="ascii").splitlines()
+    )
     broker_pid = int(broker_pid_raw)
     record_path = Path(record_raw)
     record_identity = tuple(int(part) for part in record_identity_raw.split(":"))
@@ -3597,9 +3619,7 @@ def test_publish_reviewed_image_reclaims_resources_when_broker_dies_at_each_phas
         )
         assert state.get("pushed", False) is False
         assert state.get("tagged", False) is False
-        assert state.get("tag_created", False) is (
-            broker_kill_phase == "tag-created"
-        )
+        assert state.get("tag_created", False) is (broker_kill_phase == "tag-created")
         assert not record_path.exists()
         assert not lock_path.exists()
         with pytest.raises(ProcessLookupError):
@@ -3674,9 +3694,7 @@ def test_publish_reviewed_image_reclaims_prearm_broker_resources(
     record_identity = tuple(int(part) for part in fields[1].split(":"))
     lock_path = Path(fields[2]) if len(fields) == 4 else None
     lock_identity = (
-        tuple(int(part) for part in fields[3].split(":"))
-        if len(fields) == 4
-        else None
+        tuple(int(part) for part in fields[3].split(":")) if len(fields) == 4 else None
     )
 
     def identity_exists(parent: Path, expected: tuple[int, ...]) -> bool:
@@ -3846,11 +3864,12 @@ def test_publish_reviewed_image_quiesces_descendant_before_broker_fault_cleanup(
 
         if observation_fault == "observer-construction":
             observer_start = source.index("class BrokerExitObserver:")
-            observer_end = source.index("\n\ndef extend_broker_owned_tree", observer_start)
+            observer_end = source.index(
+                "\n\ndef extend_broker_owned_tree", observer_start
+            )
             observer_body = source[observer_start:observer_end]
             observer_anchor = (
-                "    def __init__(self, pid: int):\n"
-                "        self.pid = pid\n"
+                "    def __init__(self, pid: int):\n        self.pid = pid\n"
             )
             assert observer_body.count(observer_anchor) == 1
             observer_injection = (
@@ -3976,15 +3995,19 @@ def test_publish_reviewed_image_rejects_empty_broker_process_snapshot(
         assert source.count(table_anchor) == 2
         ps_override = (
             "real_subprocess_run = subprocess.run\n"
-                "def run_empty_ps_after_child(*args, **kwargs):\n"
-                "    command = args[0] if args else kwargs.get('args', [])\n"
-                f"    if command[:2] == ['/bin/ps', '-axo'] and Path({str(child_marker)!r}).is_file() and not Path({str(fault_disable_marker)!r}).is_file():\n"
-                f"        Path({str(observation_marker)!r}).touch()\n"
-                "        return subprocess.CompletedProcess(command, 0, b'', b'')\n"
+            "def run_empty_ps_after_child(*args, **kwargs):\n"
+            "    command = args[0] if args else kwargs.get('args', [])\n"
+            f"    if command[:2] == ['/bin/ps', '-axo'] and Path({str(child_marker)!r}).is_file() and not Path({str(fault_disable_marker)!r}).is_file():\n"
+            f"        Path({str(observation_marker)!r}).touch()\n"
+            "        return subprocess.CompletedProcess(command, 0, b'', b'')\n"
             "    return real_subprocess_run(*args, **kwargs)\n"
             "subprocess.run = run_empty_ps_after_child\n\n"
         )
-        source = source[: source.rfind(table_anchor)] + ps_override + source[source.rfind(table_anchor) :]
+        source = (
+            source[: source.rfind(table_anchor)]
+            + ps_override
+            + source[source.rfind(table_anchor) :]
+        )
 
         cleanup_start = source.index("def cleanup_broker_directory(")
         cleanup_end = source.index("\n\ndef cleanup_broker_lock", cleanup_start)
@@ -4005,9 +4028,11 @@ def test_publish_reviewed_image_rejects_empty_broker_process_snapshot(
             f"        Path({str(cleanup_probe)!r}).write_text(child_state + '\\n', encoding='ascii')\n"
             "    if path.parent != parent or not path.name.startswith(prefix):\n"
         )
-        return source[:cleanup_start] + cleanup_body.replace(
-            cleanup_anchor, cleanup_probe_code, 1
-        ) + source[cleanup_end:]
+        return (
+            source[:cleanup_start]
+            + cleanup_body.replace(cleanup_anchor, cleanup_probe_code, 1)
+            + source[cleanup_end:]
+        )
 
     def process_identity(pid: int) -> tuple[int, int, int, str]:
         completed = subprocess.run(
@@ -4020,7 +4045,12 @@ def test_publish_reviewed_image_rejects_empty_broker_process_snapshot(
         for line in completed.stdout.splitlines():
             fields = line.split()
             if len(fields) == 8 and fields[0].isdigit() and int(fields[0]) == pid:
-                return (int(fields[0]), int(fields[1]), int(fields[2]), " ".join(fields[3:]))
+                return (
+                    int(fields[0]),
+                    int(fields[1]),
+                    int(fields[2]),
+                    " ".join(fields[3:]),
+                )
         raise AssertionError(f"process identity disappeared for pid {pid}")
 
     def process_identity_alive(identity: tuple[int, int, int, str]) -> bool:
@@ -4110,8 +4140,7 @@ def test_publish_reviewed_image_rejects_empty_broker_process_snapshot(
                 time.sleep(0.02)
             boundary.update(
                 root_alive=(
-                    process.poll() is None
-                    and process_identity_alive(root_identity)
+                    process.poll() is None and process_identity_alive(root_identity)
                 ),
                 child_alive=process_identity_alive(child_identity),
                 record_alive=resource_identity_alive(record_path, record_identity),
@@ -4126,11 +4155,12 @@ def test_publish_reviewed_image_rejects_empty_broker_process_snapshot(
                     pass
             fault_disable_marker.touch()
             stdout, stderr = process.communicate(timeout=30)
-            boundary["production_cleanup_completed"] = (
-                not resource_identity_alive(record_path, record_identity)
-                and not resource_identity_alive(lock_path, lock_identity)
+            boundary["production_cleanup_completed"] = not resource_identity_alive(
+                record_path, record_identity
+            ) and not resource_identity_alive(lock_path, lock_identity)
+            return subprocess.CompletedProcess(
+                command, process.returncode, stdout, stderr
             )
-            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         finally:
             if child_identity is not None and child_pid is not None:
                 try:

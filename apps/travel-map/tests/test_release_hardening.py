@@ -318,9 +318,9 @@ def _cleanup_recorded_root(marker: Path, prefix: str) -> Path:
     root = _read_recorded_root(marker, prefix)
     if not root.exists() and not root.is_symlink():
         return root
-    identity_raw = marker.with_name(marker.name + ".identity").read_text(
-        encoding="ascii"
-    ).strip()
+    identity_raw = (
+        marker.with_name(marker.name + ".identity").read_text(encoding="ascii").strip()
+    )
     identity_fields = identity_raw.split(":")
     assert len(identity_fields) == 2 and all(
         field.isascii() and field.isdecimal() for field in identity_fields
@@ -338,9 +338,8 @@ def _cleanup_exact_owned_root(
 ) -> None:
     assert root.is_absolute()
     tmp_roots = {Path("/tmp"), Path("/private/tmp")}
-    nested_quarantine = (
-        root.parent.parent in tmp_roots
-        and root.parent.name.startswith(".travel-map-cleanup.")
+    nested_quarantine = root.parent.parent in tmp_roots and root.parent.name.startswith(
+        ".travel-map-cleanup."
     )
     assert root.parent in tmp_roots or nested_quarantine
     assert root.name.startswith(prefix)
@@ -462,20 +461,29 @@ class ProcessIdentity:
     pgid: int
     lstart: str
 
+
 @dataclass(frozen=True)
 class OwnedProcessTree:
     root: ProcessIdentity | None
     descendants: tuple[ProcessIdentity, ...]
     diagnostic: str
 
+
 def _read_process_table() -> dict[int, ProcessIdentity]:
-    completed = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,pgid=,lstart=,command="], check=True, capture_output=True, text=True)
+    completed = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,ppid=,pgid=,lstart=,command="],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     table = {}
     for line in completed.stdout.splitlines():
         fields = line.strip().split(None, 8)
         if len(fields) == 9:
-            try: pid, ppid, pgid = map(int, fields[:3])
-            except ValueError: continue
+            try:
+                pid, ppid, pgid = map(int, fields[:3])
+            except ValueError:
+                continue
             table[pid] = ProcessIdentity(pid, ppid, pgid, " ".join(fields[3:8]))
     return table
 
@@ -3281,9 +3289,7 @@ exit 2"""
         publisher_source = _replace_once(
             publisher_source,
             '        "TRAVEL_MAP_PUBLISH_LAUNCHER_SHA256": expected_hash,\n',
-            (
-                '        "TRAVEL_MAP_PUBLISH_LAUNCHER_SHA256": "0" * 64,\n'
-            ),
+            ('        "TRAVEL_MAP_PUBLISH_LAUNCHER_SHA256": "0" * 64,\n'),
         )
     if malformed_launcher_identity_probe is not None:
         publisher_source = _replace_once(
@@ -3308,7 +3314,7 @@ exit 2"""
             "                launcher_capture_path=${launcher_capture% *}\n",
             (
                 "                launcher_capture_path=${launcher_capture% *}\n"
-                f"                /usr/bin/python3 -I -S {str(fd_attack_script)!r} launcher-output \"$launcher_capture_path\" {str(ready)!r} {str(release)!r} {str(attacked)!r} &\n"
+                f'                /usr/bin/python3 -I -S {str(fd_attack_script)!r} launcher-output "$launcher_capture_path" {str(ready)!r} {str(release)!r} {str(attacked)!r} &\n'
                 "                launcher_output_attacker_pid=$!\n"
                 f"                while [ ! -s {str(ready)!r} ]; do /bin/sleep 0.01; done\n"
             ),
@@ -3316,14 +3322,14 @@ exit 2"""
         publisher_source = _replace_once(
             publisher_source,
             '                wait "$supervisor_pid" || launcher_status=$?\n'
-            '                supervisor_pid=\n'
-            '                launcher_cleanup_handoff_complete=0\n',
+            "                supervisor_pid=\n"
+            "                launcher_cleanup_handoff_complete=0\n",
             (
                 '                wait "$supervisor_pid" || launcher_status=$?\n'
                 f"                /usr/bin/touch {str(release)!r}\n"
                 f"                while [ ! -s {str(attacked)!r} ]; do /bin/sleep 0.01; done\n"
-                '                supervisor_pid=\n'
-                '                launcher_cleanup_handoff_complete=0\n'
+                "                supervisor_pid=\n"
+                "                launcher_cleanup_handoff_complete=0\n"
             ),
         )
     if supervisor_output_fd_attack is not None:
@@ -3336,7 +3342,7 @@ exit 2"""
             (
                 '        exec 9<> "$supervisor_output" \\\n'
                 "            || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
-                f"        /usr/bin/python3 -I -S {str(fd_attack_script)!r} supervisor-output \"$supervisor_output\" {str(ready)!r} {str(release)!r} {str(attacked)!r} &\n"
+                f'        /usr/bin/python3 -I -S {str(fd_attack_script)!r} supervisor-output "$supervisor_output" {str(ready)!r} {str(release)!r} {str(attacked)!r} &\n'
                 "        supervisor_output_attacker_pid=$!\n"
                 f"        while [ ! -s {str(ready)!r} ]; do /bin/sleep 0.01; done\n"
             ),
@@ -3344,12 +3350,12 @@ exit 2"""
         publisher_source = _replace_once(
             publisher_source,
             '        wait "$supervisor_pid" || supervisor_status=$?\n'
-            '        supervisor_pid=\n',
+            "        supervisor_pid=\n",
             (
                 '        wait "$supervisor_pid" || supervisor_status=$?\n'
                 f"        /usr/bin/touch {str(release)!r}\n"
                 f"        while [ ! -s {str(attacked)!r} ]; do /bin/sleep 0.01; done\n"
-                '        supervisor_pid=\n'
+                "        supervisor_pid=\n"
             ),
         )
     if launcher_handoff_fd_attack is not None:
@@ -3360,7 +3366,7 @@ exit 2"""
             "                launcher_handoff_path=${launcher_handoff% *}\n",
             (
                 "                launcher_handoff_path=${launcher_handoff% *}\n"
-                f"                /usr/bin/python3 -I -S {str(fd_attack_script)!r} handoff \"$launcher_handoff_path\" {str(ready)!r} {str(target)!r} {str(attacked)!r} &\n"
+                f'                /usr/bin/python3 -I -S {str(fd_attack_script)!r} handoff "$launcher_handoff_path" {str(ready)!r} {str(target)!r} {str(attacked)!r} &\n'
                 "                launcher_handoff_attacker_pid=$!\n"
                 f"                while [ ! -s {str(ready)!r} ]; do /bin/sleep 0.01; done\n"
             ),
@@ -3368,14 +3374,14 @@ exit 2"""
         publisher_source = _replace_once(
             publisher_source,
             '                run_verified_initial_launcher "$@" >&8 &\n'
-            '                supervisor_pid=$!\n'
-            '                launcher_status=0\n',
+            "                supervisor_pid=$!\n"
+            "                launcher_status=0\n",
             (
                 '                run_verified_initial_launcher "$@" >&8 &\n'
-                '                supervisor_pid=$!\n'
+                "                supervisor_pid=$!\n"
                 f"                /usr/bin/printf '%s\\n' \"$supervisor_pid\" > {str(target)!r}\n"
                 f"                while [ ! -s {str(attacked)!r} ]; do /bin/sleep 0.01; done\n"
-                '                launcher_status=0\n'
+                "                launcher_status=0\n"
             ),
         )
     if launcher_exec_handoff is not None:
@@ -3407,7 +3413,7 @@ exit 2"""
             "private_root = Path(private_root_raw)\n",
             (
                 "private_root = Path(private_root_raw)\n"
-                f"Path({str(cleanup_root_marker)!r}).write_text(str(private_root), encoding=\"ascii\")\n"
+                f'Path({str(cleanup_root_marker)!r}).write_text(str(private_root), encoding="ascii")\n'
                 "private_root_details = private_root.lstat()\n"
                 f"Path({str(cleanup_root_marker.with_name(cleanup_root_marker.name + '.identity'))!r}).write_text(f'{{private_root_details.st_dev}}:{{private_root_details.st_ino}}\\n', encoding=\"ascii\")\n"
             ),
@@ -3428,8 +3434,7 @@ exit 2"""
             "trap cleanup_publish EXIT\ntrap interrupted_cleanup HUP INT TERM\n",
             (
                 "trap cleanup_publish EXIT\n"
-                "trap interrupted_cleanup HUP INT TERM\n"
-                + before_stage_b_body
+                "trap interrupted_cleanup HUP INT TERM\n" + before_stage_b_body
             ),
         )
     if signal_boundary is not None:
@@ -3484,7 +3489,7 @@ exit 2"""
         elif boundary == "redirection":
             publisher_source = _replace_once(
                 publisher_source,
-                'PY\n        supervisor_pid=$!\n',
+                "PY\n        supervisor_pid=$!\n",
                 (
                     "PY\n"
                     f"/usr/bin/printf '%s\\n' \"$private_environment\" > {str(private_marker)!r}\n"
@@ -3501,19 +3506,19 @@ exit 2"""
         attack, sentinel = supervisor_output_attack
         if attack == "symlink":
             replacement = (
-                f"/bin/rm -f \"$supervisor_output\"\n"
-                f"/bin/ln -s {str(sentinel)!r} \"$supervisor_output\"\n"
+                f'/bin/rm -f "$supervisor_output"\n'
+                f'/bin/ln -s {str(sentinel)!r} "$supervisor_output"\n'
             )
         elif attack == "hardlink":
             replacement = (
-                f"/bin/rm -f \"$supervisor_output\"\n"
-                f"/bin/ln {str(sentinel)!r} \"$supervisor_output\"\n"
+                f'/bin/rm -f "$supervisor_output"\n'
+                f'/bin/ln {str(sentinel)!r} "$supervisor_output"\n'
             )
         elif attack == "regular":
             replacement = (
-                f"/bin/rm -f \"$supervisor_output\"\n"
+                '/bin/rm -f "$supervisor_output"\n'
                 "/usr/bin/printf '%s' replacement > \"$supervisor_output\"\n"
-                "/bin/chmod 0600 \"$supervisor_output\"\n"
+                '/bin/chmod 0600 "$supervisor_output"\n'
             )
         else:
             raise ValueError("unknown supervisor output attack")
@@ -3543,7 +3548,8 @@ exit 2"""
             publisher_source = _replace_once(
                 publisher_source,
                 "        if os.write(output_descriptor, output) != len(output):\n",
-                attack + "        if os.write(output_descriptor, output) != len(output):\n",
+                attack
+                + "        if os.write(output_descriptor, output) != len(output):\n",
             )
         elif phase == "after-write":
             publisher_source = _replace_once(
@@ -3584,7 +3590,10 @@ exit 2"""
             )
     if repeated_signal_window is not None:
         repeat_ready, repeat_pause = repeated_signal_window
-        if cleanup_pause is not None and "        private_clean = (\n" in publisher_source:
+        if (
+            cleanup_pause is not None
+            and "        private_clean = (\n" in publisher_source
+        ):
             cleanup_pause_path, _cleanup_entered = cleanup_pause
             publisher_source = _replace_once(
                 publisher_source,
@@ -3716,7 +3725,7 @@ exit 2"""
                 "            os.mkdir(name, 0o700, dir_fd=directory_fd)\n"
             )
         else:
-            raise ValueError('unknown cleanup final stat race')
+            raise ValueError("unknown cleanup final stat race")
         assert publisher_source.count(anchor) == 1
         publisher_source = publisher_source.replace(
             anchor,
@@ -3741,9 +3750,7 @@ exit 2"""
             "        details = os.stat(name, dir_fd=quarantine_fd, follow_symlinks=False)\n"
         )
         assert publisher_source.count(moved_anchor) >= 1
-        publisher_source = publisher_source.replace(
-            moved_anchor, moved_injection, 1
-        )
+        publisher_source = publisher_source.replace(moved_anchor, moved_injection, 1)
         restore_anchor = (
             "def restore_quarantined_entry(quarantine_fd, directory_fd, name):\n"
             "    try:\n"
@@ -3826,8 +3833,7 @@ exit 2"""
             anchor,
             anchor.replace(
                 "            break\n",
-                post_leader_exit_body + "\n"
-                "            break\n",
+                post_leader_exit_body + "\n            break\n",
             ),
             1,
         )
@@ -4002,7 +4008,10 @@ def test_publisher_forwards_direct_wrapper_signal(tmp_path: Path) -> None:
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             stdout, stderr = process.communicate(timeout=5)
         survived = private_root.exists()
@@ -4011,7 +4020,10 @@ def test_publisher_forwards_direct_wrapper_signal(tmp_path: Path) -> None:
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
         pause_path.unlink(missing_ok=True)
@@ -4067,7 +4079,9 @@ signal.pause()"""
         deadline = time.monotonic() + 30
         while not ready.exists() and process.poll() is None:
             if time.monotonic() >= deadline:
-                raise AssertionError("publisher supervisor did not reach signal boundary")
+                raise AssertionError(
+                    "publisher supervisor did not reach signal boundary"
+                )
             time.sleep(0.05)
         child_pid = int(child_marker.read_text(encoding="ascii"))
         process.send_signal(signal.SIGTERM)
@@ -4114,7 +4128,13 @@ def test_publisher_outer_signal_cleans_every_supervisor_boundary(
     repeat_pause.write_text("pause\n", encoding="ascii")
     publisher, docker_config, _pause, _, _, command = _publisher_signal_fixture(
         tmp_path,
-        signal_boundary=(boundary, ready, child_marker, private_marker, launcher_marker),
+        signal_boundary=(
+            boundary,
+            ready,
+            child_marker,
+            private_marker,
+            launcher_marker,
+        ),
         repeated_signal_window=(repeat_ready, repeat_pause),
     )
     process = subprocess.Popen(
@@ -4194,9 +4214,9 @@ def test_publisher_rejects_supervisor_output_path_replacement(
     tmp_path: Path,
     attack: str,
 ) -> None:
-    publisher_source = (
-        ROOT / "deploy/nas/publish-reviewed-image.sh"
-    ).read_text(encoding="utf-8")
+    publisher_source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
     if "supervisor-output" not in publisher_source:
         assert "stdout=subprocess.PIPE" in publisher_source
         assert "if os.write(1, captured) != len(captured):" in publisher_source
@@ -4241,9 +4261,9 @@ def test_publisher_never_leaks_digest_to_late_output_hardlink(
     tmp_path: Path,
     phase: str,
 ) -> None:
-    publisher_source = (
-        ROOT / "deploy/nas/publish-reviewed-image.sh"
-    ).read_text(encoding="utf-8")
+    publisher_source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
     if "supervisor_output" not in publisher_source:
         assert "stdout=subprocess.PIPE" in publisher_source
         assert "if os.write(1, captured) != len(captured):" in publisher_source
@@ -4259,9 +4279,7 @@ def test_publisher_never_leaks_digest_to_late_output_hardlink(
     sentinel.chmod(0o640)
     before = sentinel.stat()
     expected_digest = (
-        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
-        + "a" * 64
-        + "\n"
+        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64 + "\n"
     )
     publisher, docker_config, _, _, _, command = _publisher_signal_fixture(
         tmp_path,
@@ -4327,9 +4345,7 @@ def test_publisher_final_publication_is_atomic_after_signal_window(
     pause = tmp_path / "publisher-final-publication.pause"
     pause.write_text("pause\n", encoding="ascii")
     expected_digest = (
-        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
-        + "a" * 64
-        + "\n"
+        "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64 + "\n"
     )
     publisher, docker_config, _, _, _, command = _publisher_signal_fixture(
         tmp_path,
@@ -4468,9 +4484,7 @@ def test_publisher_withholds_digest_during_cleanup_signal_window(
             if time.monotonic() >= deadline:
                 raise AssertionError("publisher root marker was not recorded")
             time.sleep(0.01)
-        private_root = _read_recorded_root(
-            root_path, "travel-map-publish-environment."
-        )
+        private_root = _read_recorded_root(root_path, "travel-map-publish-environment.")
         process.send_signal(termination_signal)
         pause_path.unlink()
         stdout, stderr = process.communicate(timeout=10)
@@ -4506,17 +4520,19 @@ def test_publisher_rejects_repeated_signal_during_outer_cleanup(
     repeat_ready = tmp_path / "publisher-repeated-signal.ready"
     repeat_pause = tmp_path / "publisher-repeated-signal.pause"
     repeat_pause.write_text("pause\n", encoding="ascii")
-    publisher, docker_config, pause_path, _, _git_sha, command = _publisher_signal_fixture(
-        tmp_path,
-        inner_body=(
-            "printf '%s\\n' "
-            "'ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
-            + "a" * 64
-            + "'\nexit 0"
-        ),
-        cleanup_pause=(cleanup_pause, entered_path),
-        cleanup_root_marker=root_path,
-        repeated_signal_window=(repeat_ready, repeat_pause),
+    publisher, docker_config, pause_path, _, _git_sha, command = (
+        _publisher_signal_fixture(
+            tmp_path,
+            inner_body=(
+                "printf '%s\\n' "
+                "'ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
+                + "a" * 64
+                + "'\nexit 0"
+            ),
+            cleanup_pause=(cleanup_pause, entered_path),
+            cleanup_root_marker=root_path,
+            repeated_signal_window=(repeat_ready, repeat_pause),
+        )
     )
     pause_path = cleanup_pause
     pause_path.write_text("pause\n", encoding="ascii")
@@ -4545,9 +4561,7 @@ def test_publisher_rejects_repeated_signal_during_outer_cleanup(
             if time.monotonic() >= deadline:
                 raise AssertionError("publisher did not record private root")
             time.sleep(0.05)
-        private_root = _read_recorded_root(
-            root_path, "travel-map-publish-environment."
-        )
+        private_root = _read_recorded_root(root_path, "travel-map-publish-environment.")
         process.send_signal(signal.SIGTERM)
         deadline = time.monotonic() + 10
         while not repeat_ready.exists():
@@ -4627,9 +4641,7 @@ def test_release_tool_resolver_allows_only_sticky_shared_ancestors(
     expected_returncode: int,
 ) -> None:
     source = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
-    function = source.split("resolve_release_tool() {\n", 1)[1].split(
-        "\n}\n", 1
-    )[0]
+    function = source.split("resolve_release_tool() {\n", 1)[1].split("\n}\n", 1)[0]
     resolver = function.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
     if stat.S_ISVTX & shared_mode:
         shared_root = _short_system_tmp_root()
@@ -5279,7 +5291,10 @@ while True:
             except subprocess.TimeoutExpired:
                 pass
             _kill_publisher_process_groups(process_groups)
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
 
@@ -7051,7 +7066,11 @@ def test_publisher_rejects_unverified_launcher_fd8_digest_spoof(
     process = subprocess.Popen(
         command,
         cwd=publisher.parents[4],
-        env={"DOCKER_CONFIG": str(docker_config), "HOME": str(tmp_path / "ambient-home"), "PATH": "/nonexistent"},
+        env={
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(tmp_path / "ambient-home"),
+            "PATH": "/nonexistent",
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -7061,23 +7080,30 @@ def test_publisher_rejects_unverified_launcher_fd8_digest_spoof(
     launcher_root_survived = False
     try:
         deadline = time.monotonic() + 30
-        while not launcher_ready.is_file() or not launcher_ready.read_text(encoding="ascii").strip():
+        while (
+            not launcher_ready.is_file()
+            or not launcher_ready.read_text(encoding="ascii").strip()
+        ):
             if process.poll() is not None:
                 raise AssertionError("first launcher wrapper exited before ready")
             if time.monotonic() >= deadline:
                 raise AssertionError("first launcher wrapper did not reach ready")
             time.sleep(0.05)
-        launcher_root = _read_recorded_root(launcher_ready, "travel-map-publish-launcher.")
+        launcher_root = _read_recorded_root(
+            launcher_ready, "travel-map-publish-launcher."
+        )
         launcher_script = launcher_root / "publish-reviewed-image.sh"
         original = launcher_script.stat()
-        fake_digest = "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "f" * 64
+        fake_digest = (
+            "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "f" * 64
+        )
         launcher_script.chmod(0o700)
         launcher_script.write_text(
             "#!/bin/sh\n"
-            "root=$(/usr/bin/dirname \"$0\")\n"
-            "/bin/rm -f \"$0\"\n"
+            'root=$(/usr/bin/dirname "$0")\n'
+            '/bin/rm -f "$0"\n'
             f"/usr/bin/printf '%s\\n' {fake_digest!r} >&8\n"
-            "/bin/rmdir \"$root\"\n"
+            '/bin/rmdir "$root"\n'
             "exit 0\n",
             encoding="ascii",
         )
@@ -7114,7 +7140,11 @@ def test_publisher_rejects_prearm_status79_without_dropping_cleanup_owner(
     process = subprocess.Popen(
         command,
         cwd=publisher.parents[4],
-        env={"DOCKER_CONFIG": str(docker_config), "HOME": str(tmp_path / "ambient-home"), "PATH": "/nonexistent"},
+        env={
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(tmp_path / "ambient-home"),
+            "PATH": "/nonexistent",
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -7124,13 +7154,18 @@ def test_publisher_rejects_prearm_status79_without_dropping_cleanup_owner(
     launcher_root_survived = False
     try:
         deadline = time.monotonic() + 30
-        while not launcher_ready.is_file() or not launcher_ready.read_text(encoding="ascii").strip():
+        while (
+            not launcher_ready.is_file()
+            or not launcher_ready.read_text(encoding="ascii").strip()
+        ):
             if process.poll() is not None:
                 raise AssertionError("first launcher wrapper exited before ready")
             if time.monotonic() >= deadline:
                 raise AssertionError("first launcher wrapper did not reach ready")
             time.sleep(0.05)
-        launcher_root = _read_recorded_root(launcher_ready, "travel-map-publish-launcher.")
+        launcher_root = _read_recorded_root(
+            launcher_ready, "travel-map-publish-launcher."
+        )
         launcher_script = launcher_root / "publish-reviewed-image.sh"
         launcher_script.chmod(0o700)
         launcher_script.write_text("#!/bin/sh\nexit 79\n", encoding="ascii")
@@ -7155,9 +7190,9 @@ def test_publisher_rejects_prearm_status79_without_dropping_cleanup_owner(
 
 def _run_retained_output_fd_attack(tmp_path: Path, *, supervisor_output: bool) -> None:
     label = "supervisor-output" if supervisor_output else "launcher-output"
-    publisher_source = (
-        ROOT / "deploy/nas/publish-reviewed-image.sh"
-    ).read_text(encoding="utf-8")
+    publisher_source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
     if label not in publisher_source:
         assert "stdout=subprocess.PIPE" in publisher_source
         assert "start_new_session=True" in publisher_source
@@ -7217,8 +7252,12 @@ def _run_retained_output_fd_attack(tmp_path: Path, *, supervisor_output: bool) -
         attacker_identity = _read_process_table()[attacker_pid]
         stdout, stderr = process.communicate(timeout=45)
         assert attacked.read_text(encoding="ascii").strip() == "attacked"
-        launcher_root = _read_recorded_root(launcher_marker, "travel-map-publish-launcher.")
-        private_root = _read_recorded_root(private_marker, "travel-map-publish-environment.")
+        launcher_root = _read_recorded_root(
+            launcher_marker, "travel-map-publish-launcher."
+        )
+        private_root = _read_recorded_root(
+            private_marker, "travel-map-publish-environment."
+        )
         assert process.returncode == 2
         assert stdout == ""
         assert "Traceback" not in stderr
@@ -7231,15 +7270,26 @@ def _run_retained_output_fd_attack(tmp_path: Path, *, supervisor_output: bool) -
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
-        if attacker_identity is not None:
-            if _read_process_table().get(attacker_identity.pid) == attacker_identity:
-                os.kill(attacker_identity.pid, signal.SIGKILL)
-        if launcher_marker.is_file() and launcher_marker.read_text(encoding="ascii").strip():
+        if (
+            attacker_identity is not None
+            and _read_process_table().get(attacker_identity.pid) == attacker_identity
+        ):
+            os.kill(attacker_identity.pid, signal.SIGKILL)
+        if (
+            launcher_marker.is_file()
+            and launcher_marker.read_text(encoding="ascii").strip()
+        ):
             _cleanup_recorded_root(launcher_marker, "travel-map-publish-launcher.")
-        if private_marker.is_file() and private_marker.read_text(encoding="ascii").strip():
+        if (
+            private_marker.is_file()
+            and private_marker.read_text(encoding="ascii").strip()
+        ):
             _cleanup_recorded_root(private_marker, "travel-map-publish-environment.")
 
 
@@ -7258,14 +7308,17 @@ def test_publisher_rejects_retained_supervisor_output_writer_after_unlink(
 def test_publisher_reclaims_launcher_root_after_forged_handoff_completion(
     tmp_path: Path,
 ) -> None:
-    publisher_source = (
-        ROOT / "deploy/nas/publish-reviewed-image.sh"
-    ).read_text(encoding="utf-8")
+    publisher_source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
     if "launcher-handoff" not in publisher_source:
         assert "stdout=subprocess.PIPE" in publisher_source
         assert "cleanup_owned_root(" in publisher_source
         assert "launcher_clean = cleanup_owned_root(" in publisher_source
-        assert "pending_at_publication = bool(signal.sigpending() & handled_signals)" in publisher_source
+        assert (
+            "pending_at_publication = bool(signal.sigpending() & handled_signals)"
+            in publisher_source
+        )
         assert "or not cleanup_ok" in publisher_source
         return
     ready = tmp_path / "launcher-handoff.attacker.ready"
@@ -7275,7 +7328,12 @@ def test_publisher_reclaims_launcher_root_after_forged_handoff_completion(
     publisher, docker_config, _, _, _, command = _publisher_signal_fixture(
         tmp_path,
         launcher_root_marker=launcher_marker,
-        launcher_handoff_fd_attack=(ready, target, attacked, tmp_path / "unused.release"),
+        launcher_handoff_fd_attack=(
+            ready,
+            target,
+            attacked,
+            tmp_path / "unused.release",
+        ),
     )
     process = subprocess.Popen(
         command,
@@ -7302,10 +7360,14 @@ def test_publisher_reclaims_launcher_root_after_forged_handoff_completion(
             if time.monotonic() >= deadline:
                 raise AssertionError("handoff attacker did not open carrier")
             time.sleep(0.05)
-        attacker_identity = _read_process_table()[int(ready.read_text(encoding="ascii"))]
+        attacker_identity = _read_process_table()[
+            int(ready.read_text(encoding="ascii"))
+        ]
         stdout, stderr = process.communicate(timeout=45)
         assert attacked.read_text(encoding="ascii").strip() == "attacked"
-        launcher_root = _read_recorded_root(launcher_marker, "travel-map-publish-launcher.")
+        launcher_root = _read_recorded_root(
+            launcher_marker, "travel-map-publish-launcher."
+        )
         assert process.returncode == 2
         assert stdout == ""
         assert "Traceback" not in stderr
@@ -7315,13 +7377,21 @@ def test_publisher_reclaims_launcher_root_after_forged_handoff_completion(
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
-        if attacker_identity is not None:
-            if _read_process_table().get(attacker_identity.pid) == attacker_identity:
-                os.kill(attacker_identity.pid, signal.SIGKILL)
-        if launcher_marker.is_file() and launcher_marker.read_text(encoding="ascii").strip():
+        if (
+            attacker_identity is not None
+            and _read_process_table().get(attacker_identity.pid) == attacker_identity
+        ):
+            os.kill(attacker_identity.pid, signal.SIGKILL)
+        if (
+            launcher_marker.is_file()
+            and launcher_marker.read_text(encoding="ascii").strip()
+        ):
             _cleanup_recorded_root(launcher_marker, "travel-map-publish-launcher.")
 
 
@@ -7360,7 +7430,9 @@ def test_publisher_waits_for_nested_noncooperative_stage_b_descendant_reap(
     stdout = stderr = ""
     try:
         deadline = time.monotonic() + 60
-        while not ready.is_file() or ready.read_text(encoding="ascii").strip() != "ready":
+        while (
+            not ready.is_file() or ready.read_text(encoding="ascii").strip() != "ready"
+        ):
             if process.poll() is not None:
                 raise AssertionError("nested-timeout fixture exited before ready")
             if time.monotonic() >= deadline:
@@ -7376,7 +7448,9 @@ def test_publisher_waits_for_nested_noncooperative_stage_b_descendant_reap(
         assert process.returncode == 2
         assert stdout == ""
         assert "Traceback" not in stderr
-        assert signal_elapsed >= 4.5, f"nested cleanup returned after {signal_elapsed:.3f}s"
+        assert signal_elapsed >= 4.5, (
+            f"nested cleanup returned after {signal_elapsed:.3f}s"
+        )
         assert not child_survived
     finally:
         child_release.touch()
@@ -7390,7 +7464,10 @@ def test_publisher_waits_for_nested_noncooperative_stage_b_descendant_reap(
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
         for marker, prefix in (
@@ -7414,13 +7491,19 @@ def test_publisher_reaps_private_group_when_exit_observer_construction_fails(
     completed = subprocess.run(
         command,
         cwd=publisher.parents[4],
-        env={"DOCKER_CONFIG": str(docker_config), "HOME": str(tmp_path / "ambient-home"), "PATH": "/nonexistent"},
+        env={
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(tmp_path / "ambient-home"),
+            "PATH": "/nonexistent",
+        },
         check=False,
         capture_output=True,
         text=True,
         timeout=15,
     )
-    private_root_raw, group_raw = failure_marker.read_text(encoding="ascii").splitlines()
+    private_root_raw, group_raw = failure_marker.read_text(
+        encoding="ascii"
+    ).splitlines()
     private_root = Path(private_root_raw)
     group_id = int(group_raw)
     try:
@@ -7442,13 +7525,12 @@ def test_publisher_reaps_private_group_when_exit_observer_construction_fails(
         if private_root.exists():
             cleanup_marker = tmp_path / "top-exit-observer-failure.private-root"
             cleanup_marker.write_text(str(private_root), encoding="ascii")
-            _cleanup_recorded_root(
-                cleanup_marker, "travel-map-publish-environment."
-            )
-        if launcher_marker.is_file() and launcher_marker.read_text(encoding="ascii").strip():
-            _cleanup_recorded_root(
-                launcher_marker, "travel-map-publish-launcher."
-            )
+            _cleanup_recorded_root(cleanup_marker, "travel-map-publish-environment.")
+        if (
+            launcher_marker.is_file()
+            and launcher_marker.read_text(encoding="ascii").strip()
+        ):
+            _cleanup_recorded_root(launcher_marker, "travel-map-publish-launcher.")
 
 
 @pytest.mark.parametrize("snapshot_fault", ("empty", "nonzero", "malformed"))
@@ -7533,7 +7615,9 @@ def test_publisher_top_owner_retains_cleanup_during_combined_observer_failure(
                     "publisher exited before combined observer failure became active"
                 )
             if time.monotonic() >= deadline:
-                raise AssertionError("combined observer-failure fixture did not become ready")
+                raise AssertionError(
+                    "combined observer-failure fixture did not become ready"
+                )
             time.sleep(0.02)
         private_root = Path(
             observer_failure.read_text(encoding="ascii").splitlines()[0]
@@ -7556,8 +7640,7 @@ def test_publisher_top_owner_retains_cleanup_during_combined_observer_failure(
             time.sleep(0.02)
         owner_alive_before_release = owner_is_running(owner_identity)
         roots_alive_before_release = all(
-            path.exists()
-            and (path.stat().st_dev, path.stat().st_ino) == expected
+            path.exists() and (path.stat().st_dev, path.stat().st_ino) == expected
             for path, expected in roots
         )
         fault_disable.touch()
@@ -7607,7 +7690,7 @@ def test_publisher_reaps_detached_stage_b_child_after_supervisor_crash(
     after_spawn_body = (
         "    process.stdin.write(script_payload)\n"
         "    process.stdin.close()\n"
-            f"    deadline = time.monotonic() + 60\n"
+        f"    deadline = time.monotonic() + 60\n"
         f"    while not Path({str(child_marker)!r}).is_file() and time.monotonic() < deadline:\n"
         "        time.sleep(0.01)\n"
         f"    while not Path({str(crash_release)!r}).is_file() and time.monotonic() < deadline:\n"
@@ -7626,7 +7709,11 @@ def test_publisher_reaps_detached_stage_b_child_after_supervisor_crash(
     process = subprocess.Popen(
         command,
         cwd=publisher.parents[4],
-        env={"DOCKER_CONFIG": str(docker_config), "HOME": str(tmp_path / "ambient-home"), "PATH": "/nonexistent"},
+        env={
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(tmp_path / "ambient-home"),
+            "PATH": "/nonexistent",
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -7638,7 +7725,10 @@ def test_publisher_reaps_detached_stage_b_child_after_supervisor_crash(
     stdout = stderr = ""
     try:
         deadline = time.monotonic() + 60
-        while not child_marker.is_file() or not child_marker.read_text(encoding="ascii").strip():
+        while (
+            not child_marker.is_file()
+            or not child_marker.read_text(encoding="ascii").strip()
+        ):
             if process.poll() is not None:
                 diagnostic_stdout, diagnostic_stderr = process.communicate(timeout=5)
                 raise AssertionError(
@@ -7673,7 +7763,10 @@ def test_publisher_reaps_detached_stage_b_child_after_supervisor_crash(
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
         for marker, prefix in (
@@ -7730,7 +7823,11 @@ exit 0"""
     process = subprocess.Popen(
         command,
         cwd=publisher.parents[4],
-        env={"DOCKER_CONFIG": str(docker_config), "HOME": str(tmp_path / "ambient-home"), "PATH": "/nonexistent"},
+        env={
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(tmp_path / "ambient-home"),
+            "PATH": "/nonexistent",
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -7742,11 +7839,18 @@ exit 0"""
     stdout = stderr = ""
     try:
         deadline = time.monotonic() + 60
-        while not child_marker.is_file() or not child_marker.read_text(encoding="ascii").strip():
+        while (
+            not child_marker.is_file()
+            or not child_marker.read_text(encoding="ascii").strip()
+        ):
             if process.poll() is not None:
-                raise AssertionError("same-group child exited before process-table boundary")
+                raise AssertionError(
+                    "same-group child exited before process-table boundary"
+                )
             if time.monotonic() >= deadline:
-                raise AssertionError("same-group child did not reach post-exit boundary")
+                raise AssertionError(
+                    "same-group child did not reach post-exit boundary"
+                )
             time.sleep(0.05)
         child_pid = int(child_marker.read_text(encoding="ascii").strip())
         child_identity = _read_process_table()[child_pid]
@@ -7757,7 +7861,10 @@ exit 0"""
         assert stdout == ""
         assert "Traceback" not in stderr
     finally:
-        if child_identity is not None and _read_process_table().get(child_identity.pid) == child_identity:
+        if (
+            child_identity is not None
+            and _read_process_table().get(child_identity.pid) == child_identity
+        ):
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(child_identity)
             )
@@ -7765,7 +7872,10 @@ exit 0"""
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
         for marker, prefix in (
@@ -7831,6 +7941,7 @@ exit 0"""
         + "                return real_run(*args, **kwargs)\n"
         "            subprocess.run = broken_run"
     )
+
     def transform(publisher_source: str) -> str:
         cleanup_anchor = "def cleanup_owned_root(path, expected, prefix):\n"
         assert publisher_source.count(cleanup_anchor) == 1
@@ -7846,16 +7957,19 @@ exit 0"""
             "            child_state = 'alive'\n"
             f"        Path({str(cleanup_probe)!r}).write_text(child_state + '\\n', encoding='ascii')\n"
         )
-        publisher_source = publisher_source.replace(cleanup_anchor, cleanup_probe_code, 1)
+        publisher_source = publisher_source.replace(
+            cleanup_anchor, cleanup_probe_code, 1
+        )
         stop_anchor = (
-            "    protected: tuple[tuple[int, int, int, str], ...],\n"
-            ") -> None:\n"
+            "    protected: tuple[tuple[int, int, int, str], ...],\n) -> None:\n"
         )
         assert publisher_source.count(stop_anchor) == 1
         publisher_source = publisher_source.replace(
             stop_anchor, stop_anchor + "    return\n", 1
         )
-        emergency_anchor = "def emergency_stop_publisher_group(group_id: int) -> bool:\n"
+        emergency_anchor = (
+            "def emergency_stop_publisher_group(group_id: int) -> bool:\n"
+        )
         assert publisher_source.count(emergency_anchor) == 1
         publisher_source = publisher_source.replace(
             emergency_anchor, emergency_anchor + "    return True\n", 1
@@ -7945,7 +8059,10 @@ exit 0"""
         for path, expected in root_identities:
             details = path.stat()
             assert (details.st_dev, details.st_ino) == expected
-        if child_identity is not None and _read_process_table().get(child_identity.pid) == child_identity:
+        if (
+            child_identity is not None
+            and _read_process_table().get(child_identity.pid) == child_identity
+        ):
             os.kill(child_identity.pid, signal.SIGKILL)
         fault_disable.touch()
         stdout, stderr = process.communicate(timeout=20)
@@ -7957,13 +8074,19 @@ exit 0"""
             assert not path.exists(), "production did not clean after recovery"
     finally:
         fault_disable.touch()
-        if child_identity is not None and _read_process_table().get(child_identity.pid) == child_identity:
+        if (
+            child_identity is not None
+            and _read_process_table().get(child_identity.pid) == child_identity
+        ):
             os.kill(child_identity.pid, signal.SIGKILL)
         if process.poll() is None:
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
         for marker, prefix in (
@@ -8048,8 +8171,7 @@ exit 0"""
         )
 
         stop_anchor = (
-            "    protected: tuple[tuple[int, int, int, str], ...],\n"
-            ") -> None:\n"
+            "    protected: tuple[tuple[int, int, int, str], ...],\n) -> None:\n"
         )
         assert source.count(stop_anchor) == 1
         source = source.replace(
@@ -8058,7 +8180,9 @@ exit 0"""
             1,
         )
 
-        emergency_anchor = "def emergency_stop_publisher_group(group_id: int) -> bool:\n"
+        emergency_anchor = (
+            "def emergency_stop_publisher_group(group_id: int) -> bool:\n"
+        )
         assert source.count(emergency_anchor) == 1
         source = source.replace(
             emergency_anchor,
@@ -8136,7 +8260,9 @@ exit 0"""
                     f"stdout={diagnostic_stdout!r} stderr={diagnostic_stderr!r}"
                 )
             if time.monotonic() >= deadline:
-                raise AssertionError("truncated top snapshot fixture did not become ready")
+                raise AssertionError(
+                    "truncated top snapshot fixture did not become ready"
+                )
             time.sleep(0.05)
 
         child_pid = int(child_marker.read_text(encoding="ascii").strip())
@@ -8153,7 +8279,9 @@ exit 0"""
 
         while not capture_ready.is_file():
             if process.poll() is not None:
-                raise AssertionError("publisher exited before top snapshot capture boundary")
+                raise AssertionError(
+                    "publisher exited before top snapshot capture boundary"
+                )
             if time.monotonic() >= deadline:
                 raise AssertionError("top snapshot did not pause for identity capture")
             time.sleep(0.05)
@@ -8181,7 +8309,9 @@ exit 0"""
         fault_enable.touch()
         while not snapshot_ready.is_file():
             if process.poll() is not None:
-                raise AssertionError("publisher exited before truncated top snapshot returned")
+                raise AssertionError(
+                    "publisher exited before truncated top snapshot returned"
+                )
             if time.monotonic() >= deadline:
                 raise AssertionError("truncated top snapshot did not return")
             time.sleep(0.05)
@@ -8220,8 +8350,7 @@ exit 0"""
             _read_process_table().get(child_identity.pid) == child_identity
         )
         roots_alive_before_release = all(
-            path.exists()
-            and (path.stat().st_dev, path.stat().st_ino) == expected
+            path.exists() and (path.stat().st_dev, path.stat().st_ino) == expected
             for path, expected in root_identities
         )
 
@@ -8241,17 +8370,14 @@ exit 0"""
         fault_disable.touch()
         snapshot_release.touch()
         stdout, stderr = process.communicate(timeout=45)
-        resources_removed_by_production_after_release = (
-            all(
-                not path.exists() and not path.is_symlink()
-                for path in (private_root, launcher_root)
-            )
-            and (
-                roots_alive_before_release
-                or (
-                    not child_alive_before_release
-                    and cleanup_state_before_release == "gone\n"
-                )
+        resources_removed_by_production_after_release = all(
+            not path.exists() and not path.is_symlink()
+            for path in (private_root, launcher_root)
+        ) and (
+            roots_alive_before_release
+            or (
+                not child_alive_before_release
+                and cleanup_state_before_release == "gone\n"
             )
         )
     finally:
@@ -8264,14 +8390,23 @@ exit 0"""
         if process.poll() is None:
             live_tree = _publisher_process_groups_for_fixture(process_identity)
             _kill_publisher_process_groups(live_tree)
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
         for path, expected in root_identities:
-            _cleanup_exact_owned_root(path, expected, "travel-map-publish-environment." if path == private_root else "travel-map-publish-launcher.")
+            _cleanup_exact_owned_root(
+                path,
+                expected,
+                "travel-map-publish-environment."
+                if path == private_root
+                else "travel-map-publish-launcher.",
+            )
         if process.poll() is not None:
             try:
                 stdout, stderr = process.communicate(timeout=2)
@@ -8382,14 +8517,17 @@ exit 0"""
         )
         source = source.replace(table_anchor, table_anchor + top_injection, 1)
         stop_anchor = (
-            "    protected: tuple[tuple[int, int, int, str], ...],\n"
-            ") -> None:\n"
+            "    protected: tuple[tuple[int, int, int, str], ...],\n) -> None:\n"
         )
         assert source.count(stop_anchor) == 1
         source = source.replace(stop_anchor, stop_anchor + "    return\n", 1)
-        emergency_anchor = "def emergency_stop_publisher_group(group_id: int) -> bool:\n"
+        emergency_anchor = (
+            "def emergency_stop_publisher_group(group_id: int) -> bool:\n"
+        )
         assert source.count(emergency_anchor) == 1
-        return source.replace(emergency_anchor, emergency_anchor + "    return True\n", 1)
+        return source.replace(
+            emergency_anchor, emergency_anchor + "    return True\n", 1
+        )
 
     publisher, docker_config, _, _, _, command = _publisher_signal_fixture(
         tmp_path,
@@ -8464,9 +8602,13 @@ exit 0"""
             time.sleep(0.05)
         while not generic_error.is_file():
             if process.poll() is not None:
-                raise AssertionError("publisher exited before generic top observation error")
+                raise AssertionError(
+                    "publisher exited before generic top observation error"
+                )
             if time.monotonic() >= deadline:
-                raise AssertionError("top owner-loss generic error did not become ready")
+                raise AssertionError(
+                    "top owner-loss generic error did not become ready"
+                )
             time.sleep(0.05)
         time.sleep(1.0)
         owner_alive_before_release = (
@@ -8476,8 +8618,7 @@ exit 0"""
             _read_process_table().get(child_identity.pid) == child_identity
         )
         roots_alive_before_release = all(
-            path.exists()
-            and (path.stat().st_dev, path.stat().st_ino) == expected
+            path.exists() and (path.stat().st_dev, path.stat().st_ino) == expected
             for path, expected in roots
         )
         signal_observed = unsafe_signal.is_file()
@@ -8497,7 +8638,10 @@ exit 0"""
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
         for path, expected in roots:
@@ -8531,9 +8675,7 @@ exit 0"""
 def test_publisher_signal_authority_rejects_ppid_only_identity_change(
     signal_kind: str,
 ) -> None:
-    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(encoding="utf-8")
     start = source.index("def broker_stable_identity(")
     end = source.index("\n\ndef broker_process(", start)
     nonzero_signals: list[tuple[int, int]] = []
@@ -8553,7 +8695,9 @@ def test_publisher_signal_authority_rejects_ppid_only_identity_change(
         "sys": sys,
         "time": time,
     }
-    exec(compile(source[start:end], "publish-reviewed-image.sh", "exec"), namespace)
+    exec(  # noqa: S102 - execute the extracted publisher helpers under test.
+        compile(source[start:end], "publish-reviewed-image.sh", "exec"), namespace
+    )
 
     expected = (41001, 40001, 41001, "Thu Sep  4 15:00:00 2026")
     ppid_changed = (expected[0], 40002, expected[2], expected[3])
@@ -8567,9 +8711,7 @@ def test_publisher_signal_authority_rejects_ppid_only_identity_change(
             observations
         )
         namespace["publisher_group_exists"] = lambda group: True
-        assert namespace["_emergency_stop_publisher_group"](
-            expected[0], expected
-        )
+        assert namespace["_emergency_stop_publisher_group"](expected[0], expected)
 
     assert nonzero_signals == []
 
@@ -8584,9 +8726,7 @@ def test_publisher_signal_authority_rejects_ppid_only_identity_change(
 def test_publisher_broker_tree_never_admits_reserved_protected_pid(
     current_protected: tuple[int, int, int, str],
 ) -> None:
-    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(encoding="utf-8")
     start = source.index("def broker_stable_identity(")
     end = source.index("\n\ndef stop_broker_shell(", start)
     signals: list[tuple[int, int]] = []
@@ -8617,12 +8757,8 @@ def test_publisher_broker_tree_never_admits_reserved_protected_pid(
     assert signals == [(shell[0], signal.SIGTERM)]
 
 
-def test_publisher_broker_tree_rejects_shell_pid_colliding_with_protected_pid() -> (
-    None
-):
-    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
-        encoding="utf-8"
-    )
+def test_publisher_broker_tree_rejects_shell_pid_colliding_with_protected_pid() -> None:
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(encoding="utf-8")
     start = source.index("def broker_stable_identity(")
     end = source.index("\n\ndef stop_broker_shell(", start)
     namespace = {
@@ -8795,9 +8931,7 @@ exec 8>&-
 def test_publisher_broker_tree_never_renews_invalidated_numeric_pid(
     signum: signal.Signals,
 ) -> None:
-    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(encoding="utf-8")
     start = source.index("def broker_stable_identity(")
     end = source.index("\n\ndef stop_broker_shell(", start)
     signals: list[tuple[int, int]] = []
@@ -8810,7 +8944,9 @@ def test_publisher_broker_tree_never_renews_invalidated_numeric_pid(
         "sys": sys,
         "time": time,
     }
-    exec(compile(source[start:end], "publish-reviewed-image.sh", "exec"), namespace)
+    exec(  # noqa: S102 - execute the extracted publisher helpers under test.
+        compile(source[start:end], "publish-reviewed-image.sh", "exec"), namespace
+    )
 
     shell = (42000, 41000, 42000, "Thu Sep  4 16:00:00 2026")
     captured = (42001, shell[0], shell[2], "Thu Sep  4 16:00:01 2026")
@@ -8835,9 +8971,7 @@ def test_publisher_broker_tree_never_renews_invalidated_numeric_pid(
 def test_publisher_broker_tree_never_renews_invalidated_shell_from_empty_capture(
     signum: signal.Signals,
 ) -> None:
-    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(encoding="utf-8")
     start = source.index("def broker_stable_identity(")
     end = source.index("\n\ndef stop_broker_shell(", start)
     signals: list[tuple[int, int]] = []
@@ -8850,7 +8984,9 @@ def test_publisher_broker_tree_never_renews_invalidated_shell_from_empty_capture
         "sys": sys,
         "time": time,
     }
-    exec(compile(source[start:end], "publish-reviewed-image.sh", "exec"), namespace)
+    exec(  # noqa: S102 - execute the extracted publisher helpers under test.
+        compile(source[start:end], "publish-reviewed-image.sh", "exec"), namespace
+    )
 
     shell = (43000, 42000, 43000, "Thu Sep  4 17:00:00 2026")
     replacement = (shell[0], 41999, shell[2], shell[3])
@@ -8932,8 +9068,7 @@ exit 2"""
         )
         assert source.count(arm_anchor) == 1
         resource_probe = (
-            arm_anchor
-            + f"    Path({str(resource_marker)!r}).write_text(\n"
+            arm_anchor + f"    Path({str(resource_marker)!r}).write_text(\n"
             "        f'{broker_record_root}\\n{broker_record_identity}\\n'\n"
             "        f'{broker_lock_path}\\n{broker_lock_identity}\\n{broker_pid}\\n',\n"
             "        encoding='ascii',\n"
@@ -8950,8 +9085,7 @@ exit 2"""
         assert source.count(stop_anchor) == 1
         if observation_fault != "broker-table-partial":
             stop_injection = (
-                stop_anchor
-                + "    raise OSError('injected broker snapshot boundary')\n"
+                stop_anchor + "    raise OSError('injected broker snapshot boundary')\n"
             )
             source = source.replace(stop_anchor, stop_injection, 1)
 
@@ -9004,9 +9138,7 @@ exit 2"""
             )
             assert source.count(table_anchor) == 2
             if observation_fault == "publisher-observer-only":
-                snapshot_body = (
-                    "            payload = f'{os.getpid()} {os.getpgrp()} S\\n'.encode('ascii')\n"
-                )
+                snapshot_body = "            payload = f'{os.getpid()} {os.getpgrp()} S\\n'.encode('ascii')\n"
             elif observation_fault == "publisher-zombie":
                 snapshot_body = (
                     f"            zombie_pid, publisher_group = (int(value) for value in Path({str(zombie_marker)!r}).read_text(encoding='ascii').split())\n"
@@ -9020,13 +9152,9 @@ exit 2"""
                     "            payload = b'\\n'.join(kept) + b'\\n'\n"
                 )
             elif observation_fault == "publisher-nonzero":
-                snapshot_body = (
-                    "            return subprocess.CompletedProcess(command, 1, b'', b'')\n"
-                )
+                snapshot_body = "            return subprocess.CompletedProcess(command, 1, b'', b'')\n"
             elif observation_fault == "publisher-malformed":
-                snapshot_body = (
-                    "            return subprocess.CompletedProcess(command, 0, b'malformed\\n', b'')\n"
-                )
+                snapshot_body = "            return subprocess.CompletedProcess(command, 0, b'malformed\\n', b'')\n"
             else:
                 raise AssertionError(f"unknown observation fault: {observation_fault}")
             broker_snapshot_injection = (
@@ -9152,10 +9280,7 @@ exit 2"""
         while (
             not child_marker.is_file()
             or not resource_marker.is_file()
-            or (
-                observation_fault == "publisher-zombie"
-                and not zombie_marker.is_file()
-            )
+            or (observation_fault == "publisher-zombie" and not zombie_marker.is_file())
         ):
             if process.poll() is not None:
                 diagnostic_stdout, diagnostic_stderr = process.communicate()
@@ -9166,7 +9291,9 @@ exit 2"""
                     f"stderr={diagnostic_stderr!r}"
                 )
             if time.monotonic() >= deadline:
-                raise AssertionError("truncated broker snapshot fixture did not become ready")
+                raise AssertionError(
+                    "truncated broker snapshot fixture did not become ready"
+                )
             time.sleep(0.05)
 
         fields = resource_marker.read_text(encoding="ascii").splitlines()
@@ -9216,23 +9343,28 @@ exit 2"""
                         zombie_identity = candidate
                         break
                 time.sleep(0.02)
-            assert zombie_identity is not None, "publisher zombie did not become observable"
+            assert zombie_identity is not None, (
+                "publisher zombie did not become observable"
+            )
             assert zombie_identity.pgid == zombie_group
 
         while not capture_ready.is_file():
             if process.poll() is not None:
-                raise AssertionError("publisher exited before broker snapshot capture boundary")
+                raise AssertionError(
+                    "publisher exited before broker snapshot capture boundary"
+                )
             if time.monotonic() >= deadline:
-                raise AssertionError("broker snapshot did not pause for identity capture")
+                raise AssertionError(
+                    "broker snapshot did not pause for identity capture"
+                )
             time.sleep(0.05)
 
         # The fault is enabled only after the broker resources and process
         # identities are captured, and the child has reparented after leader exit.
         child_lookup_deadline = time.monotonic() + 5
         while (
-            (child_identity is None or broker_identity is None)
-            and time.monotonic() < child_lookup_deadline
-        ):
+            child_identity is None or broker_identity is None
+        ) and time.monotonic() < child_lookup_deadline:
             live_processes = _read_process_table()
             child_identity = live_processes.get(child_pid)
             broker_identity = live_processes.get(broker_pid)
@@ -9243,7 +9375,9 @@ exit 2"""
         fault_enable.touch()
         while not snapshot_ready.is_file():
             if process.poll() is not None:
-                raise AssertionError("publisher exited before truncated broker snapshot returned")
+                raise AssertionError(
+                    "publisher exited before truncated broker snapshot returned"
+                )
             if time.monotonic() >= deadline:
                 raise AssertionError("truncated broker snapshot did not return")
             time.sleep(0.05)
@@ -9275,8 +9409,7 @@ exit 2"""
                 if len(fields) == 3:
                     snapshot_rows.append(fields)
             assert any(
-                fields[0] == str(broker_pid)
-                and fields[1] == str(broker_pid)
+                fields[0] == str(broker_pid) and fields[1] == str(broker_pid)
                 for fields in snapshot_rows
             )
             assert any(
@@ -9313,8 +9446,7 @@ exit 2"""
             _read_process_table().get(child_identity.pid) == child_identity
         )
         resources_alive_before_release = all(
-            path.exists()
-            and (path.stat().st_dev, path.stat().st_ino) == expected
+            path.exists() and (path.stat().st_dev, path.stat().st_ino) == expected
             for path, expected in (
                 (record_path, record_identity),
                 (lock_path, lock_identity),
@@ -9342,17 +9474,14 @@ exit 2"""
         fault_disable.touch()
         snapshot_release.touch()
         stdout, stderr = process.communicate(timeout=45)
-        resources_removed_by_production_after_release = (
-            all(
-                not path.exists() and not path.is_symlink()
-                for path in (record_path, lock_path)
-            )
-            and (
-                resources_alive_before_release
-                or (
-                    not child_alive_before_release
-                    and cleanup_state_before_release == "gone\n"
-                )
+        resources_removed_by_production_after_release = all(
+            not path.exists() and not path.is_symlink()
+            for path in (record_path, lock_path)
+        ) and (
+            resources_alive_before_release
+            or (
+                not child_alive_before_release
+                and cleanup_state_before_release == "gone\n"
             )
         )
         boundary_marker.write_text(
@@ -9387,7 +9516,10 @@ exit 2"""
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             try:
                 process.wait(timeout=5)
@@ -9493,8 +9625,7 @@ exit 2"""
         )
         assert source.count(arm_anchor) == 1
         resource_probe = (
-            arm_anchor
-            + f"    Path({str(resource_marker)!r}).write_text(\n"
+            arm_anchor + f"    Path({str(resource_marker)!r}).write_text(\n"
             "        f'{broker_record_root}\\n{broker_record_identity}\\n'\n"
             "        f'{broker_lock_path}\\n{broker_lock_identity}\\n{broker_pid}\\n'\n"
             "        f'{private_root}\\n{launcher_root}\\n',\n"
@@ -9558,7 +9689,8 @@ exit 2"""
             assert source.count(stop_anchor) == 1
             source = source.replace(
                 stop_anchor,
-                stop_anchor + "    raise OSError('persistent broker fixture failure')\n",
+                stop_anchor
+                + "    raise OSError('persistent broker fixture failure')\n",
                 1,
             )
         else:
@@ -9669,8 +9801,7 @@ exit 2"""
         child_identity = _read_process_table().get(child_pid)
         assert child_identity is not None
         assert all(
-            path.exists()
-            and (path.stat().st_dev, path.stat().st_ino) == expected
+            path.exists() and (path.stat().st_dev, path.stat().st_ino) == expected
             for path, expected in zip(resource_paths, resource_identities)
         )
         fault_enable.touch()
@@ -9701,13 +9832,11 @@ exit 2"""
             _read_process_table().get(child_identity.pid) == child_identity
         )
         resources_alive_before_release = all(
-            path.exists()
-            and (path.stat().st_dev, path.stat().st_ino) == expected
+            path.exists() and (path.stat().st_dev, path.stat().st_ino) == expected
             for path, expected in zip(resource_paths, resource_identities)
         )
         roots_alive_before_release = all(
-            path.exists()
-            and (path.stat().st_dev, path.stat().st_ino) == expected
+            path.exists() and (path.stat().st_dev, path.stat().st_ino) == expected
             for path, expected in cleanup_roots
         )
         signal_observed = unsafe_signal.is_file()
@@ -9731,7 +9860,10 @@ exit 2"""
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
         for path, expected in cleanup_roots:
@@ -9787,8 +9919,7 @@ exit 2"""
     assert "Traceback" not in stderr
     assert all(not path.exists() and not path.is_symlink() for path, _ in cleanup_roots)
     assert all(
-        not path.exists() and not path.is_symlink()
-        for path in resource_paths or ()
+        not path.exists() and not path.is_symlink() for path in resource_paths or ()
     )
 
 
@@ -9956,7 +10087,6 @@ def test_publisher_top_owner_cleans_registered_stage_b_resources(
             start_new_session=True,
         )
         top_identity = _read_process_table()[process.pid]
-        owned_tree: OwnedProcessTree | None = None
         record_path: Path | None = None
         record_identity: tuple[int, int] | None = None
         lock_path: Path | None = None
@@ -9967,7 +10097,9 @@ def test_publisher_top_owner_cleans_registered_stage_b_resources(
             deadline = time.monotonic() + 180
             while not supervisor_marker.is_file():
                 if process.poll() is not None:
-                    raise AssertionError("publisher exited before Stage-B supervisor registration")
+                    raise AssertionError(
+                        "publisher exited before Stage-B supervisor registration"
+                    )
                 if time.monotonic() >= deadline:
                     raise AssertionError("Stage-B supervisor was not registered")
                 time.sleep(0.02)
@@ -9981,7 +10113,9 @@ def test_publisher_top_owner_cleans_registered_stage_b_resources(
 
             while not resource_ready.is_file():
                 if process.poll() is not None:
-                    raise AssertionError("publisher exited before owned resources were ready")
+                    raise AssertionError(
+                        "publisher exited before owned resources were ready"
+                    )
                 if time.monotonic() >= deadline:
                     raise AssertionError("owned Stage-B resources were not ready")
                 time.sleep(0.02)
@@ -10014,13 +10148,18 @@ def test_publisher_top_owner_cleans_registered_stage_b_resources(
             assert resources["tagged"].endswith(
                 f"-sha256-{actual_image_id.removeprefix('sha256:')}"
             )
-            assert (record_path.stat().st_dev, record_path.stat().st_ino) == record_identity
+            assert (
+                record_path.stat().st_dev,
+                record_path.stat().st_ino,
+            ) == record_identity
             assert (lock_path.stat().st_dev, lock_path.stat().st_ino) == lock_identity
             ready_state = json.loads(state_path.read_text(encoding="utf-8"))
             assert ready_state["tagged"] is True
             assert ready_state["current_tag_id"] == actual_image_id
-            owned_tree = OwnedProcessTree(
-                top_identity if ready_processes.get(top_identity.pid) == top_identity else None,
+            OwnedProcessTree(
+                top_identity
+                if ready_processes.get(top_identity.pid) == top_identity
+                else None,
                 captured_identities,
                 repr(captured_identities),
             )
@@ -10078,7 +10217,10 @@ def test_publisher_top_owner_cleans_registered_stage_b_resources(
                     _kill_publisher_process_groups(
                         _publisher_process_groups_for_fixture(top_identity)
                     )
-                if process.poll() is None and _read_process_table().get(process.pid) == top_identity:
+                if (
+                    process.poll() is None
+                    and _read_process_table().get(process.pid) == top_identity
+                ):
                     process.kill()
                 try:
                     process.wait(timeout=5)
@@ -10143,9 +10285,7 @@ def test_publisher_restore_does_not_replace_late_destination_entry(
     publisher, docker_config, _, _, _, command = _publisher_signal_fixture(
         tmp_path,
         inner_body=(
-            "/usr/bin/printf '%s\\n' original > "
-            '"$HOME/cleanup-restore-entry"\n'
-            "exit 2"
+            "/usr/bin/printf '%s\\n' original > \"$HOME/cleanup-restore-entry\"\nexit 2"
         ),
         cleanup_restore_race=(marker, pause),
         cleanup_root_marker=private_marker,
@@ -10183,21 +10323,23 @@ def test_publisher_restore_does_not_replace_late_destination_entry(
                 raise AssertionError("publisher did not reach restore race boundary")
             time.sleep(0.02)
         marker_lines = marker.read_text(encoding="ascii").splitlines()
-        replacement_identity = tuple(
-            int(value) for value in marker_lines[0].split(":")
-        )
-        private_identity = tuple(
-            int(value) for value in marker_lines[1].split(":")
-        )
+        replacement_identity = tuple(int(value) for value in marker_lines[0].split(":"))
+        private_identity = tuple(int(value) for value in marker_lines[1].split(":"))
         private_root = _find_exact_owned_root(
             private_identity, "travel-map-publish-environment."
         )
         replacement = _find_identity_under(private_root, replacement_identity)
         assert replacement is not None
         replacement_details = replacement.lstat()
-        assert (replacement_details.st_dev, replacement_details.st_ino) == replacement_identity
+        assert (
+            replacement_details.st_dev,
+            replacement_details.st_ino,
+        ) == replacement_identity
         assert replacement.read_text(encoding="ascii") == "late-replacement\n"
-        if launcher_marker.is_file() and launcher_marker.read_text(encoding="ascii").strip():
+        if (
+            launcher_marker.is_file()
+            and launcher_marker.read_text(encoding="ascii").strip()
+        ):
             launcher_root = _read_recorded_root(
                 launcher_marker, "travel-map-publish-launcher."
             )
@@ -10235,7 +10377,10 @@ def test_publisher_restore_does_not_replace_late_destination_entry(
                 )
             except PermissionError:
                 pass
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
         if private_root is not None and private_identity is not None:
@@ -10270,9 +10415,9 @@ def test_publisher_rejects_top_cleanup_final_stat_replacement(
         "cleanup-regular-entry" if race_kind == "regular" else "cleanup-directory-entry"
     )
     if race_kind == "regular":
-        inner_body = f"/usr/bin/printf original > \"$HOME/{target}\"\nexit 2"
+        inner_body = f'/usr/bin/printf original > "$HOME/{target}"\nexit 2'
     else:
-        inner_body = f"/bin/mkdir \"$HOME/{target}\"\nexit 2"
+        inner_body = f'/bin/mkdir "$HOME/{target}"\nexit 2'
     publisher, docker_config, _, _, _, command = _publisher_signal_fixture(
         tmp_path,
         inner_body=inner_body,
@@ -10283,7 +10428,11 @@ def test_publisher_rejects_top_cleanup_final_stat_replacement(
     process = subprocess.Popen(
         command,
         cwd=publisher.parents[4],
-        env={"DOCKER_CONFIG": str(docker_config), "HOME": str(tmp_path / "ambient-home"), "PATH": "/nonexistent"},
+        env={
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(tmp_path / "ambient-home"),
+            "PATH": "/nonexistent",
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -10309,7 +10458,10 @@ def test_publisher_rejects_top_cleanup_final_stat_replacement(
                     and _read_process_table().get(process.pid) == process_identity
                 ):
                     process.kill()
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             try:
                 stdout, stderr = process.communicate(timeout=5)
@@ -10325,7 +10477,9 @@ def test_publisher_rejects_top_cleanup_final_stat_replacement(
         completed = subprocess.CompletedProcess(
             command, process.returncode, stdout, stderr
         )
-        assert marker.is_file() and marker.read_text(encoding="ascii").strip() == "ready"
+        assert (
+            marker.is_file() and marker.read_text(encoding="ascii").strip() == "ready"
+        )
         root = _read_recorded_root(private_marker, "travel-map-publish-environment.")
         replacement = root / "home" / target
         assert completed.returncode == 2
@@ -10340,12 +10494,21 @@ def test_publisher_rejects_top_cleanup_final_stat_replacement(
             except PermissionError:
                 if _read_process_table().get(process.pid) == process_identity:
                     process.kill()
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
-        if private_marker.is_file() and private_marker.read_text(encoding="ascii").strip():
+        if (
+            private_marker.is_file()
+            and private_marker.read_text(encoding="ascii").strip()
+        ):
             _cleanup_recorded_root(private_marker, "travel-map-publish-environment.")
-        if launcher_marker.is_file() and launcher_marker.read_text(encoding="ascii").strip():
+        if (
+            launcher_marker.is_file()
+            and launcher_marker.read_text(encoding="ascii").strip()
+        ):
             _cleanup_recorded_root(launcher_marker, "travel-map-publish-launcher.")
 
 
@@ -10368,7 +10531,11 @@ def test_publisher_rejects_stage_b_pending_signal_before_public_write(
     process = subprocess.Popen(
         command,
         cwd=publisher.parents[4],
-        env={"DOCKER_CONFIG": str(docker_config), "HOME": str(tmp_path / "ambient-home"), "PATH": "/nonexistent"},
+        env={
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(tmp_path / "ambient-home"),
+            "PATH": "/nonexistent",
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -10381,9 +10548,13 @@ def test_publisher_rejects_stage_b_pending_signal_before_public_write(
         deadline = time.monotonic() + 60
         while not ready.is_file() or not ready.read_text(encoding="ascii").strip():
             if process.poll() is not None:
-                raise AssertionError("Stage-B supervisor exited before pending boundary")
+                raise AssertionError(
+                    "Stage-B supervisor exited before pending boundary"
+                )
             if time.monotonic() >= deadline:
-                raise AssertionError("Stage-B supervisor did not reach pending boundary")
+                raise AssertionError(
+                    "Stage-B supervisor did not reach pending boundary"
+                )
             time.sleep(0.05)
         supervisor_pid = int(ready.read_text(encoding="ascii").strip())
         supervisor_identity = _read_process_table()[supervisor_pid]
@@ -10395,7 +10566,11 @@ def test_publisher_rejects_stage_b_pending_signal_before_public_write(
         assert "Traceback" not in stderr
     finally:
         pause.unlink(missing_ok=True)
-        if supervisor_identity is not None and _read_process_table().get(supervisor_identity.pid) == supervisor_identity:
+        if (
+            supervisor_identity is not None
+            and _read_process_table().get(supervisor_identity.pid)
+            == supervisor_identity
+        ):
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(supervisor_identity)
             )
@@ -10403,7 +10578,10 @@ def test_publisher_rejects_stage_b_pending_signal_before_public_write(
             _kill_publisher_process_groups(
                 _publisher_process_groups_for_fixture(process_identity)
             )
-            if process.poll() is None and _read_process_table().get(process.pid) == process_identity:
+            if (
+                process.poll() is None
+                and _read_process_table().get(process.pid) == process_identity
+            ):
                 process.kill()
             process.wait(timeout=5)
         for marker, prefix in (
@@ -10422,15 +10600,22 @@ def test_publisher_fails_closed_when_public_stdout_reader_is_closed(
     pause.write_text("pause\n", encoding="ascii")
     publisher, docker_config, _, _, _, command = _publisher_signal_fixture(
         tmp_path,
-        inner_body=("printf '%s\\n' "
-                    "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
-                    + "a" * 64 + "\nexit 0"),
+        inner_body=(
+            "printf '%s\\n' "
+            "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
+            + "a" * 64
+            + "\nexit 0"
+        ),
         stage_b_pending_signal_window=(ready, pause),
     )
     process = subprocess.Popen(
         command,
         cwd=publisher.parents[4],
-        env={"DOCKER_CONFIG": str(docker_config), "HOME": str(tmp_path / "ambient-home"), "PATH": "/nonexistent"},
+        env={
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(tmp_path / "ambient-home"),
+            "PATH": "/nonexistent",
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -10545,15 +10730,22 @@ def test_publisher_fails_closed_on_short_public_stdout_write(
 ) -> None:
     publisher, docker_config, _, _, _, command = _publisher_signal_fixture(
         tmp_path,
-        inner_body=("printf '%s\\n' "
-                    "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
-                    + "a" * 64 + "\nexit 0"),
+        inner_body=(
+            "printf '%s\\n' "
+            "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
+            + "a" * 64
+            + "\nexit 0"
+        ),
         short_stdout_write=True,
     )
     completed = subprocess.run(
         command,
         cwd=publisher.parents[4],
-        env={"DOCKER_CONFIG": str(docker_config), "HOME": str(tmp_path / "ambient-home"), "PATH": "/nonexistent"},
+        env={
+            "DOCKER_CONFIG": str(docker_config),
+            "HOME": str(tmp_path / "ambient-home"),
+            "PATH": "/nonexistent",
+        },
         check=False,
         capture_output=True,
         text=True,
@@ -10565,13 +10757,11 @@ def test_publisher_fails_closed_on_short_public_stdout_write(
 
 
 def _run_mutable_script_carrier_attack(tmp_path: Path, *, stage_b: bool) -> None:
-    publisher_source = (
-        ROOT / "deploy/nas/publish-reviewed-image.sh"
-    ).read_text(encoding="utf-8")
+    publisher_source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
     declaration = (
-        'name = ".stage-b-script"'
-        if stage_b
-        else 'capture_name = ".launcher-script"'
+        'name = ".stage-b-script"' if stage_b else 'capture_name = ".launcher-script"'
     )
     pathname_carrier = ".stage-b-script" if stage_b else ".launcher-script"
     if declaration not in publisher_source:
@@ -10580,9 +10770,15 @@ def _run_mutable_script_carrier_attack(tmp_path: Path, *, stage_b: bool) -> None
         assert pathname_carrier not in publisher_source
         return
 
-    carrier_ready = tmp_path / ("stage-b-carrier.ready" if stage_b else "launcher-carrier.ready")
-    carrier_release = tmp_path / ("stage-b-carrier.release" if stage_b else "launcher-carrier.release")
-    executed = tmp_path / ("stage-b-carrier.executed" if stage_b else "launcher-carrier.executed")
+    carrier_ready = tmp_path / (
+        "stage-b-carrier.ready" if stage_b else "launcher-carrier.ready"
+    )
+    carrier_release = tmp_path / (
+        "stage-b-carrier.release" if stage_b else "launcher-carrier.release"
+    )
+    executed = tmp_path / (
+        "stage-b-carrier.executed" if stage_b else "launcher-carrier.executed"
+    )
     fixture_kwargs = (
         {"stage_b_script_carrier_window": (carrier_ready, carrier_release)}
         if stage_b
@@ -10609,13 +10805,18 @@ def _run_mutable_script_carrier_attack(tmp_path: Path, *, stage_b: bool) -> None
     root_survived = False
     try:
         deadline = time.monotonic() + 60
-        while not carrier_ready.is_file() or not carrier_ready.read_text(encoding="ascii").strip():
+        while (
+            not carrier_ready.is_file()
+            or not carrier_ready.read_text(encoding="ascii").strip()
+        ):
             if process.poll() is not None:
                 raise AssertionError("publisher exited before carrier boundary")
             if time.monotonic() >= deadline:
                 raise AssertionError("publisher did not reach carrier boundary")
             time.sleep(0.05)
-        launcher_root = _read_recorded_root(carrier_ready, "travel-map-publish-launcher.")
+        launcher_root = _read_recorded_root(
+            carrier_ready, "travel-map-publish-launcher."
+        )
         carrier = launcher_root / (".stage-b-script" if stage_b else ".launcher-script")
         if stage_b:
             fake = (
@@ -10632,11 +10833,12 @@ def _run_mutable_script_carrier_attack(tmp_path: Path, *, stage_b: bool) -> None
                 f"/usr/bin/touch {str(executed)!r}\n"
                 "/usr/bin/printf '%s\\n' "
                 "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:"
-                + "d" * 64
+                + "d"
+                * 64
                 + " >&8\n"
-                "root=$(/usr/bin/dirname \"$0\")\n"
-                "/bin/rm -f \"$0\"\n"
-                "/bin/rmdir \"$root\"\n"
+                'root=$(/usr/bin/dirname "$0")\n'
+                '/bin/rm -f "$0"\n'
+                '/bin/rmdir "$root"\n'
                 "exit 0\n"
             )
         _rewrite_same_inode(carrier, fake)
@@ -10677,9 +10879,7 @@ def test_publisher_rejects_mutated_stage_b_script_carrier_after_hash(
 
 
 def test_publisher_has_no_pathname_reachable_script_execution_carriers() -> None:
-    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(encoding="utf-8")
 
     # Static invariant is unavoidable here: both carrier names identify regular files
     # that were previously trusted after pathname-visible hash validation.
@@ -10687,7 +10887,9 @@ def test_publisher_has_no_pathname_reachable_script_execution_carriers() -> None
     assert 'name = ".stage-b-script"' not in source
 
 
-@pytest.mark.parametrize("termination_signal", (signal.SIGHUP, signal.SIGINT, signal.SIGTERM))
+@pytest.mark.parametrize(
+    "termination_signal", (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+)
 def test_publisher_cleans_launcher_on_exec_handoff_signal(
     tmp_path: Path,
     termination_signal: signal.Signals,
@@ -10716,7 +10918,10 @@ def test_publisher_cleans_launcher_on_exec_handoff_signal(
     try:
         deadline = time.monotonic() + 30
         while process.poll() is None:
-            if launcher_probe.is_file() and launcher_probe.read_text(encoding="ascii").strip():
+            if (
+                launcher_probe.is_file()
+                and launcher_probe.read_text(encoding="ascii").strip()
+            ):
                 break
             if time.monotonic() >= deadline:
                 raise AssertionError("publisher did not reach launcher exec handoff")
@@ -10734,7 +10939,10 @@ def test_publisher_cleans_launcher_on_exec_handoff_signal(
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
-        if launcher_probe.exists() and launcher_probe.read_text(encoding="ascii").strip():
+        if (
+            launcher_probe.exists()
+            and launcher_probe.read_text(encoding="ascii").strip()
+        ):
             _cleanup_recorded_root(launcher_probe, "travel-map-publish-launcher.")
 
     assert process.returncode == 2
@@ -11324,6 +11532,11 @@ def test_release_documentation_requires_explicit_protected_docker_config() -> No
     assert "not a cryptographic provenance token" in readme
     assert "hostile same-UID code" in readme
     assert "creation-to-first-descriptor-binding" in readme
-    assert "mkdirat/openat replacement window for record/staging/lock resources" in readme
+    assert (
+        "mkdirat/openat replacement window for record/staging/lock resources" in readme
+    )
     assert "invoking UID must not be shared with untrusted concurrent code" in readme
-    assert "separate UID/sandbox or inaccessible pre-provisioned parent is the upgrade path" in readme
+    assert (
+        "separate UID/sandbox or inaccessible pre-provisioned parent is the upgrade path"
+        in readme
+    )
