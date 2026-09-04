@@ -3026,14 +3026,58 @@ def test_release_gate_rolls_back_owned_record_when_evidence_pipe_closes(
         stderr=subprocess.PIPE,
         text=True,
     )
-    assert process.stdout is not None
-    process.stdout.close()
-    stderr = process.stderr.read() if process.stderr is not None else ""
-    returncode = process.wait(timeout=15)
+    try:
+        assert process.stdout is not None
+        process.stdout.close()
+        stderr = process.stderr.read() if process.stderr is not None else ""
+        returncode = process.wait(timeout=15)
+    finally:
+        try:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        finally:
+            try:
+                if process.stdout is not None:
+                    process.stdout.close()
+            finally:
+                if process.stderr is not None:
+                    process.stderr.close()
 
     assert returncode == 2
     assert "Traceback" not in stderr
     assert not record.exists()
+
+
+def test_release_gate_reaps_child_when_evidence_wait_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_wait = subprocess.Popen.wait
+    timed_out_process: subprocess.Popen[str] | None = None
+
+    def timeout_once(
+        process: subprocess.Popen[str], timeout: float | None = None
+    ) -> int:
+        nonlocal timed_out_process
+        if timeout == 15 and timed_out_process is None:
+            timed_out_process = process
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        return real_wait(process, timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", timeout_once)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            test_release_gate_rolls_back_owned_record_when_evidence_pipe_closes(
+                tmp_path
+            )
+        assert timed_out_process is not None
+        assert timed_out_process.returncode is not None
+    finally:
+        if timed_out_process is not None:
+            if timed_out_process.poll() is None:
+                timed_out_process.kill()
+            real_wait(timed_out_process, timeout=5)
 
 
 @pytest.mark.parametrize(
@@ -10637,12 +10681,20 @@ def test_publisher_fails_closed_when_public_stdout_reader_is_closed(
         stderr = process.stderr.read() if process.stderr is not None else ""
         process.wait(timeout=15)
     finally:
-        pause.unlink(missing_ok=True)
-        if process.poll() is None:
-            _kill_publisher_process_groups(
-                _publisher_process_groups_for_fixture(process_identity)
-            )
-            process.wait(timeout=5)
+        try:
+            pause.unlink(missing_ok=True)
+            if process.poll() is None:
+                _kill_publisher_process_groups(
+                    _publisher_process_groups_for_fixture(process_identity)
+                )
+                process.wait(timeout=5)
+        finally:
+            try:
+                if process.stdout is not None:
+                    process.stdout.close()
+            finally:
+                if process.stderr is not None:
+                    process.stderr.close()
     assert process.returncode == 2
     assert "Traceback" not in stderr
 
