@@ -1720,10 +1720,11 @@ try:
         raise ValueError
     for parent in resolved.parents:
         parent_details = parent.stat()
+        shared_write = parent_details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         if (
             not stat.S_ISDIR(parent_details.st_mode)
             or parent_details.st_uid not in {0, os.getuid()}
-            or parent_details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or (shared_write and not parent_details.st_mode & stat.S_ISVTX)
         ):
             raise ValueError
 except (OSError, ValueError):
@@ -2220,6 +2221,27 @@ signal_received_at: float | None = None
 termination_deadline: float | None = None
 script_input: int | None = None
 signal_forwarded = False
+publisher_process_group = os.getpgrp()
+
+
+def enable_child_subreaper() -> bool:
+    if not sys.platform.startswith("linux"):
+        return False
+    operation = getattr(ctypes.CDLL(None, use_errno=True), "prctl", None)
+    if operation is None:
+        raise OSError
+    operation.argtypes = [ctypes.c_int, *([ctypes.c_ulong] * 4)]
+    operation.restype = ctypes.c_int
+    if operation(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return True
+
+
+try:
+    subreaper_enabled = enable_child_subreaper()
+except OSError:
+    raise SystemExit(2) from None
 
 
 def read_verified_launcher_script() -> bytes:
@@ -3062,18 +3084,17 @@ def extend_broker_owned_tree(
     protected: tuple[tuple[int, int, int, str], ...],
 ) -> tuple[tuple[int, int, int, str], ...]:
     records = broker_process_table()
+    protected_pids = {identity_value[0] for identity_value in protected}
+    if shell_identity[0] in protected_pids:
+        raise OSError
     retained = {
         identity_value[0]: identity_value
         for identity_value in captured
+        if identity_value[0] not in protected_pids
     }
     retained[shell_identity[0]] = shell_identity
-    protected_live = {
-        identity_value[0]
-        for identity_value in protected
-        if same_broker_process(records.get(identity_value[0]), identity_value)
-    }
     for pid, identity_value in records.items():
-        if identity_value[2] == shell_identity[2] and pid not in protected_live:
+        if identity_value[2] == shell_identity[2] and pid not in protected_pids:
             retained.setdefault(pid, identity_value)
     if same_broker_process(records.get(shell_identity[0]), shell_identity):
         owned = {shell_identity[0]}
@@ -3081,7 +3102,11 @@ def extend_broker_owned_tree(
         while changed:
             changed = False
             for pid, identity_value in records.items():
-                if identity_value[1] in owned and pid not in owned:
+                if (
+                    identity_value[1] in owned
+                    and pid not in owned
+                    and pid not in protected_pids
+                ):
                     owned.add(pid)
                     changed = True
         for pid in owned:
@@ -3212,6 +3237,21 @@ def reap_owned_direct_children() -> None:
     while True:
         try:
             waited, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except InterruptedError:
+            continue
+        if waited == 0:
+            return
+
+
+def reap_reparented_publisher_children(
+    _signum: int | None = None,
+    _frame: object | None = None,
+) -> None:
+    while True:
+        try:
+            waited, _ = os.waitpid(-publisher_process_group, os.WNOHANG)
         except ChildProcessError:
             return
         except InterruptedError:
@@ -4070,7 +4110,19 @@ if failure_message is None and not interrupted and status == 0:
     broker_request = b"DONE\n"
 else:
     broker_request = b"ABORT\n"
-broker_clean = finish_resource_broker(broker_request)
+previous_sigchld = None
+if subreaper_enabled:
+    previous_sigchld = signal.signal(
+        signal.SIGCHLD,
+        reap_reparented_publisher_children,
+    )
+    reap_reparented_publisher_children()
+try:
+    broker_clean = finish_resource_broker(broker_request)
+finally:
+    if previous_sigchld is not None:
+        signal.signal(signal.SIGCHLD, previous_sigchld)
+        reap_reparented_publisher_children()
 if broker_clean:
     close_fallback_tag_reader()
 else:

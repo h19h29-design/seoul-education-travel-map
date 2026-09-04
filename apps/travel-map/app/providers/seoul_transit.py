@@ -1,13 +1,16 @@
+from __future__ import annotations
+
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from math import isfinite
-from xml.etree.ElementTree import Element, ParseError
+from typing import Protocol, cast
 
 import httpx
 from defusedxml import ElementTree
 from defusedxml.common import DefusedXmlException
+from defusedxml.ElementTree import ParseError
 from pydantic import SecretStr
 
 from app.providers.http import BoundedHttpClient, ProviderRequestError
@@ -20,6 +23,27 @@ from app.routing.models import (
     TravelMode,
 )
 from app.settings import Settings
+
+
+class Element(Protocol):
+    tag: str
+    attrib: dict[str, str]
+    text: str | None
+
+    def find(
+        self,
+        path: str,
+        namespaces: dict[str, str] | None = None,
+    ) -> Element | None: ...
+
+    def findall(
+        self,
+        path: str,
+        namespaces: dict[str, str] | None = None,
+    ) -> list[Element]: ...
+
+    def __iter__(self) -> Iterator[Element]: ...
+
 
 _PATH_URL = "http://ws.bus.go.kr/api/rest/pathinfo/getPathInfoByBusNSub"
 _MAX_SCHEMA_DEPTH = 64
@@ -157,7 +181,7 @@ class SeoulTransitProvider:
         return self._last_schema_fingerprint
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "SeoulTransitProvider":
+    def from_settings(cls, settings: Settings) -> SeoulTransitProvider:
         if type(settings) is not Settings:
             raise TypeError("settings must be an exact Settings")
         return cls(
@@ -243,11 +267,14 @@ def _parse_routes(
 
 
 def _parse_document(raw: bytes) -> Element:
-    return ElementTree.fromstring(
-        raw,
-        forbid_dtd=True,
-        forbid_entities=True,
-        forbid_external=True,
+    return cast(
+        Element,
+        ElementTree.fromstring(
+            raw,
+            forbid_dtd=True,
+            forbid_entities=True,
+            forbid_external=True,
+        ),
     )
 
 

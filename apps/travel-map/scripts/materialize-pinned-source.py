@@ -75,6 +75,8 @@ def _read_tree(path: Path) -> dict[str, TreeEntry]:
 
 def _git_blob_id(payload: bytes) -> str:
     header = f"blob {len(payload)}\0".encode("ascii")
+    # Git's object protocol mandates SHA-1 here; this is identity, not security.
+    # nosemgrep: python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
     return hashlib.sha1(header + payload, usedforsecurity=False).hexdigest()
 
 

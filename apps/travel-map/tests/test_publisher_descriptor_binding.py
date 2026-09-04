@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -219,7 +220,13 @@ def _write_docker_config(root: Path, socket_path: Path) -> None:
     config.write_text(
         json.dumps(
             {
-                "auths": {"ghcr.io": {"auth": "dGVzdC1maXh0dXJl"}},
+                "auths": {
+                    "ghcr.io": {
+                        "auth": base64.b64encode(
+                            f"fixture:{socket_path}".encode()
+                        ).decode("ascii")
+                    }
+                },
                 "currentContext": name,
             }
         )
@@ -337,9 +344,10 @@ def _run_publisher(
     *,
     target: str | None,
     mismatch: str | None,
+    tool_parent: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]], tuple[str, ...]]:
     scenario = _scenario(target, mismatch)
-    fake_bin = tmp_path / "safe-bin"
+    fake_bin = (tool_parent or tmp_path) / "safe-bin"
     fake_bin.mkdir(mode=0o700)
     scenario_path = tmp_path / "scenario.json"
     scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
@@ -450,7 +458,10 @@ def _run_publisher(
             env=environment,
         )
     inputs = (str(record), image_tag, image_id, git_sha)
-    return completed, _network_events(events_path, tagged), inputs
+    network_events = (
+        _network_events(events_path, tagged) if events_path.exists() else []
+    )
+    return completed, network_events, inputs
 
 
 @pytest.mark.parametrize(
@@ -511,3 +522,20 @@ def test_publisher_accepts_a_fully_descriptor_bound_index(
         ["descriptor", "tag"],
     ]
     assert "Traceback" not in completed.stderr
+
+
+# Break caught: Linux CI keeps pytest's private tool directory below sticky /tmp.
+def test_publisher_accepts_private_tools_below_sticky_tmp(tmp_path: Path) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="tm-desc-tools-",
+        dir=Path("/tmp").resolve(strict=True),
+    ) as tool_parent:
+        completed, network_events, _ = _run_publisher(
+            tmp_path,
+            target=None,
+            mismatch=None,
+            tool_parent=Path(tool_parent),
+        )
+
+    assert completed.returncode == 0, completed.stderr
+    assert network_events[-1][0] == "descriptor"

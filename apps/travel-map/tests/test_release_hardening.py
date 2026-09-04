@@ -8505,6 +8505,78 @@ def test_publisher_signal_authority_rejects_ppid_only_identity_change(
     assert nonzero_signals == []
 
 
+@pytest.mark.parametrize(
+    "current_protected",
+    (
+        (44001, 43002, 44000, "Thu Sep  4 18:00:00 2026"),
+        (44001, 43002, 44000, "Thu Sep  4 18:00:01 2026"),
+    ),
+)
+def test_publisher_broker_tree_never_admits_reserved_protected_pid(
+    current_protected: tuple[int, int, int, str],
+) -> None:
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("def broker_stable_identity(")
+    end = source.index("\n\ndef stop_broker_shell(", start)
+    signals: list[tuple[int, int]] = []
+    namespace = {
+        "os": SimpleNamespace(kill=lambda pid, sent: signals.append((pid, sent))),
+        "re": __import__("re"),
+        "select": __import__("select"),
+        "signal": signal,
+        "subprocess": subprocess,
+        "sys": sys,
+        "time": time,
+    }
+    exec(  # noqa: S102 - execute the extracted publisher helpers under test.
+        compile(source[start:end], "publish-reviewed-image.sh", "exec"), namespace
+    )
+
+    shell = (44002, 44000, 44000, "Thu Sep  4 18:00:00 2026")
+    protected = (44001, 43001, 44000, "Thu Sep  4 18:00:00 2026")
+    namespace["broker_process_table"] = lambda: {
+        shell[0]: shell,
+        current_protected[0]: current_protected,
+    }
+
+    captured = namespace["extend_broker_owned_tree"](shell, (), (protected,))
+    namespace["signal_broker_tree"](captured, signal.SIGTERM)
+
+    assert all(identity[0] != protected[0] for identity in captured)
+    assert signals == [(shell[0], signal.SIGTERM)]
+
+
+def test_publisher_broker_tree_rejects_shell_pid_colliding_with_protected_pid() -> (
+    None
+):
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("def broker_stable_identity(")
+    end = source.index("\n\ndef stop_broker_shell(", start)
+    namespace = {
+        "os": SimpleNamespace(kill=lambda _pid, _sent: None),
+        "re": __import__("re"),
+        "select": __import__("select"),
+        "signal": signal,
+        "subprocess": subprocess,
+        "sys": sys,
+        "time": time,
+    }
+    exec(  # noqa: S102 - execute the extracted publisher helpers under test.
+        compile(source[start:end], "publish-reviewed-image.sh", "exec"), namespace
+    )
+
+    shell = (45001, 44001, 45000, "Thu Sep  4 19:00:00 2026")
+    protected = (shell[0], 43001, shell[2], shell[3])
+    namespace["broker_process_table"] = lambda: {shell[0]: shell}
+
+    with pytest.raises(OSError):
+        namespace["extend_broker_owned_tree"](shell, (), (protected,))
+
+
 @pytest.mark.parametrize("signum", (signal.SIGTERM, signal.SIGKILL))
 def test_publisher_broker_tree_never_renews_invalidated_numeric_pid(
     signum: signal.Signals,
