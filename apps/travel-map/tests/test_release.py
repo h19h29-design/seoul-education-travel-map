@@ -2989,6 +2989,83 @@ def test_publish_reviewed_image_preserves_replaced_cleanup_child(
         assert not root.exists() and not root.is_symlink()
 
 
+def test_publish_reviewed_image_delimits_negative_cleanup_group_operands(
+    tmp_path: Path,
+) -> None:
+    kill_log = tmp_path / "kill-arguments.jsonl"
+    fake_kill = tmp_path / "safe-kill"
+    fake_kill.write_text(
+        f"""#!/usr/bin/python3
+import json
+import os
+import signal
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+with Path({str(kill_log)!r}).open("a", encoding="utf-8") as output:
+    output.write(json.dumps(arguments, separators=(",", ":")) + "\\n")
+if (
+    len(arguments) == 2
+    and arguments[0] in {{"-TERM", "-0"}}
+    and arguments[1].isdigit()
+):
+    raise SystemExit(0)
+if (
+    len(arguments) == 2
+    and arguments[0] == "-KILL"
+    and arguments[1].isdigit()
+):
+    target = int(arguments[1])
+    if target <= 1 or target in {{os.getpid(), os.getppid()}}:
+        raise SystemExit(97)
+    os.kill(target, signal.SIGKILL)
+    raise SystemExit(0)
+if (
+    len(arguments) in {{2, 3}}
+    and arguments[0] in {{"-TERM", "-KILL"}}
+    and arguments[-1].startswith("-")
+    and arguments[-1][1:].isdigit()
+):
+    raise SystemExit(0)
+raise SystemExit(97)
+""",
+        encoding="utf-8",
+    )
+    fake_kill.chmod(0o755)
+
+    def transform(source: str) -> str:
+        assert source.count("/bin/kill") == 5
+        source = source.replace("/bin/kill", shlex.quote(str(fake_kill)))
+        timeout_anchor = '[ "$signal_ticks" -ge 1200 ]'
+        assert source.count(timeout_anchor) == 1
+        return source.replace(timeout_anchor, '[ "$signal_ticks" -ge 0 ]', 1)
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        cleanup_child_replacement_attack="record",
+        publisher_source_transform=transform,
+    )
+
+    calls = [
+        json.loads(line) for line in kill_log.read_text(encoding="utf-8").splitlines()
+    ]
+    signal_pid = calls[0][1]
+    assert signal_pid.isdigit() and int(signal_pid) > 1
+    assert calls == [
+        ["-TERM", signal_pid],
+        ["-TERM", "--", f"-{signal_pid}"],
+        ["-0", signal_pid],
+        ["-KILL", signal_pid],
+        ["-KILL", "--", f"-{signal_pid}"],
+    ]
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+
+
 @pytest.mark.parametrize("root_kind", ("launcher", "environment", "record"))
 def test_publish_reviewed_image_cleans_renamed_owned_root_without_replacement(
     tmp_path: Path,

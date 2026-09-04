@@ -1529,12 +1529,12 @@ cleanup_outer_signal() {
     signal_pid=${supervisor_pid:-${!:-}}
     if [ -n "$signal_pid" ]; then
         /bin/kill -TERM "$signal_pid" 2>/dev/null || true
-        /bin/kill -TERM -"$signal_pid" 2>/dev/null || true
+        /bin/kill -TERM -- -"$signal_pid" 2>/dev/null || true
         signal_ticks=0
         while /bin/kill -0 "$signal_pid" 2>/dev/null; do
             if [ "$signal_ticks" -ge 1200 ]; then
                 /bin/kill -KILL "$signal_pid" 2>/dev/null || true
-                /bin/kill -KILL -"$signal_pid" 2>/dev/null || true
+                /bin/kill -KILL -- -"$signal_pid" 2>/dev/null || true
                 break
             fi
             /bin/sleep 0.01
