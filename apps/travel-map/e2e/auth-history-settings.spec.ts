@@ -264,6 +264,10 @@ test("history loads the page after the first hundred records", async ({ page }) 
 test("history deletion sends only the readable csrf token and refreshes", async ({ page }) => {
   await installAuthenticatedHistoryApi(page);
   let deleted = false;
+  let releaseHistory!: () => void;
+  let markHistorySeen!: () => void;
+  const heldHistory = new Promise<void>((resolve) => { releaseHistory = resolve; });
+  const historySeen = new Promise<void>((resolve) => { markHistorySeen = resolve; });
   await page.route("**/api/v1/me/history**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -272,6 +276,8 @@ test("history deletion sends only the readable csrf token and refreshes", async 
       return route.fulfill({ status: 204 });
     }
     if (request.method() === "GET" && path === "/api/v1/me/history") {
+      markHistorySeen();
+      await heldHistory;
       return route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -280,17 +286,28 @@ test("history deletion sends only the readable csrf token and refreshes", async 
     }
     return route.fallback();
   });
-  let deleteCsrf: string | undefined;
+  const deleteRequests: Array<{ path: string; csrf: string | undefined }> = [];
   page.on("request", (request) => {
-    if (request.method() === "DELETE" && new URL(request.url()).pathname.startsWith("/api/v1/me/history/")) {
-      deleteCsrf = request.headers()["x-csrf-token"];
+    if (request.method() === "DELETE") {
+      deleteRequests.push({
+        path: new URL(request.url()).pathname,
+        csrf: request.headers()["x-csrf-token"],
+      });
     }
   });
   await page.goto("/");
   await page.getByRole("button", { name: "계산 이력" }).click();
-  await page.getByRole("button", { name: "삭제" }).first().click();
-  await expect.poll(() => deleteCsrf).toBe("fixture-csrf-token");
+  await historySeen;
+  releaseHistory();
+  const historyDialog = page.getByRole("dialog", { name: "계산 이력" });
+  const rowDelete = historyDialog.getByRole("button", { name: "삭제", exact: true });
+  await expect(rowDelete).toBeVisible();
+  await rowDelete.click();
   await expect(page.getByText("보관 중인 계산 이력이 없습니다.")).toBeVisible();
+  expect(deleteRequests).toEqual([{
+    path: "/api/v1/me/history/AbCdEfGhIjKlMnOpQrStUv",
+    csrf: "fixture-csrf-token",
+  }]);
 });
 
 test("successful saved calculation refreshes authenticated history", async ({ page }) => {
