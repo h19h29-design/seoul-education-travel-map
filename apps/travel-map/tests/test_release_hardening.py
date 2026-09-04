@@ -400,7 +400,7 @@ def test_cleanup_recorded_root_preserves_replacement_inode(tmp_path: Path) -> No
 def _find_exact_owned_root(
     expected: tuple[int, int],
     prefix: str,
-) -> Path:
+) -> Path | None:
     for tmp_root in {Path("/tmp"), Path("/private/tmp")}:
         if not tmp_root.exists():
             continue
@@ -425,7 +425,7 @@ def _find_exact_owned_root(
                     continue
                 if (details.st_dev, details.st_ino) == expected:
                     return owned
-    raise AssertionError(f"owned root {expected!r} was not found")
+    return None
 
 
 def _find_identity_under(root: Path, expected: tuple[int, int]) -> Path | None:
@@ -10697,6 +10697,7 @@ def test_publisher_restore_does_not_replace_late_destination_entry(
         private_root = _find_exact_owned_root(
             private_identity, "travel-map-publish-environment."
         )
+        assert private_root is not None
         replacement = _find_identity_under(private_root, replacement_identity)
         assert replacement is not None
         replacement_details = replacement.lstat()
@@ -10719,6 +10720,7 @@ def test_publisher_restore_does_not_replace_late_destination_entry(
         private_root = _find_exact_owned_root(
             private_identity, "travel-map-publish-environment."
         )
+        assert private_root is not None
         replacement = _find_identity_under(private_root, replacement_identity)
         replacement_preserved = (
             replacement is not None
@@ -11032,6 +11034,29 @@ def test_publisher_rejects_nonpipe_public_stdout_before_registry_mutation(
     image_id = "sha256:" + "a" * 64
     remote_digest = "sha256:" + "b" * 64
     public_output = tmp_path / "public-output.txt"
+    launcher_marker = tmp_path / f"nonpipe-{sink_kind}.launcher-root"
+    launcher_expected: tuple[int, int] | None = None
+
+    def transform(source: str) -> str:
+        anchor = "                launcher_root_identity=${launcher_creation##* }\n"
+        probe = anchor + (
+            f"                /usr/bin/printf '%s\\n' \"$launcher_root\" > "
+            f"{str(launcher_marker)!r}\n"
+            f"                /usr/bin/printf '%s\\n' \"$launcher_root_identity\" > "
+            f"{str(launcher_marker.with_name(launcher_marker.name + '.identity'))!r}\n"
+        )
+        return _replace_once(source, anchor, probe)
+
+    def recorded_launcher_identity() -> tuple[int, int]:
+        identity_raw = launcher_marker.with_name(
+            launcher_marker.name + ".identity"
+        ).read_text(encoding="ascii")
+        assert identity_raw.endswith("\n") and identity_raw.count("\n") == 1
+        identity_fields = identity_raw[:-1].split(":")
+        assert len(identity_fields) == 2 and all(
+            field.isascii() and field.isdecimal() for field in identity_fields
+        )
+        return int(identity_fields[0]), int(identity_fields[1])
 
     def runner(
         command: list[str],
@@ -11089,17 +11114,41 @@ def test_publisher_rejects_nonpipe_public_stdout_before_registry_mutation(
             stderr_raw.decode("utf-8", errors="replace"),
         )
 
-    completed = _run_publish_reviewed_image(
-        tmp_path,
-        image_id=image_id,
-        remote_digest=remote_digest,
-        root_manifest=_image_manifest(image_id),
-        publisher_runner=runner,
-    )
+    try:
+        completed = _run_publish_reviewed_image(
+            tmp_path,
+            image_id=image_id,
+            remote_digest=remote_digest,
+            root_manifest=_image_manifest(image_id),
+            publisher_source_transform=transform,
+            publisher_runner=runner,
+        )
+        launcher_root = _read_recorded_root(
+            launcher_marker, "travel-map-publish-launcher."
+        )
+        launcher_expected = recorded_launcher_identity()
 
-    assert completed.returncode == 2
-    assert completed.stdout == ""
-    assert "Traceback" not in completed.stderr
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert "Traceback" not in completed.stderr
+        assert not launcher_root.exists() and not launcher_root.is_symlink()
+        assert (
+            _find_exact_owned_root(launcher_expected, "travel-map-publish-launcher.")
+            is None
+        )
+    finally:
+        if launcher_marker.is_file():
+            if launcher_expected is None:
+                launcher_expected = recorded_launcher_identity()
+            owned_root = _find_exact_owned_root(
+                launcher_expected, "travel-map-publish-launcher."
+            )
+            if owned_root is not None:
+                _cleanup_exact_owned_root(
+                    owned_root,
+                    launcher_expected,
+                    "travel-map-publish-launcher.",
+                )
 
 
 def test_publisher_fails_closed_on_short_public_stdout_write(

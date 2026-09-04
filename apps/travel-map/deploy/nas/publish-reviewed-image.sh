@@ -636,15 +636,6 @@ def remember_signal(signum, _frame):
 for handled_signal in handled_signals:
     signal.signal(handled_signal, remember_signal)
 
-try:
-    public_stdout_details = os.fstat(1)
-    public_pipe_buf = os.fpathconf(1, "PC_PIPE_BUF")
-    if not stat.S_ISFIFO(public_stdout_details.st_mode) or public_pipe_buf < 256:
-        raise OSError
-except OSError:
-    raise SystemExit(2) from None
-
-
 def identity(details):
     return details.st_dev, details.st_ino
 
@@ -1312,6 +1303,10 @@ quiescence_proven = False
 input_open = False
 group_term_sent_at = None
 try:
+    public_stdout_details = os.fstat(1)
+    public_pipe_buf = os.fpathconf(1, "PC_PIPE_BUF")
+    if not stat.S_ISFIFO(public_stdout_details.st_mode) or public_pipe_buf < 256:
+        raise OSError
     payload = read_verified_script()
     private_root, private_expected = create_private_root()
     environment = {
