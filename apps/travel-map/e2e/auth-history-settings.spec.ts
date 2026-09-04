@@ -350,6 +350,7 @@ test("history detail returns keyboard focus to the visible history row", async (
   await page.getByRole("button", { name: "계산 이력" }).click();
   const detailButton = page.getByRole("button", { name: "상세 보기" }).first();
   await detailButton.click();
+  await expect(page.getByRole("dialog", { name: "저장 당시 계산 상세" })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog", { name: "계산 이력" })).toBeVisible();
   await expect(detailButton).toBeFocused();
