@@ -8117,28 +8117,297 @@ exit 0"""
         for path, expected in root_identities:
             assert not path.exists(), "production did not clean after recovery"
     finally:
-        fault_disable.touch()
-        if (
-            child_identity is not None
-            and _read_process_table().get(child_identity.pid) == child_identity
-        ):
-            os.kill(child_identity.pid, signal.SIGKILL)
-        if process.poll() is None:
-            _kill_publisher_process_groups(
-                _publisher_process_groups_for_fixture(process_identity)
+        body_error = sys.exception()
+        cleanup_error: Exception | None = None
+
+        def close_pipe(pipe) -> None:
+            nonlocal cleanup_error
+            if pipe is None:
+                return
+            try:
+                pipe.close()
+            except Exception as error:  # noqa: BLE001 - preserve first failure
+                if cleanup_error is None:
+                    cleanup_error = error
+
+        try:
+            try:
+                fault_disable.touch()
+                if (
+                    child_identity is not None
+                    and _read_process_table().get(child_identity.pid) == child_identity
+                ):
+                    os.kill(child_identity.pid, signal.SIGKILL)
+                if process.poll() is None:
+                    _kill_publisher_process_groups(
+                        _publisher_process_groups_for_fixture(process_identity)
+                    )
+                    if (
+                        process.poll() is None
+                        and _read_process_table().get(process.pid) == process_identity
+                    ):
+                        process.kill()
+                    process.wait(timeout=5)
+                for marker, prefix in (
+                    (private_marker, "travel-map-publish-environment."),
+                    (launcher_marker, "travel-map-publish-launcher."),
+                ):
+                    if marker.is_file() and marker.read_text(encoding="ascii").strip():
+                        _cleanup_recorded_root(marker, prefix)
+            except Exception as error:  # noqa: BLE001 - preserve the body failure
+                cleanup_error = error
+        finally:
+            try:
+                close_pipe(process.stdout)
+            finally:
+                close_pipe(process.stderr)
+        if body_error is None and cleanup_error is not None:
+            raise cleanup_error
+
+
+@pytest.mark.parametrize(
+    (
+        "body_timeout",
+        "stdout_close_failure",
+        "base_exception_failure",
+        "safety_base_exception_failure",
+    ),
+    (
+        (True, False, None, None),
+        (True, True, None, None),
+        (False, False, None, None),
+        (False, False, "cleanup", None),
+        (False, True, "stdout", None),
+        (True, False, None, "poll"),
+        (True, True, None, "first-root"),
+    ),
+    ids=(
+        "cleanup-preserves-timeout",
+        "close-preserves-timeout",
+        "cleanup-surfaces",
+        "cleanup-base-exception-closes-pipes",
+        "stdout-base-exception-closes-stderr",
+        "safety-poll-base-exception-continues-cleanup",
+        "safety-first-root-base-exception-cleans-second-root",
+    ),
+)
+def test_post_leader_cleanup_preserves_errors_and_closes_pipes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body_timeout: bool,
+    stdout_close_failure: bool,
+    base_exception_failure: str | None,
+    safety_base_exception_failure: str | None,
+) -> None:
+    class InjectedCleanupInterrupt(BaseException):
+        pass
+
+    real_cleanup = _cleanup_recorded_root
+    real_communicate = subprocess.Popen.communicate
+    real_wait = subprocess.Popen.wait
+    timed_out_process: subprocess.Popen[str] | None = None
+    stdout_stream: io.TextIOWrapper | None = None
+    stderr_stream: io.TextIOWrapper | None = None
+    close_attempts: list[str] = []
+    safety_attempts: list[str] = []
+    root_cleanup_failure_seen = False
+    injected_interrupt = InjectedCleanupInterrupt(
+        base_exception_failure or safety_base_exception_failure
+    )
+
+    def timeout_once(
+        process: subprocess.Popen[str],
+        input: str | None = None,
+        timeout: float | None = None,
+    ) -> tuple[str, str]:
+        nonlocal stderr_stream, stdout_stream, timed_out_process
+        if timeout == 20 and timed_out_process is None:
+            timed_out_process = process
+            assert isinstance(process.stdout, io.TextIOWrapper)
+            assert isinstance(process.stderr, io.TextIOWrapper)
+            stdout_stream = process.stdout
+            stderr_stream = process.stderr
+            result = (
+                None
+                if body_timeout
+                else real_communicate(process, input=input, timeout=timeout)
             )
-            if (
-                process.poll() is None
-                and _read_process_table().get(process.pid) == process_identity
-            ):
-                process.kill()
-            process.wait(timeout=5)
-        for marker, prefix in (
-            (private_marker, "travel-map-publish-environment."),
-            (launcher_marker, "travel-map-publish-launcher."),
-        ):
-            if marker.is_file() and marker.read_text(encoding="ascii").strip():
-                _cleanup_recorded_root(marker, prefix)
+
+            def close_stdout() -> None:
+                close_attempts.append("stdout")
+                assert stdout_stream is not None
+                stdout_stream.close()
+                if stdout_close_failure:
+                    if base_exception_failure == "stdout":
+                        raise injected_interrupt
+                    raise OSError("injected stdout close failure")
+
+            def close_stderr() -> None:
+                close_attempts.append("stderr")
+                assert stderr_stream is not None
+                stderr_stream.close()
+
+            process.stdout = SimpleNamespace(close=close_stdout)
+            process.stderr = SimpleNamespace(close=close_stderr)
+            if body_timeout:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            assert result is not None
+            return result
+        return real_communicate(process, input=input, timeout=timeout)
+
+    def fail_root_cleanup_once(marker: Path, prefix: str) -> Path:
+        nonlocal root_cleanup_failure_seen
+        root = real_cleanup(marker, prefix)
+        if not stdout_close_failure and not root_cleanup_failure_seen:
+            root_cleanup_failure_seen = True
+            if base_exception_failure == "cleanup":
+                raise injected_interrupt
+            raise OSError("injected cleanup failure")
+        return root
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", timeout_once)
+    monkeypatch.setattr(
+        sys.modules[__name__], "_cleanup_recorded_root", fail_root_cleanup_once
+    )
+    try:
+        expected_error = (
+            InjectedCleanupInterrupt
+            if base_exception_failure is not None
+            else subprocess.TimeoutExpired
+            if body_timeout
+            else OSError
+        )
+        with pytest.raises(expected_error) as raised:
+            test_publisher_rejects_post_leader_unproven_quiescence(tmp_path, "empty")
+        if base_exception_failure is not None:
+            assert raised.value is injected_interrupt
+        elif body_timeout:
+            assert isinstance(raised.value, subprocess.TimeoutExpired)
+            assert raised.value.timeout == 20
+        else:
+            assert str(raised.value) == "injected cleanup failure"
+        assert timed_out_process is not None
+        assert close_attempts == ["stdout", "stderr"]
+        assert stdout_stream is not None and stdout_stream.closed
+        assert stderr_stream is not None and stderr_stream.closed
+        assert root_cleanup_failure_seen == (not stdout_close_failure)
+    finally:
+        primary_error = sys.exception()
+
+        def run_safety_cleanup() -> None:
+            safety_error: Exception | None = None
+
+            def safely(action) -> None:
+                nonlocal safety_error
+                try:
+                    action()
+                except Exception as error:  # noqa: BLE001 - continue exact cleanup
+                    if safety_error is None:
+                        safety_error = error
+
+            try:
+                if timed_out_process is not None:
+                    process_running = True
+
+                    def observe_process() -> None:
+                        nonlocal process_running
+                        safety_attempts.append("poll")
+                        if safety_base_exception_failure == "poll":
+                            raise injected_interrupt
+                        process_running = timed_out_process.poll() is None
+
+                    def kill_process() -> None:
+                        safety_attempts.append("kill")
+                        timed_out_process.kill()
+
+                    def wait_process() -> None:
+                        safety_attempts.append("wait")
+                        real_wait(timed_out_process, timeout=5)
+
+                    try:
+                        safely(observe_process)
+                    finally:
+                        try:
+                            if process_running:
+                                safely(kill_process)
+                        finally:
+                            safely(wait_process)
+            finally:
+                try:
+                    try:
+                        if stdout_stream is not None:
+                            safety_attempts.append("stdout")
+                            safely(stdout_stream.close)
+                    finally:
+                        if stderr_stream is not None:
+                            safety_attempts.append("stderr")
+                            safely(stderr_stream.close)
+                finally:
+
+                    def cleanup_recorded_root(
+                        marker: Path, prefix: str, attempt: str
+                    ) -> None:
+                        if (
+                            marker.is_file()
+                            and marker.read_text(encoding="ascii").strip()
+                        ):
+
+                            def cleanup_root(
+                                marker: Path = marker,
+                                prefix: str = prefix,
+                                attempt: str = attempt,
+                            ) -> None:
+                                safety_attempts.append(attempt)
+                                real_cleanup(marker, prefix)
+                                if (
+                                    safety_base_exception_failure == "first-root"
+                                    and attempt == "private-root"
+                                ):
+                                    raise injected_interrupt
+
+                            safely(cleanup_root)
+
+                    try:
+                        cleanup_recorded_root(
+                            tmp_path / "post-leader-empty.private-root",
+                            "travel-map-publish-environment.",
+                            "private-root",
+                        )
+                    finally:
+                        cleanup_recorded_root(
+                            tmp_path / "post-leader-empty.launcher-root",
+                            "travel-map-publish-launcher.",
+                            "launcher-root",
+                        )
+            if primary_error is None and safety_error is not None:
+                raise safety_error
+
+        if safety_base_exception_failure is None:
+            run_safety_cleanup()
+        else:
+            with pytest.raises(InjectedCleanupInterrupt) as safety_raised:
+                run_safety_cleanup()
+            assert safety_raised.value is injected_interrupt
+            if safety_base_exception_failure == "poll":
+                assert safety_attempts[:5] == [
+                    "poll",
+                    "kill",
+                    "wait",
+                    "stdout",
+                    "stderr",
+                ]
+            else:
+                assert [
+                    attempt
+                    for attempt in safety_attempts
+                    if attempt in {"private-root", "launcher-root"}
+                ] == [
+                    "private-root",
+                    "launcher-root",
+                ]
+
+    assert timed_out_process is not None
+    assert timed_out_process.returncode is not None
 
 
 def test_publisher_top_owner_rejects_truncated_group_snapshot_before_cleanup(
