@@ -469,6 +469,52 @@ class OwnedProcessTree:
     diagnostic: str
 
 
+def _refresh_reparented_process_identity(
+    original: ProcessIdentity,
+    current: ProcessIdentity | None,
+) -> ProcessIdentity | None:
+    if current is None or (
+        current.pid,
+        current.pgid,
+        current.lstart,
+    ) != (
+        original.pid,
+        original.pgid,
+        original.lstart,
+    ):
+        return None
+    return current
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        ProcessIdentity(43100, 1, 43101, "Fri Sep  4 16:00:00 2026"),
+        ProcessIdentity(43100, 1, 43100, "Fri Sep  4 16:00:01 2026"),
+    ),
+    ids=("changed-group", "changed-start"),
+)
+def test_post_leader_identity_refresh_rejects_reused_pid(
+    replacement: ProcessIdentity,
+) -> None:
+    original = ProcessIdentity(43100, 43099, 43100, "Fri Sep  4 16:00:00 2026")
+    signalled: list[ProcessIdentity] = []
+
+    refreshed = _refresh_reparented_process_identity(original, replacement)
+    if refreshed is not None:
+        signalled.append(refreshed)
+
+    assert refreshed is None, "a reused PID must fail the test rather than false-pass"
+    assert signalled == [], "a reused PID must not gain signal authority"
+
+
+def test_post_leader_identity_refresh_accepts_only_expected_reparent() -> None:
+    original = ProcessIdentity(43100, 43099, 43100, "Fri Sep  4 16:00:00 2026")
+    reparented = ProcessIdentity(43100, 1, 43100, "Fri Sep  4 16:00:00 2026")
+
+    assert _refresh_reparented_process_identity(original, reparented) == reparented
+
+
 def _read_process_table() -> dict[int, ProcessIdentity]:
     completed = subprocess.run(
         ["/bin/ps", "-axo", "pid=,ppid=,pgid=,lstart=,command="],
@@ -8099,6 +8145,11 @@ exit 0"""
             time.sleep(0.05)
         assert process.poll() is None, "publisher exited during post-leader fault"
         assert _read_process_table().get(process_identity.pid) == process_identity
+        child_identity = _refresh_reparented_process_identity(
+            child_identity,
+            _read_process_table().get(child_pid),
+        )
+        assert child_identity is not None
         assert not cleanup_probe.exists(), "cleanup entered without quiescence proof"
         for path, expected in root_identities:
             details = path.stat()
@@ -8924,6 +8975,11 @@ exit 0"""
                 )
             time.sleep(0.05)
         time.sleep(1.0)
+        child_identity = _refresh_reparented_process_identity(
+            child_identity,
+            _read_process_table().get(child_pid),
+        )
+        assert child_identity is not None
         owner_alive_before_release = (
             _read_process_table().get(top_owner_identity.pid) == top_owner_identity
         )
