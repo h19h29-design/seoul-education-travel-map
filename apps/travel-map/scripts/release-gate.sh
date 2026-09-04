@@ -143,7 +143,10 @@ try:
     try:
         candidates = []
         for candidate in os.listdir(parent_descriptor):
-            details = os.stat(candidate, dir_fd=parent_descriptor, follow_symlinks=False)
+            try:
+                details = os.stat(candidate, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
             if (
                 details.st_dev,
                 details.st_ino,
@@ -1475,7 +1478,10 @@ try:
     try:
         candidates = []
         for candidate in os.listdir(parent_descriptor):
-            details = os.stat(candidate, dir_fd=parent_descriptor, follow_symlinks=False)
+            try:
+                details = os.stat(candidate, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
             if (
                 details.st_dev,
                 details.st_ino,
@@ -2445,7 +2451,10 @@ def remove_private_root() -> None:
     try:
         candidates = []
         for candidate in os.listdir(parent_descriptor):
-            details = os.stat(candidate, dir_fd=parent_descriptor, follow_symlinks=False)
+            try:
+                details = os.stat(candidate, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
             if (
                 details.st_dev,
                 details.st_ino,

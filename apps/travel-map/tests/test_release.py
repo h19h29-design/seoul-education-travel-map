@@ -2,14 +2,20 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import runpy
 import shlex
+import signal
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable
 
 import pytest
 from app.contracts import TripPreviewResponse
@@ -1557,9 +1563,15 @@ def test_publish_reviewed_image_uses_one_validated_canonical_lock_root() -> None
     assert "lock_parent=/tmp/travel-map-publish-locks-$publisher_uid" in publish
     assert "publisher_uid=$(/usr/bin/id -u 2>/dev/null)" in publish
     assert "/usr/bin/python3 -I -S" in publish
-    assert '/bin/mkdir -m 0700 "$lock_parent"' in publish
-    assert '(umask 077 && /bin/mkdir "$lock_directory")' in publish
-    assert '/bin/rmdir "$lock_directory"' in publish
+    assert "def create_broker_lock()" in publish
+    arm_body = publish.split("def arm_resource_broker(", 1)[1].split(
+        "\ndef poll_resource_broker", 1
+    )[0]
+    assert "create_broker_lock()" in arm_body
+    assert "precreated_lock_path" in publish
+    assert '/bin/mkdir -m 0700 "$lock_parent"' not in publish
+    assert '(umask 077 && /bin/mkdir "$lock_directory")' not in publish
+    assert '/bin/rmdir "$lock_directory"' not in publish
     assert 'validate_private_directory "$lock_parent"' in publish
     assert "details = Path(sys.argv[1]).lstat()" in publish
     assert "not stat.S_ISDIR(details.st_mode)" in publish
@@ -1584,6 +1596,38 @@ IN_TOTO_LAYER = "application/vnd.in-toto+json"
 def _publisher_socket_path(tmp_path: Path) -> Path:
     suffix = hashlib.sha256(str(tmp_path).encode("utf-8")).hexdigest()[:16]
     return Path("/private/tmp") / f"tm-publisher-{suffix}.sock"
+
+
+def _safe_recorded_root(raw: str, prefixes: tuple[str, ...]) -> Path:
+    root = Path(raw.strip())
+    assert root.is_absolute()
+    assert root.parent in {Path("/tmp"), Path("/private/tmp")}
+    assert root.name.startswith(prefixes)
+    return root
+
+
+def _cleanup_exact_owned_test_root(
+    root: Path,
+    expected: tuple[int, int],
+    *,
+    allowed_parents: set[Path],
+    prefix: str,
+) -> None:
+    assert root.is_absolute()
+    assert root.parent in allowed_parents
+    assert prefix and root.name.startswith(prefix)
+    assert len(expected) == 2
+    try:
+        details = root.lstat()
+    except FileNotFoundError:
+        return
+    if (details.st_dev, details.st_ino) != expected:
+        return
+    assert stat.S_ISDIR(details.st_mode)
+    assert stat.S_IMODE(details.st_mode) == 0o700
+    assert details.st_uid == os.getuid()
+    assert not root.is_symlink()
+    shutil.rmtree(root)
 
 
 def _remote_descriptor(digest: str, media_type: str) -> dict[str, object]:
@@ -2036,6 +2080,17 @@ def _run_publish_reviewed_image(
     expect_success: bool = False,
     record_payload: str | None = None,
     publisher_attack: str | None = None,
+    cleanup_replacement_attack: bool = False,
+    creation_replacement_attack: str | None = None,
+    cleanup_child_replacement_attack: str | None = None,
+    rename_without_replacement_attack: str | None = None,
+    setup_failure: str | None = None,
+    shared_parent_disappearance: Path | None = None,
+    publisher_source_transform: Callable[[str], str] | None = None,
+    publisher_runner: Callable[
+        [list[str], Path, dict[str, str], Path], subprocess.CompletedProcess[str]
+    ]
+    | None = None,
 ) -> subprocess.CompletedProcess[str]:
     ambient_lock_name = git_sha
     repository = tmp_path / "repository"
@@ -2086,6 +2141,316 @@ PY"""
     for original, replacement in replacements.items():
         assert publisher_source.count(original) == 1
         publisher_source = publisher_source.replace(original, replacement, 1)
+    cleanup_replacements = tmp_path / "cleanup-replacements.jsonl"
+    if cleanup_replacement_attack:
+        record_attack = (
+            "    /usr/bin/python3 -I -S - \"$record_parent\" <<'PY'\n"
+            "import json\nimport sys\nfrom pathlib import Path\n\n"
+            "root = Path(sys.argv[1])\n"
+            "owned = root.with_name(root.name + '.owned')\n"
+            "root.rename(owned)\nroot.mkdir(mode=0o700)\n"
+            "(root / 'replacement-marker').write_text('replacement\\n', encoding='ascii')\n"
+            "root_details = root.lstat()\nowned_details = owned.lstat()\n"
+            f"with Path({str(cleanup_replacements)!r}).open('a', encoding='utf-8') as output:\n"
+            "    output.write(json.dumps({'record': str(root), 'record_identity': [root_details.st_dev, root_details.st_ino], 'owned': str(owned), 'owned_identity': [owned_details.st_dev, owned_details.st_ino]}) + '\\n')\n"
+            "PY\n"
+        )
+        record_anchor = '    if [ -n "$record_parent" ]; then\n'
+        assert publisher_source.count(record_anchor) == 1
+        publisher_source = publisher_source.replace(
+            record_anchor, record_attack + record_anchor, 1
+        )
+        outer_attack = (
+            "    if [ -n \"$private_environment\" ] && [ -n \"$launcher_root\" ]; then\n"
+            "    /usr/bin/python3 -I -S - \"$private_environment\" \"$launcher_root\" <<'PY'\n"
+            "import json\nimport sys\nfrom pathlib import Path\n\n"
+            "records = []\n"
+            "for kind, raw in (('private', sys.argv[1]), ('launcher', sys.argv[2])):\n"
+            "    if not raw:\n        continue\n"
+            "    root = Path(raw)\n"
+            "    owned = root.with_name(root.name + '.owned')\n"
+            "    root.rename(owned)\n    root.mkdir(mode=0o700)\n"
+            "    (root / 'replacement-marker').write_text('replacement\\n', encoding='ascii')\n"
+            "    root_details = root.lstat()\n    owned_details = owned.lstat()\n"
+            "    records.append({'kind': kind, 'root': str(root), 'root_identity': [root_details.st_dev, root_details.st_ino], 'owned': str(owned), 'owned_identity': [owned_details.st_dev, owned_details.st_ino]})\n"
+            f"with Path({str(cleanup_replacements)!r}).open('a', encoding='utf-8') as output:\n"
+            "    output.write(json.dumps({'outer': records}) + '\\n')\n"
+            "PY\n"
+            "    fi\n"
+        )
+        if "        private_clean = (\n" in publisher_source:
+            python_outer_attack = (
+                "        import json\n"
+                "        records = []\n"
+                "        for kind, attacked_root in (('private', private_root), ('launcher', root)):\n"
+                "            owned = attacked_root.with_name(attacked_root.name + '.owned')\n"
+                "            attacked_root.rename(owned)\n"
+                "            attacked_root.mkdir(mode=0o700)\n"
+                "            (attacked_root / 'replacement-marker').write_text('replacement\\n', encoding='ascii')\n"
+                "            root_details = attacked_root.lstat()\n"
+                "            owned_details = owned.lstat()\n"
+                "            records.append({'kind': kind, 'root': str(attacked_root), 'root_identity': [root_details.st_dev, root_details.st_ino], 'owned': str(owned), 'owned_identity': [owned_details.st_dev, owned_details.st_ino]})\n"
+                f"        with Path({str(cleanup_replacements)!r}).open('a', encoding='utf-8') as output:\n"
+                "            output.write(json.dumps({'outer': records}) + '\\n')\n"
+            )
+            publisher_source = publisher_source.replace(
+                "        private_clean = (\n",
+                python_outer_attack + "        private_clean = (\n",
+                1,
+            )
+        else:
+            outer_anchor = "cleanup_outer_launcher() {\n    cleanup_status=0\n"
+            assert publisher_source.count(outer_anchor) == 1
+            publisher_source = publisher_source.replace(
+                outer_anchor, outer_anchor + outer_attack, 1
+            )
+    child_replacements = tmp_path / "child-replacements.jsonl"
+    if cleanup_child_replacement_attack is not None:
+        conditions = {
+            "launcher": 'root.name.startswith("travel-map-publish-launcher.") and name == "publish-reviewed-image.sh"',
+            "record": 'root.name.startswith("travel-map-publish.") and name == "docker"',
+        }
+        try:
+            child_condition = conditions[cleanup_child_replacement_attack]
+        except KeyError as error:
+            raise ValueError("unknown cleanup child replacement attack") from error
+        if cleanup_child_replacement_attack == "record" and (
+            "def remove_broker_entry(" in publisher_source
+        ):
+            record_root_marker = tmp_path / "record-child-root"
+            arm_anchor = (
+                "    (\n"
+                "        broker_record_root,\n"
+                "        broker_record_identity,\n"
+                "        broker_lock_path,\n"
+                "        broker_lock_identity,\n"
+                "        broker_lock_parent_identity,\n"
+                "        broker_lock_parent_created,\n"
+                "    ) = arm_resource_broker()\n"
+            )
+            assert publisher_source.count(arm_anchor) == 1
+            publisher_source = publisher_source.replace(
+                arm_anchor,
+                arm_anchor
+                + f"    Path({str(record_root_marker)!r}).write_text(broker_record_root + '\\n', encoding='ascii')\n",
+                1,
+            )
+            removal_start = publisher_source.index("def remove_broker_entry(")
+            removal_end = publisher_source.index(
+                "\n\ndef remove_broker_contents", removal_start
+            )
+            removal_body = publisher_source[removal_start:removal_end]
+            child_anchor = (
+                "        details = os.stat(name, dir_fd=quarantine_fd, "
+                "follow_symlinks=False)\n"
+            )
+            child_attack = textwrap.indent(
+                (
+                    f"if name == 'docker' and not Path({str(child_replacements)!r}).exists():\n"
+                    "    import json\n"
+                    f"    root = Path(Path({str(record_root_marker)!r}).read_text(encoding='ascii').strip())\n"
+                    "    displaced_name = '.child-displaced-' + name\n"
+                    "    os.rename(name, displaced_name, src_dir_fd=quarantine_fd, dst_dir_fd=quarantine_fd)\n"
+                    "    replacement = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=quarantine_fd)\n"
+                    "    try:\n        os.write(replacement, b'replacement\\n')\n"
+                    "    finally:\n        os.close(replacement)\n"
+                    f"    with Path({str(child_replacements)!r}).open('a', encoding='utf-8') as output:\n"
+                    "        output.write(json.dumps({'root': str(root), 'name': name, 'displaced': displaced_name}) + '\\n')\n"
+                ),
+                " " * 8,
+            )
+            assert removal_body.count(child_anchor) == 1
+            publisher_source = (
+                publisher_source[:removal_start]
+                + removal_body.replace(child_anchor, child_anchor + child_attack, 1)
+                + publisher_source[removal_end:]
+            )
+        elif cleanup_child_replacement_attack == "launcher" and (
+            "        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)\n"
+            in publisher_source
+        ):
+            child_anchor = (
+                "        details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)\n"
+            )
+            child_attack = textwrap.indent(
+                (
+                    f"if name == 'publish-reviewed-image.sh' and not Path({str(child_replacements)!r}).exists():\n"
+                    "    import json\n"
+                    "    displaced_name = '.child-displaced-' + name\n"
+                    "    os.rename(name, displaced_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)\n"
+                    "    replacement = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory_fd)\n"
+                    "    try:\n        os.write(replacement, b'replacement\\n')\n"
+                    "    finally:\n        os.close(replacement)\n"
+                    f"    with Path({str(child_replacements)!r}).open('a', encoding='utf-8') as output:\n"
+                    "        output.write(json.dumps({'root': str(root), 'name': name, 'displaced': displaced_name}) + '\\n')\n"
+                ),
+                " " * 8,
+            )
+        else:
+            child_anchor = (
+                "        details = os.stat(name, dir_fd=descriptor, "
+                "follow_symlinks=False)\n"
+            )
+            child_attack = textwrap.indent(
+                (
+                    f"if {child_condition} and not Path({str(child_replacements)!r}).exists():\n"
+                    "    import json\n"
+                    "    displaced_name = '.child-displaced-' + name\n"
+                    "    os.rename(name, displaced_name, src_dir_fd=descriptor, dst_dir_fd=descriptor)\n"
+                    "    replacement = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=descriptor)\n"
+                    "    try:\n        os.write(replacement, b'replacement\\n')\n"
+                    "    finally:\n        os.close(replacement)\n"
+                    f"    with Path({str(child_replacements)!r}).open('a', encoding='utf-8') as output:\n"
+                    "        output.write(json.dumps({'root': str(root), 'name': name, 'displaced': displaced_name}) + '\\n')\n"
+                ),
+                " " * 8,
+            )
+        assert publisher_source.count(child_anchor) >= 1
+        publisher_source = publisher_source.replace(
+            child_anchor, child_anchor + child_attack, 1
+        )
+    creation_replacements = tmp_path / "creation-replacements.jsonl"
+    if creation_replacement_attack is not None:
+        anchors = {
+            "launcher": (
+                '                [ -n "$launcher_root" ] && [ -n "$launcher_root_identity" ] \\\n'
+                "                    || blocked 'BLOCKED_INVALID_PUBLISH_CONTEXT'\n",
+                '"$launcher_root"',
+                "                ",
+            ),
+            "environment": (
+                '        [ -n "$private_environment" ] && [ -n "$private_environment_identity" ] \\\n'
+                "            || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n",
+                '"$private_environment"',
+                "        ",
+            ),
+            "record": (
+                '[ -n "$record_parent" ] && [ -n "$record_parent_identity" ] \\\n'
+                "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n",
+                '"$record_parent"',
+                "",
+            ),
+        }
+        try:
+            creation_anchor, root_variable, indentation = anchors[creation_replacement_attack]
+        except KeyError as error:
+            raise ValueError("unknown creation replacement attack") from error
+        assert publisher_source.count(creation_anchor) == 1
+        creation_attack = (
+            f"{indentation}/usr/bin/python3 -I -S - {root_variable} <<'PY'\n"
+            "import json\nimport sys\nfrom pathlib import Path\n\n"
+            "root = Path(sys.argv[1])\n"
+            "displaced = root.with_name(root.name + '.displaced')\n"
+            "root.rename(displaced)\nroot.mkdir(mode=0o700)\n"
+            "(root / 'replacement-marker').write_text('replacement\\n', encoding='ascii')\n"
+            f"with Path({str(creation_replacements)!r}).open('a', encoding='utf-8') as output:\n"
+            "    output.write(json.dumps({'root': str(root), 'displaced': str(displaced)}) + '\\n')\n"
+            "PY\n"
+        )
+        publisher_source = publisher_source.replace(
+            creation_anchor, creation_anchor + creation_attack, 1
+        )
+    rename_records = tmp_path / "rename-without-replacement.jsonl"
+    if rename_without_replacement_attack is not None:
+        rename_anchors = {
+            "launcher": (
+                '                [ -n "$launcher_root" ] && [ -n "$launcher_root_identity" ] \\\n'
+                "                    || blocked 'BLOCKED_INVALID_PUBLISH_CONTEXT'\n",
+                "$launcher_root",
+            ),
+            "environment": (
+                '        [ -n "$private_environment" ] && [ -n "$private_environment_identity" ] \\\n'
+                "            || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n",
+                "$private_environment",
+            ),
+            "record": (
+                '[ -n "$record_parent" ] && [ -n "$record_parent_identity" ] \\\n'
+                "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n",
+                "$record_parent",
+            ),
+        }
+        try:
+            rename_anchor, rename_variable = rename_anchors[rename_without_replacement_attack]
+        except KeyError as error:
+            raise ValueError("unknown rename attack") from error
+        assert publisher_source.count(rename_anchor) == 1
+        rename_attack = (
+            f"/bin/mv {rename_variable} {rename_variable}.renamed\n"
+            f"/usr/bin/printf '%s\\n' {rename_variable}.renamed >> {str(rename_records)!r}\n"
+        )
+        publisher_source = publisher_source.replace(
+            rename_anchor, rename_anchor + rename_attack, 1
+        )
+    setup_records = tmp_path / "setup-failure-roots.jsonl"
+    if setup_failure is not None:
+        if setup_failure == "record":
+            setup_anchor = (
+                "    (\n"
+                "        broker_record_root,\n"
+                "        broker_record_identity,\n"
+                "        broker_lock_path,\n"
+                "        broker_lock_identity,\n"
+                "        broker_lock_parent_identity,\n"
+                "        broker_lock_parent_created,\n"
+                "    ) = arm_resource_broker()\n"
+            )
+            setup_attack = (
+                f"    Path({str(setup_records)!r}).write_text(broker_record_root + '\\n', encoding='ascii')\n"
+                "    raise OSError\n"
+            )
+        elif setup_failure == "environment":
+            setup_anchor = (
+                '            "$private_xdg_data" \\\n'
+                "            || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
+            )
+            setup_attack = (
+                f"/usr/bin/printf '%s\\n' $private_environment > {str(setup_records)!r}\n"
+                "exit 2\n"
+            )
+        else:
+            raise ValueError("unknown setup failure")
+        assert publisher_source.count(setup_anchor) == 1
+        publisher_source = publisher_source.replace(
+            setup_anchor, setup_anchor + setup_attack, 1
+        )
+    if shared_parent_disappearance is not None:
+        matching_start = publisher_source.index(
+            "def matching_identity(parent_fd: int, expected: tuple[int, int]) -> list[str]:\n"
+        )
+        matching_end = publisher_source.index("\n\ndef ", matching_start + 1)
+        matching_body = publisher_source[matching_start:matching_end]
+        shared_parent_anchor = (
+            "def matching_identity(parent_fd: int, expected: tuple[int, int]) -> list[str]:\n"
+            "    matches = []\n"
+        )
+        assert matching_body.count(shared_parent_anchor) == 1
+        shared_parent_attack = (
+            "def matching_identity(parent_fd: int, expected: tuple[int, int]) -> list[str]:\n"
+            f"    probe = Path({str(shared_parent_disappearance)!r})\n"
+            "    matches = []\n"
+        )
+        matching_body = matching_body.replace(
+            shared_parent_anchor, shared_parent_attack, 1
+        )
+        loop_anchor = "    for candidate in os.listdir(parent_fd):\n"
+        assert matching_body.count(loop_anchor) == 1
+        matching_body = matching_body.replace(
+            loop_anchor,
+            (
+                loop_anchor
+                +
+                "        if candidate == probe.name:\n"
+                "            os.rmdir(candidate, dir_fd=parent_fd)\n"
+            ),
+            1,
+        )
+        publisher_source = (
+            publisher_source[:matching_start]
+            + matching_body
+            + publisher_source[matching_end:]
+        )
+    if publisher_source_transform is not None:
+        publisher_source = publisher_source_transform(publisher_source)
     publisher.write_text(publisher_source, encoding="utf-8")
     publisher.chmod(0o755)
     subprocess.run(
@@ -2336,7 +2701,9 @@ PY"""
         encoding="utf-8",
     )
 
-    environment = dict(os.environ)
+    # Keep failure tracebacks deterministic and incapable of reproducing host
+    # credentials while still exercising explicit ambient-injection inputs.
+    environment: dict[str, str] = {}
     environment.update(
         {
             "PATH": "/nonexistent",
@@ -2375,8 +2742,7 @@ PY"""
     publisher_socket.chmod(0o600)
     listener.listen(1)
     try:
-        return subprocess.run(
-            [
+        command = [
                 str(publisher),
                 str(approved_record.resolve(strict=True)),
                 image_tag,
@@ -2384,7 +2750,11 @@ PY"""
                 platform,
                 git_sha,
                 approved_record_sha256,
-            ],
+            ]
+        if publisher_runner is not None:
+            return publisher_runner(command, publisher.parents[4], environment, docker_state)
+        return subprocess.run(
+            command,
             check=False,
             capture_output=True,
             text=True,
@@ -2410,7 +2780,6 @@ def test_publish_reviewed_image_accepts_classic_config_digest_identity(
         root_manifest=_image_manifest(image_id),
         expect_success=True,
     )
-
     assert completed.returncode == 0
     assert completed.stdout == _published_reference(tmp_path)
     assert completed.stderr == ""
@@ -2453,6 +2822,225 @@ def test_publish_reviewed_image_runs_approved_private_launcher_copy(
         modes[0]["device"],
         modes[0]["inode"],
     )
+
+
+def test_publish_reviewed_image_preserves_replaced_owned_cleanup_roots(
+    tmp_path: Path,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest(image_id),
+        expect_success=True,
+        cleanup_replacement_attack=True,
+    )
+    replacements = [
+        json.loads(line)
+        for line in (tmp_path / "cleanup-replacements.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(replacements) == 2
+    record = next(item for item in replacements if "record" in item)
+    outer = next(item for item in replacements if "outer" in item)
+    roots = [Path(record["record"])] + [Path(item["root"]) for item in outer["outer"]]
+    cleanup_roots = [
+        (Path(record["record"]), tuple(record["record_identity"])),
+        (Path(record["owned"]), tuple(record["owned_identity"])),
+    ] + [
+        (Path(item[field]), tuple(item[f"{field}_identity"]))
+        for item in outer["outer"]
+        for field in ("root", "owned")
+    ]
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert completed.stderr == ""
+        assert all(
+            root.is_dir() and not root.is_symlink()
+            and (root / "replacement-marker").read_text(encoding="ascii") == "replacement\n"
+            for root in roots
+        )
+    finally:
+        for root, expected in cleanup_roots:
+            prefix = next(
+                candidate
+                for candidate in (
+                    "travel-map-publish.",
+                    "travel-map-publish-environment.",
+                    "travel-map-publish-launcher.",
+                )
+                if root.name.startswith(candidate)
+            )
+            _cleanup_exact_owned_test_root(
+                root,
+                expected,
+                allowed_parents={Path("/tmp"), Path("/private/tmp")},
+                prefix=prefix,
+            )
+
+
+@pytest.mark.parametrize("root_kind", ("launcher", "environment", "record"))
+def test_publish_reviewed_image_binds_private_root_identity_at_creation(
+    tmp_path: Path,
+    root_kind: str,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest(image_id),
+        expect_success=True,
+        creation_replacement_attack=root_kind,
+    )
+    replacement = json.loads(
+        (tmp_path / "creation-replacements.jsonl").read_text(encoding="utf-8")
+    )
+    root = Path(replacement["root"])
+    displaced = Path(replacement["displaced"])
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert (root / "replacement-marker").read_text(encoding="ascii") == "replacement\n"
+        assert not displaced.exists()
+    finally:
+        for cleanup_root in (root, displaced):
+            assert cleanup_root.is_absolute()
+            assert cleanup_root.parent in {Path("/tmp"), Path("/private/tmp")}
+            assert cleanup_root.name.startswith(
+                (
+                    "travel-map-publish-launcher.",
+                    "travel-map-publish-environment.",
+                    "travel-map-publish.",
+                )
+            )
+            if cleanup_root.exists():
+                assert cleanup_root.is_dir() and not cleanup_root.is_symlink()
+                shutil.rmtree(cleanup_root)
+            assert not cleanup_root.exists() and not cleanup_root.is_symlink()
+
+
+@pytest.mark.parametrize("root_kind", ("launcher", "record"))
+def test_publish_reviewed_image_preserves_replaced_cleanup_child(
+    tmp_path: Path,
+    root_kind: str,
+) -> None:
+    image_id = "sha256:" + "a" * 64
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest(image_id),
+        expect_success=True,
+        cleanup_child_replacement_attack=root_kind,
+    )
+    replacement = json.loads(
+        (tmp_path / "child-replacements.jsonl").read_text(encoding="utf-8")
+    )
+    root = Path(replacement["root"])
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        preserved = [
+            child
+            for child in root.rglob(replacement["name"])
+            if child.read_text(encoding="ascii") == "replacement\n"
+        ]
+        assert len(preserved) == 1
+    finally:
+        assert root.is_absolute() and root.parent in {Path("/tmp"), Path("/private/tmp")}
+        assert root.name.startswith(("travel-map-publish.", "travel-map-publish-launcher."))
+        if root.exists():
+            assert root.is_dir() and not root.is_symlink()
+            shutil.rmtree(root)
+        assert not root.exists() and not root.is_symlink()
+
+
+@pytest.mark.parametrize("root_kind", ("launcher", "environment", "record"))
+def test_publish_reviewed_image_cleans_renamed_owned_root_without_replacement(
+    tmp_path: Path,
+    root_kind: str,
+) -> None:
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        rename_without_replacement_attack=root_kind,
+    )
+    renamed = Path(
+        (tmp_path / "rename-without-replacement.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert "Traceback" not in completed.stderr
+        assert not renamed.exists()
+    finally:
+        root = _safe_recorded_root(
+            str(renamed),
+            (
+                "travel-map-publish-launcher.",
+                "travel-map-publish-environment.",
+                "travel-map-publish.",
+            ),
+        )
+        if root.exists():
+            assert root.is_dir() and not root.is_symlink()
+            shutil.rmtree(root)
+        assert not root.exists() and not root.is_symlink()
+
+
+@pytest.mark.parametrize("setup_failure", ("environment", "record"))
+def test_publish_reviewed_image_cleans_root_when_setup_fails(
+    tmp_path: Path,
+    setup_failure: str,
+) -> None:
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        setup_failure=setup_failure,
+    )
+    root = _safe_recorded_root(
+        (tmp_path / "setup-failure-roots.jsonl").read_text(encoding="utf-8"),
+        ("travel-map-publish-environment.", "travel-map-publish."),
+    )
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert "Traceback" not in completed.stderr
+        assert not root.exists()
+    finally:
+        if root.exists():
+            assert root.is_dir() and not root.is_symlink()
+            shutil.rmtree(root)
+        assert not root.exists() and not root.is_symlink()
+
+
+def test_publish_reviewed_image_tolerates_unrelated_parent_entry_disappearing(
+    tmp_path: Path,
+) -> None:
+    probe = Path("/private/tmp") / f"travel-map-publish-unrelated-{os.getpid()}"
+    probe.mkdir(mode=0o700)
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        shared_parent_disappearance=probe,
+        expect_success=True,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == _published_reference(tmp_path)
+    assert completed.stderr == ""
+    assert not probe.exists() and not probe.is_symlink()
 
 
 @pytest.mark.parametrize("publisher_attack", ("dirty", "mode", "assume", "skip"))
@@ -2757,6 +3345,910 @@ def test_publish_reviewed_image_blocks_stale_canonical_lock_without_removing_it(
     finally:
         if lock_directory is not None:
             lock_directory.rmdir()
+
+
+def _assert_publish_not_mutated(tmp_path: Path) -> None:
+    state_path = tmp_path / "docker-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    assert state.get("tag_created", False) is False
+    assert state.get("pushed", False) is False
+
+
+def test_publish_reviewed_image_rejects_renamed_canonical_lock_leaf_after_validation(
+    tmp_path: Path,
+) -> None:
+    """A lock leaf displaced after validation must not authorize publication."""
+    marker = tmp_path / "canonical-lock-leaf-rename.json"
+
+    def transform(source: str) -> str:
+        anchor = (
+            "validate_owned_private_directory \\\n"
+            "    \"$lock_directory\" \"$lock_directory_identity\" \"$lock_parent\" \"$git_sha\" \\\n"
+            "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
+        )
+        assert source.count(anchor) == 1
+        attack = (
+            "/bin/mv \"$lock_directory\" \"$lock_directory.renamed\"\n"
+            f"/usr/bin/printf '%s\\n' \"$lock_directory\" \"$lock_directory.renamed\" > {str(marker)!r}\n"
+        )
+        return source.replace(anchor, anchor + attack, 1)
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        publisher_source_transform=transform,
+    )
+
+    _canonical_raw, renamed_raw = marker.read_text(encoding="ascii").splitlines()
+    renamed = Path(renamed_raw)
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert "Traceback" not in completed.stderr
+        _assert_publish_not_mutated(tmp_path)
+        # The displaced inode is still broker-owned and is reclaimed by identity.
+        assert not renamed.exists()
+    finally:
+        if renamed.exists():
+            renamed.rmdir()
+
+
+def test_publish_reviewed_image_rejects_replaced_canonical_lock_parent_after_validation(
+    tmp_path: Path,
+) -> None:
+    """Replacing the canonical lock parent after its initial check must fail closed."""
+    marker = tmp_path / "canonical-lock-parent-replace.json"
+    canonical_parent = Path(f"/tmp/travel-map-publish-locks-{os.getuid()}")
+    parent_preexisted = canonical_parent.is_dir()
+    preexisting_children = (
+        {child.name for child in canonical_parent.iterdir()}
+        if parent_preexisted
+        else set()
+    )
+
+    def transform(source: str) -> str:
+        anchor = (
+            "validate_owned_private_directory \\\n"
+            "    \"$lock_directory\" \"$lock_directory_identity\" \"$lock_parent\" \"$git_sha\" \\\n"
+            "    || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'\n"
+        )
+        assert source.count(anchor) == 1
+        attack = (
+            "/bin/mv \"$lock_parent\" \"$lock_parent.displaced\"\n"
+            "(umask 077 && /bin/mkdir \"$lock_parent\")\n"
+            "(umask 077 && /bin/mkdir \"$lock_parent/$git_sha\")\n"
+            f"/usr/bin/printf '%s\\n' \"$lock_parent\" \"$lock_parent.displaced\" > {str(marker)!r}\n"
+        )
+        return source.replace(anchor, anchor + attack, 1)
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        publisher_source_transform=transform,
+    )
+
+    replacement_raw, displaced_raw = marker.read_text(encoding="ascii").splitlines()
+    replacement = Path(replacement_raw)
+    displaced = Path(displaced_raw)
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert "Traceback" not in completed.stderr
+        _assert_publish_not_mutated(tmp_path)
+        assert replacement.is_dir() and not replacement.is_symlink()
+        replacement_children = list(replacement.iterdir())
+        assert len(replacement_children) == 1
+        assert replacement_children[0].is_dir()
+        if parent_preexisted:
+            assert displaced.is_dir() and not displaced.is_symlink()
+            assert {child.name for child in displaced.iterdir()} == preexisting_children
+        else:
+            assert not displaced.exists()
+    finally:
+        if replacement.exists():
+            shutil.rmtree(replacement)
+        if parent_preexisted and displaced.exists():
+            displaced.rename(replacement)
+        elif displaced.exists():
+            shutil.rmtree(displaced)
+
+
+def test_publish_reviewed_image_binds_record_creation_to_first_opened_descriptor() -> None:
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
+    body = source.split("def create_broker_directory(", 1)[1].split(
+        "\n\ndef create_broker_lock", 1
+    )[0]
+
+    mkdir_at = body.index("os.mkdir(name, 0o700, dir_fd=parent_fd)")
+    open_at = body.index("descriptor = os.open(", mkdir_at)
+    first_path_stat = body.index("path_details = os.stat(", mkdir_at)
+    assert mkdir_at < open_at < first_path_stat
+    assert "created_expected = descriptor_identity(os.fstat(descriptor))" in body
+
+
+def test_publish_reviewed_image_publishes_preopened_random_lock_parent_no_replace() -> None:
+    source = (ROOT / "deploy/nas/publish-reviewed-image.sh").read_text(
+        encoding="utf-8"
+    )
+    body = source.split("def create_broker_lock()", 1)[1].split(
+        "\n\ndef descriptor_identity", 1
+    )[0]
+
+    assert ".travel-map-lock-parent." in body
+    assert "rename_no_replace(" in body
+    assert "SAME_UID_CREATION_BOUNDARY" in body
+
+
+@pytest.mark.parametrize("broker_kill_phase", ("arm", "tag-armed", "tag-created"))
+def test_publish_reviewed_image_reclaims_resources_when_broker_dies_at_each_phase(
+    tmp_path: Path,
+    broker_kill_phase: str,
+) -> None:
+    """A dead resource broker must revoke all publication authority and resources."""
+    marker = tmp_path / f"broker-killed-{broker_kill_phase}.json"
+
+    def transform(source: str) -> str:
+        arm_anchor = (
+            "    (\n"
+            "        broker_record_root,\n"
+            "        broker_record_identity,\n"
+            "        broker_lock_path,\n"
+            "        broker_lock_identity,\n"
+            "        broker_lock_parent_identity,\n"
+            "        broker_lock_parent_created,\n"
+            "    ) = arm_resource_broker()\n"
+        )
+        assert source.count(arm_anchor) == 1
+        arm_probe = (
+            f"    Path({str(marker)!r}).write_text(\n"
+            "        f'{broker_pid}\\n{broker_record_root}\\n{broker_record_identity}\\n'\n"
+            "        f'{broker_lock_path}\\n{broker_lock_identity}\\n',\n"
+            "        encoding='ascii',\n"
+            "    )\n"
+        )
+        if broker_kill_phase == "arm":
+            arm_probe += (
+                "    os.kill(broker_pid, signal.SIGKILL)\n"
+                "    raise OSError\n"
+            )
+        source = source.replace(arm_anchor, arm_anchor + arm_probe, 1)
+        if broker_kill_phase == "tag-armed":
+            tag_anchor = (
+                "    eval \"exec ${fallback_tag_arm_fd}>&-\"\n"
+                "    fallback_tag_arm_fd=\n"
+                "    eval \"exec ${tag_arm_fd}>&-\"\n"
+                "    tag_arm_fd=\n"
+            )
+            assert source.count(tag_anchor) == 1
+            kill_code = (
+                f"    /usr/bin/python3 -I -S - {str(marker)!r} <<'PY'\n"
+                "import os\n"
+                "import signal\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "broker_pid = int(Path(sys.argv[1]).read_text(encoding='ascii').splitlines()[0])\n"
+                "os.kill(broker_pid, signal.SIGKILL)\n"
+                "PY\n"
+                "    return 1\n"
+            )
+            source = source.replace(
+                tag_anchor,
+                tag_anchor + kill_code,
+                1,
+            )
+        elif broker_kill_phase == "tag-created":
+            tag_anchor = (
+                '    run_docker tag "$image_id" "$tagged" || blocked \'BLOCKED_IMAGE_TAGGING\'\n'
+            )
+            assert source.count(tag_anchor) == 1
+            kill_code = (
+                f"    /usr/bin/python3 -I -S - {str(marker)!r} <<'PY'\n"
+                "import os\n"
+                "import signal\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "broker_pid = int(Path(sys.argv[1]).read_text(encoding='ascii').splitlines()[0])\n"
+                "os.kill(broker_pid, signal.SIGKILL)\n"
+                "PY\n"
+                "    exit 2\n"
+            )
+            source = source.replace(tag_anchor, tag_anchor + kill_code, 1)
+        return source
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        publisher_source_transform=transform,
+    )
+
+    broker_pid_raw, record_raw, record_identity_raw, lock_raw, lock_identity_raw = marker.read_text(
+        encoding="ascii"
+    ).splitlines()
+    broker_pid = int(broker_pid_raw)
+    record_path = Path(record_raw)
+    record_identity = tuple(int(part) for part in record_identity_raw.split(":"))
+    lock_path = Path(lock_raw)
+    lock_identity = tuple(int(part) for part in lock_identity_raw.split(":"))
+    assert re.fullmatch(r"[0-9a-f]{40}", lock_path.name) is not None
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert "Traceback" not in completed.stderr
+        state_path = tmp_path / "docker-state.json"
+        state = (
+            json.loads(state_path.read_text(encoding="utf-8"))
+            if state_path.exists()
+            else {}
+        )
+        assert state.get("pushed", False) is False
+        assert state.get("tagged", False) is False
+        assert state.get("tag_created", False) is (
+            broker_kill_phase == "tag-created"
+        )
+        assert not record_path.exists()
+        assert not lock_path.exists()
+        with pytest.raises(ProcessLookupError):
+            os.kill(broker_pid, 0)
+    finally:
+        _cleanup_exact_owned_test_root(
+            record_path,
+            record_identity,
+            allowed_parents={Path("/tmp"), Path("/private/tmp")},
+            prefix="travel-map-publish.",
+        )
+        _cleanup_exact_owned_test_root(
+            lock_path,
+            lock_identity,
+            allowed_parents={Path(f"/tmp/travel-map-publish-locks-{os.getuid()}")},
+            prefix=lock_path.name,
+        )
+
+
+@pytest.mark.parametrize("broker_prearm_kill_point", ("record", "lock"))
+def test_publish_reviewed_image_reclaims_prearm_broker_resources(
+    tmp_path: Path,
+    broker_prearm_kill_point: str,
+) -> None:
+    """A broker dying before ARM must not strand either resource it created."""
+    marker = tmp_path / f"broker-prearm-{broker_prearm_kill_point}.txt"
+
+    def transform(source: str) -> str:
+        record_anchor = (
+            "    record_root = precreated_record_root\n"
+            "    record_expected = precreated_record_expected\n"
+        )
+        assert source.count(record_anchor) == 1
+        if broker_prearm_kill_point == "record":
+            probe = (
+                f"    Path({str(marker)!r}).write_text(\n"
+                "        f'{record_root}\\n{record_expected[0]}:{record_expected[1]}\\n',\n"
+                "        encoding='ascii',\n"
+                "    )\n"
+                "    os._exit(79)\n"
+            )
+            return source.replace(record_anchor, record_anchor + probe, 1)
+
+        lock_anchor = (
+            "    lock_path = precreated_lock_path\n"
+            "    lock_expected = precreated_lock_expected\n"
+            "    lock_parent_expected = precreated_lock_parent_expected\n"
+            "    lock_parent_created = precreated_lock_parent_created\n"
+        )
+        assert source.count(lock_anchor) == 1
+        probe = (
+            f"    Path({str(marker)!r}).write_text(\n"
+            "        f'{record_root}\\n{record_expected[0]}:{record_expected[1]}\\n'\n"
+            "        f'{lock_path}\\n{lock_expected[0]}:{lock_expected[1]}\\n',\n"
+            "        encoding='ascii',\n"
+            "    )\n"
+            "    os._exit(79)\n"
+        )
+        return source.replace(lock_anchor, lock_anchor + probe, 1)
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        publisher_source_transform=transform,
+    )
+
+    fields = marker.read_text(encoding="ascii").splitlines()
+    assert len(fields) in {2, 4}
+    record_path = Path(fields[0])
+    record_identity = tuple(int(part) for part in fields[1].split(":"))
+    lock_path = Path(fields[2]) if len(fields) == 4 else None
+    lock_identity = (
+        tuple(int(part) for part in fields[3].split(":"))
+        if len(fields) == 4
+        else None
+    )
+
+    def identity_exists(parent: Path, expected: tuple[int, ...]) -> bool:
+        try:
+            entries = parent.iterdir()
+        except FileNotFoundError:
+            return False
+        for entry in entries:
+            try:
+                details = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if (details.st_dev, details.st_ino) == expected:
+                return True
+        return False
+
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert "Traceback" not in completed.stderr
+        assert not record_path.exists()
+        assert not identity_exists(record_path.parent, record_identity)
+        with pytest.raises(FileNotFoundError):
+            os.stat(record_path, follow_symlinks=False)
+        if lock_path is not None and lock_identity is not None:
+            assert not lock_path.exists()
+            assert not identity_exists(lock_path.parent, lock_identity)
+            with pytest.raises(FileNotFoundError):
+                os.stat(lock_path, follow_symlinks=False)
+    finally:
+        for path in (record_path, lock_path):
+            if path is not None and path.exists() and path.is_dir():
+                shutil.rmtree(path)
+
+
+def test_publish_reviewed_image_rejects_broker_record_hardlink_cleanup(
+    tmp_path: Path,
+) -> None:
+    external_link = tmp_path / "broker-record-hardlink"
+    record_marker = tmp_path / "broker-record-root"
+
+    def transform(source: str) -> str:
+        arm_anchor = (
+            "    (\n"
+            "        broker_record_root,\n"
+            "        broker_record_identity,\n"
+            "        broker_lock_path,\n"
+            "        broker_lock_identity,\n"
+            "        broker_lock_parent_identity,\n"
+            "        broker_lock_parent_created,\n"
+            "    ) = arm_resource_broker()\n"
+        )
+        assert source.count(arm_anchor) == 1
+        source = source.replace(
+            arm_anchor,
+            arm_anchor
+            + f"    Path({str(record_marker)!r}).write_text(broker_record_root + '\\n', encoding='ascii')\n",
+            1,
+        )
+        start = source.index("def remove_broker_entry(")
+        end = source.index("\n\ndef remove_broker_contents", start)
+        body = source[start:end]
+        anchor = (
+            "        else:\n"
+            "            final = os.stat(name, dir_fd=quarantine_fd, follow_symlinks=False)\n"
+        )
+        assert body.count(anchor) == 1
+        injection = (
+            "        else:\n"
+            "            if name == 'docker' and not "
+            f"Path({str(external_link)!r}).exists():\n"
+            "                os.link(\n"
+            "                    name,\n"
+            f"                    {str(external_link)!r},\n"
+            "                    src_dir_fd=quarantine_fd,\n"
+            "                    follow_symlinks=False,\n"
+            "                )\n"
+            "            final = os.stat(name, dir_fd=quarantine_fd, follow_symlinks=False)\n"
+        )
+        return source[:start] + body.replace(anchor, injection, 1) + source[end:]
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        expect_success=True,
+        publisher_source_transform=transform,
+    )
+    record_root = Path(record_marker.read_text(encoding="ascii").strip())
+
+    try:
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert "Traceback" not in completed.stderr
+        assert external_link.is_file() and not external_link.is_symlink()
+        assert record_root.is_dir() and not record_root.is_symlink()
+    finally:
+        external_link.unlink(missing_ok=True)
+        if record_root.exists():
+            shutil.rmtree(record_root)
+
+
+@pytest.mark.parametrize(
+    "observation_fault",
+    ("observer-construction", "ps-nonzero", "ps-malformed"),
+)
+def test_publish_reviewed_image_quiesces_descendant_before_broker_fault_cleanup(
+    tmp_path: Path,
+    observation_fault: str,
+) -> None:
+    child_marker = tmp_path / f"broker-{observation_fault}.child"
+    cleanup_probe = tmp_path / f"broker-{observation_fault}.cleanup"
+
+    def transform(source: str) -> str:
+        tag_anchor = "    owns_tagged=1\n"
+        assert source.count(tag_anchor) == 1
+        child_body = textwrap.dedent(
+            f"""
+            /usr/bin/python3 -I -S - <<'PY' >/dev/null 2>&1 &
+            import os
+            import signal
+            import time
+            from pathlib import Path
+
+            for handled in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+                signal.signal(handled, signal.SIG_IGN)
+            Path({str(child_marker)!r}).write_text(str(os.getpid()) + "\\n", encoding="ascii")
+            while True:
+                time.sleep(1)
+            PY
+            child_ticks=0
+            while [ ! -s {str(child_marker)!r} ]; do
+                [ "$child_ticks" -lt 1000 ] || exit 2
+                /bin/sleep 0.01
+                child_ticks=$((child_ticks + 1))
+            done
+            """
+        )
+        source = source.replace(tag_anchor, tag_anchor + child_body, 1)
+
+        cleanup_start = source.index("def cleanup_broker_directory(")
+        cleanup_end = source.index("\n\ndef cleanup_broker_lock", cleanup_start)
+        cleanup_body = source[cleanup_start:cleanup_end]
+        cleanup_anchor = ") -> bool:\n    if path.parent != parent or not path.name.startswith(prefix):\n"
+        assert cleanup_body.count(cleanup_anchor) == 1
+        cleanup_injection = (
+            ") -> bool:\n"
+            "    if prefix == 'travel-map-publish.' and not "
+            f"Path({str(cleanup_probe)!r}).exists() and "
+            f"Path({str(child_marker)!r}).is_file():\n"
+            f"        child_pid = int(Path({str(child_marker)!r}).read_text(encoding='ascii'))\n"
+            "        try:\n"
+            "            os.kill(child_pid, 0)\n"
+            "        except ProcessLookupError:\n"
+            "            child_state = 'gone'\n"
+            "        else:\n"
+            "            child_state = 'alive'\n"
+            f"        Path({str(cleanup_probe)!r}).write_text(child_state + '\\n', encoding='ascii')\n"
+            "    if path.parent != parent or not path.name.startswith(prefix):\n"
+        )
+        source = (
+            source[:cleanup_start]
+            + cleanup_body.replace(cleanup_anchor, cleanup_injection, 1)
+            + source[cleanup_end:]
+        )
+
+        if observation_fault == "observer-construction":
+            observer_start = source.index("class BrokerExitObserver:")
+            observer_end = source.index("\n\ndef extend_broker_owned_tree", observer_start)
+            observer_body = source[observer_start:observer_end]
+            observer_anchor = (
+                "    def __init__(self, pid: int):\n"
+                "        self.pid = pid\n"
+            )
+            assert observer_body.count(observer_anchor) == 1
+            observer_injection = (
+                "    def __init__(self, pid: int):\n"
+                "        self.pid = pid\n"
+                "        deadline = time.monotonic() + 60\n"
+                f"        while not Path({str(child_marker)!r}).is_file():\n"
+                "            if time.monotonic() >= deadline:\n"
+                "                raise OSError\n"
+                "            time.sleep(0.01)\n"
+                "        raise OSError\n"
+            )
+            source = (
+                source[:observer_start]
+                + observer_body.replace(observer_anchor, observer_injection, 1)
+                + source[observer_end:]
+            )
+        else:
+            table_start = source.index("def broker_process_table()")
+            table_end = source.index("\n\ndef broker_stable_identity", table_start)
+            table_body = source[table_start:table_end]
+            table_anchor = (
+                "            if completed.returncode != 0:\n"
+                "                raise OSError\n"
+            )
+            assert table_body.count(table_anchor) == 1
+            replacement = (
+                "            fault_attempts = globals().get(\n"
+                "                'broker_observation_fault_attempts', 3\n"
+                "            )\n"
+                f"            if Path({str(child_marker)!r}).is_file() and fault_attempts:\n"
+                "                globals()['broker_observation_fault_attempts'] = (\n"
+                "                    fault_attempts - 1\n"
+                "                )\n"
+                + (
+                    "                completed = subprocess.CompletedProcess(completed.args, 1, b'')\n"
+                    if observation_fault == "ps-nonzero"
+                    else "                completed = subprocess.CompletedProcess(completed.args, 0, b'malformed\\n')\n"
+                )
+                + table_anchor
+            )
+            source = (
+                source[:table_start]
+                + table_body.replace(table_anchor, replacement, 1)
+                + source[table_end:]
+            )
+        return source
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        publisher_source_transform=transform,
+    )
+
+    child_pid = int(child_marker.read_text(encoding="ascii"))
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert "Traceback" not in completed.stderr
+    assert cleanup_probe.read_text(encoding="ascii") == "gone\n"
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+def test_publish_reviewed_image_rejects_empty_broker_process_snapshot(
+    tmp_path: Path,
+) -> None:
+    """An empty successful ps snapshot cannot authorize broker cleanup."""
+    child_marker = tmp_path / "broker-empty-ps.child"
+    fault_disable_marker = tmp_path / "broker-empty-ps.disable"
+    observation_marker = tmp_path / "broker-empty-ps.observed"
+    cleanup_probe = tmp_path / "broker-empty-ps.cleanup"
+    resource_marker = tmp_path / "broker-empty-ps.resources"
+
+    def transform(source: str) -> str:
+        tag_anchor = "    owns_tagged=1\n"
+        assert source.count(tag_anchor) == 1
+        child_body = textwrap.dedent(
+            f"""
+            /usr/bin/python3 -I -S - <<'PY' >/dev/null 2>&1 &
+            import os
+            import signal
+            import time
+            from pathlib import Path
+
+            for handled in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+                signal.signal(handled, signal.SIG_IGN)
+            Path({str(child_marker)!r}).write_text(str(os.getpid()) + "\\n", encoding="ascii")
+            while True:
+                time.sleep(1)
+            PY
+            child_ticks=0
+            while [ ! -s {str(child_marker)!r} ]; do
+                [ "$child_ticks" -lt 1000 ] || exit 2
+                /bin/sleep 0.01
+                child_ticks=$((child_ticks + 1))
+            done
+            """
+        )
+        source = source.replace(tag_anchor, tag_anchor + child_body, 1)
+
+        resource_anchor = (
+            "    lock_path = precreated_lock_path\n"
+            "    lock_expected = precreated_lock_expected\n"
+            "    lock_parent_expected = precreated_lock_parent_expected\n"
+            "    lock_parent_created = precreated_lock_parent_created\n"
+        )
+        assert source.count(resource_anchor) == 1
+        resource_probe = (
+            f"    Path({str(resource_marker)!r}).write_text(\n"
+            "        f'{record_root}\\n{record_expected[0]}:{record_expected[1]}\\n'\n"
+            "        f'{lock_path}\\n{lock_expected[0]}:{lock_expected[1]}\\n',\n"
+            "        encoding='ascii',\n"
+            "    )\n"
+        )
+        source = source.replace(resource_anchor, resource_anchor + resource_probe, 1)
+
+        table_anchor = (
+            "handled_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)\n"
+        )
+        assert source.count(table_anchor) == 2
+        ps_override = (
+            "real_subprocess_run = subprocess.run\n"
+                "def run_empty_ps_after_child(*args, **kwargs):\n"
+                "    command = args[0] if args else kwargs.get('args', [])\n"
+                f"    if command[:2] == ['/bin/ps', '-axo'] and Path({str(child_marker)!r}).is_file() and not Path({str(fault_disable_marker)!r}).is_file():\n"
+                f"        Path({str(observation_marker)!r}).touch()\n"
+                "        return subprocess.CompletedProcess(command, 0, b'', b'')\n"
+            "    return real_subprocess_run(*args, **kwargs)\n"
+            "subprocess.run = run_empty_ps_after_child\n\n"
+        )
+        source = source[: source.rfind(table_anchor)] + ps_override + source[source.rfind(table_anchor) :]
+
+        cleanup_start = source.index("def cleanup_broker_directory(")
+        cleanup_end = source.index("\n\ndef cleanup_broker_lock", cleanup_start)
+        cleanup_body = source[cleanup_start:cleanup_end]
+        cleanup_anchor = ") -> bool:\n    if path.parent != parent or not path.name.startswith(prefix):\n"
+        assert cleanup_body.count(cleanup_anchor) == 1
+        cleanup_probe_code = (
+            ") -> bool:\n"
+            "    if prefix == 'travel-map-publish.' and not "
+            f"Path({str(cleanup_probe)!r}).exists() and Path({str(child_marker)!r}).is_file():\n"
+            f"        child_pid = int(Path({str(child_marker)!r}).read_text(encoding='ascii'))\n"
+            "        try:\n"
+            "            os.kill(child_pid, 0)\n"
+            "        except ProcessLookupError:\n"
+            "            child_state = 'gone'\n"
+            "        else:\n"
+            "            child_state = 'alive'\n"
+            f"        Path({str(cleanup_probe)!r}).write_text(child_state + '\\n', encoding='ascii')\n"
+            "    if path.parent != parent or not path.name.startswith(prefix):\n"
+        )
+        return source[:cleanup_start] + cleanup_body.replace(
+            cleanup_anchor, cleanup_probe_code, 1
+        ) + source[cleanup_end:]
+
+    def process_identity(pid: int) -> tuple[int, int, int, str]:
+        completed = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,ppid=,pgid=,lstart="],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 8 and fields[0].isdigit() and int(fields[0]) == pid:
+                return (int(fields[0]), int(fields[1]), int(fields[2]), " ".join(fields[3:]))
+        raise AssertionError(f"process identity disappeared for pid {pid}")
+
+    def process_identity_alive(identity: tuple[int, int, int, str]) -> bool:
+        try:
+            return process_identity(identity[0]) == identity
+        except AssertionError:
+            return False
+
+    def resource_identity_alive(path: Path, expected: tuple[int, int]) -> bool:
+        try:
+            entries = tuple(path.parent.iterdir())
+        except FileNotFoundError:
+            return False
+        for entry in entries:
+            try:
+                details = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                (details.st_dev, details.st_ino) == expected
+                and entry.is_dir()
+                and not entry.is_symlink()
+            ):
+                return True
+        return False
+
+    boundary: dict[str, bool] = {}
+
+    def runner(
+        command: list[str],
+        cwd: Path,
+        environment: dict[str, str],
+        state_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        root_identity = process_identity(process.pid)
+        child_identity: tuple[int, int, int, str] | None = None
+        child_pid: int | None = None
+        try:
+            deadline = time.monotonic() + 120
+            while (
+                not resource_marker.is_file()
+                or not child_marker.is_file()
+                or not observation_marker.is_file()
+            ):
+                if process.poll() is not None:
+                    raise AssertionError(
+                        "publisher exited before resource/child markers: "
+                        f"resource={resource_marker.exists()} "
+                        f"child={child_marker.exists()} "
+                        f"observation={observation_marker.exists()} "
+                        f"return={process.returncode}"
+                    )
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        "publisher did not reach empty-ps boundary: "
+                        f"resource={resource_marker.exists()} "
+                        f"child={child_marker.exists()} "
+                        f"observation={observation_marker.exists()} "
+                        f"return={process.poll()}"
+                    )
+                time.sleep(0.02)
+            resource_marker.read_text(encoding="ascii")
+            child_pid = int(child_marker.read_text(encoding="ascii"))
+            child_identity = process_identity(child_pid)
+            fields = resource_marker.read_text(encoding="ascii").splitlines()
+            if len(fields) != 4:
+                raise AssertionError(f"unexpected resource marker: {fields!r}")
+            record_path = Path(fields[0])
+            record_identity = tuple(int(part) for part in fields[1].split(":"))
+            lock_path = Path(fields[2])
+            lock_identity = tuple(int(part) for part in fields[3].split(":"))
+            if len(record_identity) != 2 or len(lock_identity) != 2:
+                raise AssertionError(f"unexpected resource identities: {fields!r}")
+            observation_deadline = time.monotonic() + 0.5
+            while time.monotonic() < observation_deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.02)
+            boundary.update(
+                root_alive=(
+                    process.poll() is None
+                    and process_identity_alive(root_identity)
+                ),
+                child_alive=process_identity_alive(child_identity),
+                record_alive=resource_identity_alive(record_path, record_identity),
+                lock_alive=resource_identity_alive(lock_path, lock_identity),
+                cleanup_absent=not cleanup_probe.exists(),
+            )
+            if child_identity is not None and child_pid is not None:
+                try:
+                    if process_identity_alive(child_identity):
+                        os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            fault_disable_marker.touch()
+            stdout, stderr = process.communicate(timeout=30)
+            boundary["production_cleanup_completed"] = (
+                not resource_identity_alive(record_path, record_identity)
+                and not resource_identity_alive(lock_path, lock_identity)
+            )
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        finally:
+            if child_identity is not None and child_pid is not None:
+                try:
+                    if process_identity_alive(child_identity):
+                        os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None and process_identity_alive(root_identity):
+                process.kill()
+                process.wait(timeout=5)
+
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id="sha256:" + "a" * 64,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest("sha256:" + "a" * 64),
+        publisher_source_transform=transform,
+        publisher_runner=runner,
+    )
+
+    fields = resource_marker.read_text(encoding="ascii").splitlines()
+    assert len(fields) == 4
+    record_path = Path(fields[0])
+    record_identity = tuple(int(part) for part in fields[1].split(":"))
+    lock_path = Path(fields[2])
+    lock_identity = tuple(int(part) for part in fields[3].split(":"))
+    assert re.fullmatch(r"[0-9a-f]{40}", lock_path.name) is not None
+    try:
+        assert boundary == {
+            "root_alive": True,
+            "child_alive": True,
+            "record_alive": True,
+            "lock_alive": True,
+            "cleanup_absent": True,
+            "production_cleanup_completed": True,
+        }
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert "Traceback" not in completed.stderr
+        assert cleanup_probe.read_text(encoding="ascii") == "gone\n"
+    finally:
+        _cleanup_exact_owned_test_root(
+            record_path,
+            record_identity,
+            allowed_parents={Path("/tmp"), Path("/private/tmp")},
+            prefix="travel-map-publish.",
+        )
+        _cleanup_exact_owned_test_root(
+            lock_path,
+            lock_identity,
+            allowed_parents={Path(f"/tmp/travel-map-publish-locks-{os.getuid()}")},
+            prefix=lock_path.name,
+        )
+
+
+def test_release_fixture_exact_root_teardown_preserves_replacement() -> None:
+    owned = Path("/private/tmp") / (
+        f"travel-map-publish.teardown-{os.getpid()}-{time.monotonic_ns()}"
+    )
+    displaced = owned.with_name(owned.name + ".owned")
+    replacement_marker = owned / "replacement-marker"
+    owned.mkdir(mode=0o700)
+    details = owned.lstat()
+    expected = (details.st_dev, details.st_ino)
+    try:
+        owned.rename(displaced)
+        owned.mkdir(mode=0o700)
+        replacement_marker.write_text("replacement\n", encoding="ascii")
+
+        _cleanup_exact_owned_test_root(
+            owned,
+            expected,
+            allowed_parents={Path("/tmp"), Path("/private/tmp")},
+            prefix="travel-map-publish.",
+        )
+
+        assert replacement_marker.read_text(encoding="ascii") == "replacement\n"
+    finally:
+        for root in (owned, displaced):
+            assert root.parent == Path("/private/tmp")
+            assert root.name.startswith("travel-map-publish.teardown-")
+            if root.exists():
+                assert root.is_dir() and not root.is_symlink()
+                shutil.rmtree(root)
+
+
+def test_publish_reviewed_image_retries_one_transient_broker_process_snapshot(
+    tmp_path: Path,
+) -> None:
+    """One transient ps failure must not turn a valid publication into a flaky denial."""
+
+    def transform(source: str) -> str:
+        anchor = (
+            "handled_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)\n"
+        )
+        assert source.count(anchor) == 2
+        injection = (
+            "real_subprocess_run = subprocess.run\n"
+            "transient_ps_failure = True\n\n"
+            "def run_with_one_transient_ps_failure(*args, **kwargs):\n"
+            "    global transient_ps_failure\n"
+            "    command = args[0] if args else kwargs.get('args', [])\n"
+            "    if command[:2] == ['/bin/ps', '-axo'] and transient_ps_failure:\n"
+            "        transient_ps_failure = False\n"
+            "        return subprocess.CompletedProcess(command, 1, b'', b'')\n"
+            "    return real_subprocess_run(*args, **kwargs)\n\n"
+            "subprocess.run = run_with_one_transient_ps_failure\n\n"
+        )
+        position = source.rfind(anchor)
+        return source[:position] + injection + source[position:]
+
+    image_id = "sha256:" + "a" * 64
+    completed = _run_publish_reviewed_image(
+        tmp_path,
+        image_id=image_id,
+        remote_digest="sha256:" + "b" * 64,
+        root_manifest=_image_manifest(image_id),
+        expect_success=True,
+        publisher_source_transform=transform,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == _published_reference(tmp_path)
+    assert completed.stderr == ""
 
 
 def test_publish_reviewed_image_rejects_ambiguous_remote_lookup_before_push(

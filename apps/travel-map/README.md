@@ -380,8 +380,11 @@ reviewed commit and the exact locally gated image bytes. The four-field record
 is evidence, not a cryptographic provenance token; Stage B's independently
 approved tuple is the authority. Process-group cleanup covers accidental child
 processes from the reviewed snapshot. Deliberately hostile same-UID code that
-escapes its process group requires a separate UID, container sandbox, or signed
-broker and is outside this gate's stated boundary.
+interferes during creation-to-first-descriptor-binding is outside this gate's
+threat boundary.
+The mkdirat/openat replacement window for record/staging/lock resources is excluded.
+The invoking UID must not be shared with untrusted concurrent code.
+A separate UID/sandbox or inaccessible pre-provisioned parent is the upgrade path.
 
 Before the swap, run the read-only backup check with secret-free artifacts:
 
