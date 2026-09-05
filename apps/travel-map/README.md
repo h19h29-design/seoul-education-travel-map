@@ -179,6 +179,12 @@ The current rule sources are versioned in `resources/rules/local-travel-2026-07-
 
 The Docker context is staged from a reviewed workspace: it validates SGIS source and normalized geodata hashes, hash-pinned rule payloads, and `current.json` before Docker is consulted. The staged context contains no `.env`, Git metadata, source/raw provider data, geodata source, institution-source input, tests, E2E files, artifacts, or historical snapshots—only the snapshot selected by `current.json`. The runtime image uses UID `10001` and contains only application code, rules, normalized geodata/manifest, and that one approved institution snapshot. It has a `/healthz` health check and runs in production mode, so invalid settings or artifacts fail closed before serving traffic.
 
+Stage A has an existing macOS release host requirement: its containment and
+copy-on-write checks require `/usr/bin/sandbox-exec` and the Darwin
+`fclonefileat` primitive. This host requirement does not change the application
+image or NAS target platforms, which remain the explicitly selected
+`linux/amd64` or `linux/arm64` value.
+
 Run Stage A only after the snapshot is approved and a dedicated, authless local
 Docker context exists. This stage must not receive registry credentials,
 provider credentials, an auth-bearing Docker path, or an open secret file

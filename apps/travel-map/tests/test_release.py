@@ -41,7 +41,10 @@ PREPARE_CONTEXT = ROOT / "scripts/prepare-release-context.py"
 SYNC = ROOT / "scripts/sync-institutions.py"
 FIXTURE_SNAPSHOT = ROOT / "tests/fixtures/institutions/snapshot"
 ROLLBACK_PUBLISH = ROOT / "deploy/nas/publish-rollback-baseline.sh"
-ROLLBACK_REVIEW_COMMIT = "3d4d25dd249e69aaf8a25e2bcb7267b3f296c0c6"
+# The original review commit was restored onto main by this reachable commit;
+# both Git objects contain the exact immutable publisher blob asserted below.
+ROLLBACK_ORIGINAL_REVIEW_COMMIT = "3d4d25dd249e69aaf8a25e2bcb7267b3f296c0c6"
+ROLLBACK_REVIEW_COMMIT = "b550c010da5754154fa11b7ebfecf70e064282c6"
 ROLLBACK_PUBLISH_BLOB_SHA = "0227f8a202464dc0874b1ba64c71d504a57ee5cd"
 ROLLBACK_SHA = "469c13f5afbc13af3ed9e91eaf43c20825163c6e"
 ROLLBACK_IMAGE_ID = "sha256:" + "1" * 64
@@ -1297,6 +1300,7 @@ def test_release_gate_treats_a_post_completion_signal_as_interrupted() -> None:
 
 def test_ci_runs_every_warning_strict_release_check() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    operations = Path("apps/travel-map/README.md").read_text(encoding="utf-8")
     publish = Path("apps/travel-map/deploy/nas/publish-reviewed-image.sh").read_text(
         encoding="utf-8"
     )
@@ -1304,10 +1308,67 @@ def test_ci_runs_every_warning_strict_release_check() -> None:
         encoding="utf-8"
     )
     normalized = " ".join(workflow.split())
+    python_job_match = re.search(
+        r"(?ms)^  python:\n.*?(?=^  [a-zA-Z0-9_-]+:\n|\Z)", workflow
+    )
+    macos_job_match = re.search(
+        r"(?ms)^  macos-release-gate:\n.*?(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+        workflow,
+    )
 
-    assert "PYTHONWARNINGS: error" in workflow
     assert "python: timeout-minutes: 20" in normalized
-    assert "pytest apps/travel-map/tests -vv -o faulthandler_timeout=120" in normalized
+    assert python_job_match is not None
+    python_job = " ".join(python_job_match.group().split())
+    assert "PYTHONWARNINGS: error" in python_job
+    assert "actions/checkout@v7.0.1 with: fetch-depth: 0" in python_job
+    assert "astral-sh/setup-uv@v10.0.1 id: uv" in python_job
+    trusted_bin = 'mkdir -p "$HOME/.local/bin"'
+    trusted_uv_install = (
+        '/usr/bin/install -m 0755 "${{ steps.uv.outputs.uv-path }}" '
+        '"$HOME/.local/bin/uv"'
+    )
+    trusted_uv_check = '"$HOME/.local/bin/uv" --version'
+    trusted_node_capture = "node_path=$(command -v node)"
+    trusted_node_install = (
+        '/usr/bin/install -m 0755 "$node_path" "$HOME/.local/bin/node"'
+    )
+    trusted_node_check = '"$HOME/.local/bin/node" --version'
+    trusted_path_export = 'export PATH="$HOME/.local/bin:$PATH"'
+    trusted_pnpm_install = 'npm install --global --prefix "$HOME/.local" pnpm@10'
+    trusted_pnpm_check = '"$HOME/.local/bin/pnpm" --version'
+    assert "pnpm/action-setup" not in python_job
+    trusted_setup = (
+        trusted_bin,
+        trusted_uv_install,
+        trusted_uv_check,
+        trusted_node_capture,
+        trusted_node_install,
+        trusted_node_check,
+        trusted_path_export,
+        trusted_pnpm_install,
+        trusted_pnpm_check,
+    )
+    assert all(command in python_job for command in trusted_setup)
+    assert [python_job.index(command) for command in trusted_setup] == sorted(
+        python_job.index(command) for command in trusted_setup
+    )
+    assert (
+        'pytest apps/travel-map/tests -vv -k "not test_release_gate_" '
+        "-o faulthandler_timeout=120" in python_job
+    )
+    assert macos_job_match is not None
+    macos_job = " ".join(macos_job_match.group().split())
+    assert "PYTHONWARNINGS: error" in macos_job
+    assert "timeout-minutes: 35" in macos_job
+    assert "runs-on: macos-latest" in macos_job
+    assert (
+        'pytest apps/travel-map/tests -vv -k "test_release_gate_" '
+        "-o faulthandler_timeout=120" in macos_job
+    )
+    assert "continue-on-error" not in python_job + macos_job
+    assert "macOS release host" in operations
+    assert "/usr/bin/sandbox-exec" in operations
+    assert "fclonefileat" in operations
     assert "ruff check apps/travel-map" in normalized
     assert (
         "ruff format --check apps/travel-map/app apps/travel-map/tests "
@@ -4685,6 +4746,12 @@ def test_deploy_wrapper_treats_interruption_during_env_swap_as_failure() -> None
 # Production break caught: an operator can otherwise publish an unreviewed,
 # mutable, wrong-platform image while believing it is the deployed rollback.
 def test_rollback_baseline_publisher_is_tracked_from_the_reviewed_git_object() -> None:
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ROLLBACK_REVIEW_COMMIT, "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     object_path = f"{ROLLBACK_REVIEW_COMMIT}:apps/travel-map/deploy/nas/publish-rollback-baseline.sh"
     blob = subprocess.run(
         ["git", "rev-parse", object_path],
@@ -4692,8 +4759,12 @@ def test_rollback_baseline_publisher_is_tracked_from_the_reviewed_git_object() -
         capture_output=True,
         text=True,
     )
+    assert ancestor.returncode == 0
     assert blob.returncode == 0
-    assert blob.stdout.strip() == ROLLBACK_PUBLISH_BLOB_SHA
+    assert blob.stdout.strip() == ROLLBACK_PUBLISH_BLOB_SHA, (
+        "the reachable restoration must retain the publisher reviewed at "
+        + ROLLBACK_ORIGINAL_REVIEW_COMMIT
+    )
     assert ROLLBACK_PUBLISH.is_file()
     publisher = ROLLBACK_PUBLISH.read_text(encoding="utf-8")
     assert f"rollback_sha={ROLLBACK_SHA}" in publisher

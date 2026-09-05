@@ -19,6 +19,53 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v10.0.1
+        id: uv
+        with:
+          version: "0.11.17"
+          enable-cache: true
+          cache-dependency-glob: apps/travel-map/uv.lock
+      - name: Install release tools in the trust path
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          /usr/bin/install -m 0755 "${{ steps.uv.outputs.uv-path }}" "$HOME/.local/bin/uv"
+          "$HOME/.local/bin/uv" --version
+          node_path=$(command -v node)
+          /usr/bin/install -m 0755 "$node_path" "$HOME/.local/bin/node"
+          "$HOME/.local/bin/node" --version
+          export PATH="$HOME/.local/bin:$PATH"
+          npm install --global --prefix "$HOME/.local" pnpm@10
+          "$HOME/.local/bin/pnpm" --version
+      - name: Install locked dependencies
+        run: uv sync --project apps/travel-map --frozen --dev
+      - name: Test with warnings as errors
+        env:
+          PYTHONWARNINGS: error
+        run: >-
+          uv run --project apps/travel-map pytest apps/travel-map/tests -vv
+          -k "not test_release_gate_"
+          -o faulthandler_timeout=120
+      - name: Lint and format
+        run: |
+          uv run --project apps/travel-map ruff check apps/travel-map
+          uv run --project apps/travel-map ruff format --check apps/travel-map/app apps/travel-map/tests apps/travel-map/scripts
+      - name: Type check
+        env:
+          MYPYPATH: apps/travel-map
+        run: uv run --project apps/travel-map mypy apps/travel-map/app apps/travel-map/scripts
+
+  macos-release-gate:
+    # The complete macOS suite has taken about 29 minutes; this bounded job
+    # runs only the native release-gate partition.
+    timeout-minutes: 35
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
@@ -29,20 +76,13 @@ jobs:
           cache-dependency-glob: apps/travel-map/uv.lock
       - name: Install locked dependencies
         run: uv sync --project apps/travel-map --frozen --dev
-      - name: Test with warnings as errors
+      - name: Test native release gate with warnings as errors
         env:
           PYTHONWARNINGS: error
         run: >-
           uv run --project apps/travel-map pytest apps/travel-map/tests -vv
+          -k "test_release_gate_"
           -o faulthandler_timeout=120
-      - name: Lint and format
-        run: |
-          uv run --project apps/travel-map ruff check apps/travel-map
-          uv run --project apps/travel-map ruff format --check apps/travel-map/app apps/travel-map/tests apps/travel-map/scripts
-      - name: Type check
-        env:
-          MYPYPATH: apps/travel-map
-        run: uv run --project apps/travel-map mypy apps/travel-map/app apps/travel-map/scripts
 
   browser:
     runs-on: ubuntu-latest
