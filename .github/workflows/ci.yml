@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   python:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -31,7 +32,9 @@ jobs:
       - name: Test with warnings as errors
         env:
           PYTHONWARNINGS: error
-        run: uv run --project apps/travel-map pytest apps/travel-map/tests -q
+        run: >-
+          uv run --project apps/travel-map pytest apps/travel-map/tests -vv
+          -o faulthandler_timeout=120
       - name: Lint and format
         run: |
           uv run --project apps/travel-map ruff check apps/travel-map

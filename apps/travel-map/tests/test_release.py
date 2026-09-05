@@ -1306,7 +1306,8 @@ def test_ci_runs_every_warning_strict_release_check() -> None:
     normalized = " ".join(workflow.split())
 
     assert "PYTHONWARNINGS: error" in workflow
-    assert "pytest apps/travel-map/tests -q" in normalized
+    assert "python: timeout-minutes: 20" in normalized
+    assert "pytest apps/travel-map/tests -vv -o faulthandler_timeout=120" in normalized
     assert "ruff check apps/travel-map" in normalized
     assert (
         "ruff format --check apps/travel-map/app apps/travel-map/tests "
