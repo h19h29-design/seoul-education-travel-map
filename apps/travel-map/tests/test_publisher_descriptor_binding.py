@@ -11,6 +11,7 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -498,6 +499,93 @@ def test_publisher_rejects_raw_bytes_that_do_not_match_their_descriptor(
     assert all(value not in completed.stderr for value in inputs)
     assert network_events == expected
     assert not any(event[0] == "push" for event in network_events)
+
+
+@pytest.mark.parametrize(
+    ("group", "observer_group", "include_observer"),
+    ((0, 4000, True), (-1, 4000, True), (0, 0, True), (0, 4000, False)),
+)
+def test_publisher_broker_process_table_handles_unrelated_kernel_group(
+    group: int,
+    observer_group: int,
+    include_observer: bool,
+) -> None:
+    source = PUBLISHER.read_text(encoding="utf-8")
+    start = source.index("def broker_process_table()")
+    end = source.index("\n\ndef broker_stable_identity(", start)
+    output = f"2 0 {group} Sat Sep 5 00:00:00 2026\n".encode("ascii")
+    if include_observer:
+        output += f"4001 4000 {observer_group} Sat Sep 5 00:00:01 2026\n".encode(
+            "ascii"
+        )
+    namespace = {
+        "os": SimpleNamespace(getpid=lambda: 4001),
+        "re": __import__("re"),
+        "subprocess": SimpleNamespace(
+            run=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output),
+            DEVNULL=subprocess.DEVNULL,
+            PIPE=subprocess.PIPE,
+            SubprocessError=subprocess.SubprocessError,
+        ),
+        "time": SimpleNamespace(sleep=lambda _seconds: None),
+    }
+    exec(  # noqa: S102 - exercise the real publisher parser with a controlled snapshot.
+        compile(source[start:end], "publisher-process-table", "exec"), namespace
+    )
+    if group < 0 or observer_group <= 0 or not include_observer:
+        with pytest.raises(OSError):
+            namespace["broker_process_table"]()
+    else:
+        records = namespace["broker_process_table"]()
+        assert records[2][:3] == (2, 0, 0)
+        assert records[4001][:3] == (4001, 4000, 4000)
+
+
+@pytest.mark.parametrize(
+    ("group", "observer_group", "include_observer", "target_present"),
+    (
+        (0, 4001, True, False),
+        (0, 4001, True, True),
+        (-1, 4001, True, False),
+        (0, 0, True, False),
+        (0, 4001, False, False),
+    ),
+)
+def test_publisher_quiescence_handles_unrelated_kernel_group(
+    group: int,
+    observer_group: int,
+    include_observer: bool,
+    target_present: bool,
+) -> None:
+    source = PUBLISHER.read_text(encoding="utf-8")
+    start = source.index("def publisher_group_quiescent(")
+    end = source.index("\n\ndef wait_for_publisher_group_observation(", start)
+    output = f"2 {group} S\n".encode("ascii")
+    if include_observer:
+        output += f"4001 {observer_group} Ss\n".encode("ascii")
+    if target_present:
+        output += b"5000 5000 S\n"
+    probes: list[int] = []
+    namespace = {
+        "os": SimpleNamespace(getpid=lambda: 4001),
+        "subprocess": SimpleNamespace(
+            run=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output),
+            DEVNULL=subprocess.DEVNULL,
+            PIPE=subprocess.PIPE,
+        ),
+        "reap_owned_direct_children": lambda: None,
+        "publisher_group_exists": lambda group: probes.append(group) or target_present,
+        "IncompletePublisherGroupSnapshot": OSError,
+    }
+    exec(  # noqa: S102 - exercise real quiescence validation with controlled probes.
+        compile(source[start:end], "publisher-quiescence", "exec"), namespace
+    )
+    if group < 0 or observer_group <= 0 or not include_observer:
+        with pytest.raises(OSError):
+            namespace["publisher_group_quiescent"](5000)
+    else:
+        assert namespace["publisher_group_quiescent"](5000) is not target_present
+    assert all(group == 5000 for group in probes)
 
 
 def test_publisher_accepts_a_fully_descriptor_bound_index(

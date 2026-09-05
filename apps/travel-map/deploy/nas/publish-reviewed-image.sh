@@ -3016,7 +3016,8 @@ def broker_process_table() -> dict[int, tuple[int, int, int, str]]:
                 ):
                     raise OSError
                 pid, ppid, pgid = (int(value) for value in fields[:3])
-                if pid <= 0 or ppid < 0 or pgid <= 0 or not fields[3:]:
+                # Hosted Linux process tables include kernel threads in PGID 0.
+                if pid <= 0 or ppid < 0 or pgid < 0 or not fields[3:]:
                     raise OSError
                 records[pid] = (pid, ppid, pgid, " ".join(fields[3:]))
             observing = records.get(os.getpid())
@@ -3332,10 +3333,10 @@ def publisher_group_quiescent(group_id: int) -> bool:
             if len(fields) < 2:
                 raise ValueError
             pid_value, group_value = (int(value) for value in fields[:2])
-            if pid_value <= 0 or group_value <= 0:
+            if pid_value <= 0 or group_value < 0:
                 raise ValueError
             if pid_value == os.getpid():
-                if len(fields) != 3 or not fields[2]:
+                if group_value <= 0 or len(fields) != 3 or not fields[2]:
                     raise ValueError
                 observing = True
             if group_value == group_id:
