@@ -260,21 +260,55 @@ The only public origin and Kakao redirect/domain is
 service at `127.0.0.1:18080`; never publish an alternate NAS hostname, including
 during rollback. Keep these operational details out of the public usage panel.
 
+### Current one-time stateless beta profile
+
+The currently approved beta profile sets `STATELESS_BETA=1`. It keeps the
+public institution/address search, all three trip patterns, route providers,
+and policy calculation, but does not expose Kakao login, saved defaults,
+settings, history, or any user SQLite database. Inputs and results are held
+only for the active request/page; no browser storage or user-data volume is
+used. Provider credentials remain server-side and are still required for the
+public route/place services.
+
+The non-secret mode fields in the beta `runtime.env` are:
+
+```text
+ENVIRONMENT=production
+STATELESS_BETA=1
+PUBLIC_BASE_URL=https://travel.h19h19.com
+ALLOWED_HOSTS=["travel.h19h19.com","127.0.0.1","localhost"]
+ALLOWED_ORIGINS=["https://travel.h19h19.com"]
+```
+
+For this profile, stage
+[`deploy/nas/compose.stateless.example.yml`](deploy/nas/compose.stateless.example.yml)
+and keep the application, Compose file, and `runtime.env` below `/volume1`.
+There is deliberately no `/volume2` bind mount and no database migration or
+backup is created. `deploy-reviewed-image.sh` reads the mode marker without
+sourcing the secret-bearing environment file, skips the private migration,
+and rejects a stateless Compose file that attempts to mount user data.
+
+The persistent login profile remains documented below for a later, separately
+approved change. Do not add its `USER_DATABASE_PATH`, OIDC, HMAC, or encryption
+settings to the beta runtime environment.
+
 ### Filesystem and runtime boundary
 
 The application, fixed Compose file, immutable image state, and runtime
-environment stay below `/volume1/docker/seoul-education-travel-map`. The only
-user-data mount is:
+environment stay below `/volume1/docker/seoul-education-travel-map`. In the
+current stateless beta there is no user-data mount. The persistent profile,
+when separately approved, uses:
 
 ```text
 /volume2/docker-1/seoul-education-travel-map/data/travel-map.sqlite3
 ```
 
 The directory is `0700`, the database/WAL/SHM files are `0600`, and all are
-owned by `10001:10001`. The application container has a read-only root, runs as
-UID/GID `10001`, and receives only `/data` as its writable bind mount; do not
-mount it into cloudflared or a backup job. Use the reviewed digest-only Compose
-asset on `/volume1`; `runtime.env`, `image.env`, and `previous-image.env` are
+owned by `10001:10001`. The application container has a read-only root and
+runs as UID/GID `10001`. The persistent profile receives only `/data` as its
+writable bind mount; do not mount it into cloudflared or a backup job. Use the
+reviewed digest-only Compose asset on `/volume1`; `runtime.env`, `image.env`, and
+`previous-image.env` are
 regular, non-symlink `0600` files and are never copied into Git, images, logs,
 screenshots, reports, or shell arguments.
 
@@ -290,7 +324,7 @@ Record the observed Cloudflare connector socket peer as one exact `/32` or
 `/128` `TRUSTED_PROXY_CIDRS` value. Verify a spoofed forwarding header from an
 untrusted peer is ignored before accepting the connector configuration.
 
-### Login keys and retention
+### Login keys and retention (persistent profile only)
 
 Use a login-only Kakao application. `KAKAO_OIDC_CLIENT_ID` and its
 `KAKAO_OIDC_CLIENT_SECRET` configure OIDC; `KAKAO_REST_API_KEY` is the separate
@@ -318,8 +352,9 @@ platform in `image.env`; a first deployment without that baseline is blocked.
 For a reviewed release, stage exactly these five NAS assets from the reviewed
 commit in a new private staging directory on `/volume1`:
 
-1. `compose.example.yml`
-2. `migrate-user-database.sh`
+1. `compose.stateless.example.yml` for the current beta (or
+   `compose.example.yml` only for the separately approved persistent profile)
+2. `migrate-user-database.sh` for the persistent profile; the beta skips it
 3. `backup-excludes.txt`
 4. `verify-backup-exclusion.sh`
 5. `deploy-reviewed-image.sh`
@@ -330,12 +365,13 @@ scripts, and exclusion file with their documented private modes. Do not copy or
 overwrite `runtime.env`, `image.env`, or `previous-image.env` in this step.
 
 The supported deploy wrapper validates and pulls one reviewed immutable GHCR
-digest, preserves the prior digest in `previous-image.env`, runs migration and
-schema verification before the container swap, then starts the fixed Compose
-configuration. The migration's private directory checks must pass before the
-swap. On failure, do not start the new image. Roll back only by restoring the
-preceding immutable image behind the same `travel.h19h19.com` Cloudflare route;
-never substitute a tag, a different repository, or a different public origin.
+digest, preserves the prior digest in `previous-image.env`, and starts the
+fixed Compose configuration. In the persistent profile it also runs migration
+and schema verification before the swap; in the current beta it requires the
+stateless mode marker and skips all private-store work. On failure, do not
+start the new image. Roll back only by restoring the preceding immutable image
+behind the same `travel.h19h19.com` Cloudflare route; never substitute a tag,
+a different repository, or a different public origin.
 
 Stage B starts only after a reviewer approves the independent tuple
 `(imageTag, imageId, platform, gitSha, recordSha256)`. Invoke it from the clean
@@ -417,8 +453,10 @@ destination listing, record
 `BLOCKED_BACKUP_CONFIGURATION_UNVERIFIED` and keep deployment blocked; do not
 invent backup evidence.
 
-After a successful swap, smoke-test anonymous institution/address search and
-all three trip patterns, then login, default-workplace restore, history
-create/detail/delete, logout, and anonymous calculation after logout. Confirm a
-user-storage failure leaves anonymous calculation available while auth,
-history, and settings fail closed.
+After a successful stateless-beta swap, smoke-test anonymous institution/address
+search and all three trip patterns. Confirm the private `/auth` and `/me`
+endpoints are not registered, the UI hides login/history/settings, and no
+`/volume2` user-data directory is created. The persistent profile additionally
+requires login, default-workplace restore, history create/detail/delete,
+logout, and anonymous calculation after logout; that profile is not part of
+the current beta deployment.

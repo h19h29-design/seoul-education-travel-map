@@ -41,6 +41,7 @@ case "$digest" in *[!0-9a-f]*) blocked 'BLOCKED_INVALID_IMAGE_REFERENCE' ;; esac
 base=/volume1/docker/seoul-education-travel-map
 compose=$base/compose.yml
 migration=$base/migrate-user-database.sh
+runtime_env=$base/runtime.env
 image_env=$base/image.env
 previous_env=$base/previous-image.env
 
@@ -48,8 +49,33 @@ previous_env=$base/previous-image.env
     || blocked 'BLOCKED_INVALID_DEPLOY_DIRECTORY'
 [ -f "$compose" ] && [ ! -L "$compose" ] \
     || blocked 'BLOCKED_INVALID_DEPLOY_ASSET'
-[ -f "$migration" ] && [ ! -L "$migration" ] && [ -x "$migration" ] \
-    || blocked 'BLOCKED_INVALID_DEPLOY_ASSET'
+
+stateless_beta=0
+if [ -e "$runtime_env" ] || [ -L "$runtime_env" ]; then
+    [ -f "$runtime_env" ] && [ ! -L "$runtime_env" ] \
+        || blocked 'BLOCKED_INVALID_DEPLOY_ASSET'
+    [ "$(stat_mode "$runtime_env")" = 600 ] \
+        || blocked 'BLOCKED_INVALID_DEPLOY_ASSET'
+    mode_count=$(grep -c '^STATELESS_BETA=' "$runtime_env" || true)
+    if [ "$mode_count" -gt 1 ]; then
+        blocked 'BLOCKED_INVALID_RUNTIME_MODE'
+    fi
+    if [ "$mode_count" -eq 1 ]; then
+        mode_value=$(sed -n 's/^STATELESS_BETA=//p' "$runtime_env")
+        [ "$mode_value" = 1 ] || blocked 'BLOCKED_INVALID_RUNTIME_MODE'
+        stateless_beta=1
+    fi
+fi
+
+if [ "$stateless_beta" -eq 1 ]; then
+    if grep -Fq '/volume2/docker-1/seoul-education-travel-map/data' "$compose" \
+        || grep -Eq ':[[:space:]]*/data:rw([[:space:]]|$)' "$compose"; then
+        blocked 'BLOCKED_STATELESS_DATA_MOUNT'
+    fi
+else
+    [ -f "$migration" ] && [ ! -L "$migration" ] && [ -x "$migration" ] \
+        || blocked 'BLOCKED_INVALID_DEPLOY_ASSET'
+fi
 
 validate_image_env() {
     path=$1
@@ -121,7 +147,9 @@ mv -f "$previous_tmp" "$previous_env" || blocked 'BLOCKED_ROLLBACK_COPY'
 previous_tmp=
 validate_image_env "$previous_env"
 
-"$migration" "$reference"
+if [ "$stateless_beta" -eq 0 ]; then
+    "$migration" "$reference"
+fi
 printf 'TRAVEL_MAP_MANIFEST_DIGEST=%s\n' "$digest" > "$image_tmp" \
     || blocked 'BLOCKED_IMAGE_ENV_WRITE'
 validate_image_env "$image_tmp"

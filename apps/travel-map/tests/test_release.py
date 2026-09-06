@@ -1516,6 +1516,78 @@ def test_deploy_wrapper_maps_exact_nas_platform_architecture_before_mutation(
     )
 
 
+def test_deploy_wrapper_stateless_beta_skips_private_database_migration(
+    tmp_path: Path,
+) -> None:
+    reference = "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64
+    deploy, environment, _events_path, migration_events_path, base = (
+        _deploy_wrapper_fixture(
+            tmp_path,
+            nas_architecture="amd64",
+            image_platform="linux/amd64",
+            stateless_beta=True,
+            include_migration=False,
+        )
+    )
+
+    completed = subprocess.run(
+        [str(deploy), reference],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "DEPLOYED_REVIEWED_IMAGE\n"
+    assert completed.stderr == ""
+    assert (base / "runtime.env").read_text(encoding="ascii") == "STATELESS_BETA=1\n"
+    assert _read_test_event_log(migration_events_path) == []
+
+
+def test_deploy_wrapper_rejects_a_stateless_user_data_mount_before_mutation(
+    tmp_path: Path,
+) -> None:
+    reference = "ghcr.io/h19h29-design/seoul-education-travel-map@sha256:" + "a" * 64
+    deploy, environment, events_path, migration_events_path, base = (
+        _deploy_wrapper_fixture(
+            tmp_path,
+            nas_architecture="amd64",
+            image_platform="linux/amd64",
+            stateless_beta=True,
+            include_migration=False,
+        )
+    )
+    (base / "compose.yml").write_text(
+        "services:\n  app:\n    volumes:\n      - /volume2/docker-1/seoul-education-travel-map/data:/data:rw\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [str(deploy), reference],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "BLOCKED_STATELESS_DATA_MOUNT\n"
+    assert _read_test_event_log(events_path) == []
+    assert _read_test_event_log(migration_events_path) == []
+
+
+def test_stateless_compose_example_has_no_user_data_bind_mount() -> None:
+    compose = Path("apps/travel-map/deploy/nas/compose.stateless.example.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "/volume2/docker-1/seoul-education-travel-map/data" not in compose
+    assert "/data:rw" not in compose
+    assert "/volume1/docker/seoul-education-travel-map/runtime.env" in compose
+
+
 @pytest.mark.parametrize(
     "nas_architecture",
     (
@@ -4760,7 +4832,9 @@ def test_deploy_wrapper_preserves_a_valid_rollback_before_any_mutation() -> None
     assert '"$migration" "$reference"' in deploy
     assert "TRAVEL_MAP_MANIFEST_DIGEST=%s" in deploy
     assert 'docker compose --env-file "$image_env" -f "$compose" up -d' in deploy
-    assert "runtime.env" not in deploy
+    assert "runtime_env=$base/runtime.env" in deploy
+    assert 'source "$runtime_env"' not in deploy
+    assert '. "$runtime_env"' not in deploy
     assert "docker build" not in deploy
     assert deploy.index('cp -p "$image_env" "$previous_tmp"') < deploy.index(
         '"$migration" "$reference"'
@@ -5296,10 +5370,15 @@ def _deploy_wrapper_fixture(
     nas_architecture: str,
     image_platform: str,
     docker_info_output: str | None = None,
+    stateless_beta: bool = False,
+    include_migration: bool = True,
 ) -> tuple[Path, dict[str, str], Path, Path, Path]:
     base = tmp_path / "nas/docker/seoul-education-travel-map"
     base.mkdir(parents=True)
     (base / "compose.yml").write_text("services: {}\n", encoding="utf-8")
+    if stateless_beta:
+        (base / "runtime.env").write_text("STATELESS_BETA=1\n", encoding="ascii")
+        (base / "runtime.env").chmod(0o600)
     image_env = base / "image.env"
     image_env.write_text(
         "TRAVEL_MAP_MANIFEST_DIGEST=" + "b" * 64 + "\n", encoding="utf-8"
@@ -5337,15 +5416,16 @@ exec /usr/bin/mktemp "$@"
     )
     fake_mktemp.chmod(0o755)
 
-    migration = base / "migrate-user-database.sh"
-    migration.write_text(
-        """#!/bin/sh
+    if include_migration:
+        migration = base / "migrate-user-database.sh"
+        migration.write_text(
+            """#!/bin/sh
 set -eu
 printf 'migration %s\\n' "$1" >> "$FAKE_MIGRATION_EVENTS"
 """,
-        encoding="utf-8",
-    )
-    migration.chmod(0o755)
+            encoding="utf-8",
+        )
+        migration.chmod(0o755)
 
     deploy = tmp_path / "deploy-reviewed-image.sh"
     deploy.write_text(
