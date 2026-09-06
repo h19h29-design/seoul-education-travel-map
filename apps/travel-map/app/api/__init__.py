@@ -11,12 +11,21 @@ from app.api.places import router as places_router
 from app.api.policy import router as policy_router
 from app.api.trips import router as trips_router
 
-router = APIRouter(prefix="/api/v1")
-router.include_router(bootstrap_router)
-router.include_router(institutions_router)
-router.include_router(geodata_router)
-router.include_router(places_router)
-router.include_router(policy_router)
-router.include_router(trips_router)
-router.include_router(session_router)
-router.include_router(me_router)
+
+def create_router(*, include_private: bool = True) -> APIRouter:
+    """Build the versioned API with an explicit private-feature boundary."""
+
+    router = APIRouter(prefix="/api/v1")
+    router.include_router(bootstrap_router)
+    router.include_router(institutions_router)
+    router.include_router(geodata_router)
+    router.include_router(places_router)
+    router.include_router(policy_router)
+    router.include_router(trips_router)
+    if include_private:
+        router.include_router(session_router)
+        router.include_router(me_router)
+    return router
+
+
+router = create_router()

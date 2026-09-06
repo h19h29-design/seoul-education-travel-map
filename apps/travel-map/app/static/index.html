@@ -127,7 +127,7 @@
 
             <section id="policy-disclosure" class="policy-disclosure" role="note" aria-label="고정 적용 규정">
               <strong class="policy-badge">서울특별시교육청 공무원 여비 기준</strong>
-              <span>계산 기준은 서버에서 고정 적용합니다. Kakao 로그인은 재직 확인이 아닙니다.</span>
+      <span id="policy-login-disclosure">계산 기준은 서버에서 고정 적용합니다. Kakao 로그인은 재직 확인이 아닙니다.</span>
             </section>
 
             <fieldset class="vehicle-assumptions">
@@ -206,7 +206,7 @@
     <footer id="notice" class="legal-notice">
       <p>⚠ 기관 위치는 경로 기준일 뿐 적용 법규를 정하지 않습니다</p>
       <p>예상액이며 지급 확정액이 아닙니다</p>
-      <small>로그인하지 않은 계산은 저장하지 않습니다. 로그인하면 계산 이력 중 필요한 최소 정보만 암호화해 정확히 168시간 보관하며, 설정은 “내 데이터 삭제” 전까지 유지합니다. 검색어, 좌표, 경로 선은 계산 이력에 저장하지 않습니다.</small>
+      <small id="retention-notice">로그인하지 않은 계산은 저장하지 않습니다. 로그인하면 계산 이력 중 필요한 최소 정보만 암호화해 정확히 168시간 보관하며, 설정은 “내 데이터 삭제” 전까지 유지합니다. 검색어, 좌표, 경로 선은 계산 이력에 저장하지 않습니다.</small>
     </footer>
     <dialog id="help-dialog" class="info-dialog" aria-labelledby="help-dialog-title">
       <div class="dialog-heading-row">
@@ -232,7 +232,7 @@
         </section>
         <section>
           <h3>로그인과 보관</h3>
-          <p>검색과 경로·여비 계산은 로그인 없이 이용할 수 있습니다. Kakao 로그인은 선택 사항이며, 기본 근무지·설정과 계산이력만 추가합니다. 계산이력은 생성 시점부터 정확히 168시간 동안만 보관합니다.</p>
+          <p id="help-retention-description">검색과 경로·여비 계산은 로그인 없이 이용할 수 있습니다. Kakao 로그인은 선택 사항이며, 기본 근무지·설정과 계산이력만 추가합니다. 계산이력은 생성 시점부터 정확히 168시간 동안만 보관합니다.</p>
         </section>
       </div>
     </dialog>
@@ -249,7 +249,7 @@
           <p data-policy-sources class="policy-sources"></p>
         </section>
         <p class="panel-disclaimer">이 화면의 결과는 예상값이며 실제 지급액 또는 지급 확정을 대신하지 않습니다. 기관의 최종 판단을 확인하세요.</p>
-        <p class="panel-disclaimer">Kakao 로그인은 재직 확인이 아닙니다. 카카오 계정 제어 확인일 뿐이며, 공개 고정 여비 기준을 변경하지 않습니다.</p>
+        <p id="policy-auth-disclaimer" class="panel-disclaimer">Kakao 로그인은 재직 확인이 아닙니다. 카카오 계정 제어 확인일 뿐이며, 공개 고정 여비 기준을 변경하지 않습니다.</p>
       </div>
     </dialog>
     <dialog id="private-auth-dialog" class="info-dialog" aria-labelledby="private-auth-dialog-title">

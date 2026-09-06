@@ -16,5 +16,6 @@ async def bootstrap(request: Request) -> dict[str, object]:
                 if javascript_key is not None
                 else None
             )
-        }
+        },
+        "privateFeaturesEnabled": not dependencies.settings.stateless_beta,
     }

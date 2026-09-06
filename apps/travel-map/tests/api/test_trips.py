@@ -93,6 +93,33 @@ def test_authenticated_preview_writes_only_minimal_history_draft(client) -> None
     assert [item.duration_seconds for item in summary.route_legs] == [900, 1_000]
 
 
+def test_stateless_beta_never_resolves_or_writes_private_history(client) -> None:
+    history = AsyncMock()
+    dependencies = client.app.state.dependencies
+    dependencies.settings = dependencies.settings.model_copy(
+        update={"stateless_beta": True}
+    )
+    dependencies.user_services = UserServices(
+        oauth_attempts=AsyncMock(),
+        sessions=AsyncMock(),
+        history=history,
+        settings=AsyncMock(),
+        retention_cleaner=AsyncMock(),
+        oidc_client=AsyncMock(),
+    )
+
+    response = client.post(
+        "/api/v1/trips/preview",
+        json=trip_payload(),
+        headers={"Cookie": "__Host-travel_session=must-not-be-read"},
+    )
+
+    assert response.status_code == 200
+    assert "HISTORY_NOT_SAVED" not in response.json()["warnings"]
+    history.create.assert_not_awaited()
+    dependencies.user_services.sessions.resolve.assert_not_awaited()
+
+
 def test_authenticated_preview_requires_origin_and_csrf_before_calculation_or_save(
     client,
     fake_route_providers,

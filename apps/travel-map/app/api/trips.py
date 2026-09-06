@@ -60,6 +60,8 @@ async def _preview_user_context(
     request: Request,
     dependencies: AppDependencies,
 ) -> tuple[SessionPrincipal | None, UserServices | None, bool]:
+    if dependencies.settings.stateless_beta:
+        return None, None, False
     raw_token = request.cookies.get(_SESSION_COOKIE)
     if raw_token is None:
         return None, None, False

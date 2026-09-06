@@ -48,6 +48,7 @@ const controls = {
   fuelType: $("#fuel-type"),
   helpButton: $("#help-button"),
   helpDialog: $("#help-dialog"),
+  helpRetentionDescription: $("#help-retention-description"),
   historyButton: $("#history-button"),
   historyCloseButton: $("#history-close-button"),
   historyDeleteAllButton: $("#history-delete-all"),
@@ -80,6 +81,8 @@ const controls = {
   previousAllowance: $("#previous-allowance"),
   previousAllowanceField: $("#previous-allowance-field"),
   policyButton: $("#policy-button"),
+  policyAuthDisclaimer: $("#policy-auth-disclaimer"),
+  policyLoginDisclosure: $("#policy-login-disclosure"),
   policyDialog: $("#policy-dialog"),
   privateAuthDialog: $("#private-auth-dialog"),
   privateAuthCloseButton: $("#private-auth-close-button"),
@@ -88,6 +91,7 @@ const controls = {
   results: $("#results"),
   routeCount: $("#route-count"),
   routeList: $("#route-list"),
+  retentionNotice: $("#retention-notice"),
   startDate: $("#starts-date"),
   startTime: $("#starts-time"),
   tripPattern: [...document.querySelectorAll("input[name='trip-pattern']")],
@@ -117,6 +121,20 @@ let historyPanel;
 let settingsPanel;
 let appliedAuthenticatedSettings = false;
 let settingsRevision = 0;
+
+function disablePrivateFeatures() {
+  [
+    controls.authStatus,
+    controls.historyButton,
+    controls.settingsButton,
+    controls.loginButton,
+    controls.logoutButton,
+  ].forEach((element) => { element.hidden = true; });
+  controls.retentionNotice.textContent = "1회성 베타 모드에서는 로그인·계정·계산 이력을 제공하지 않으며, 입력값과 결과를 저장하지 않습니다.";
+  controls.helpRetentionDescription.textContent = "기관·출장지 검색과 경로·여비 계산을 로그인 없이 이용합니다. 이 1회성 베타 모드에서는 기본 근무지·설정·계산 이력을 저장하지 않습니다.";
+  controls.policyLoginDisclosure.textContent = "계산 기준은 서버에서 고정 적용합니다. 1회성 베타 모드에서는 로그인 기능을 제공하지 않습니다.";
+  controls.policyAuthDisclaimer.textContent = "1회성 베타 모드에서는 로그인 기능을 제공하지 않으며, 공개 고정 여비 기준만 적용합니다.";
+}
 
 const helpPanels = createHelpPanels({
   api,
@@ -452,13 +470,16 @@ async function initialize() {
   controls.otherTrips.addEventListener("change", updatePreviousAllowanceControl);
   updatePreviousAllowanceControl();
   updateCalculateAvailability();
-  void authController.initialize();
+  let privateFeaturesEnabled = true;
   try {
     const bootstrap = await api.bootstrap();
+    privateFeaturesEnabled = bootstrap?.privateFeaturesEnabled !== false;
+    if (!privateFeaturesEnabled) disablePrivateFeatures();
     await map.initialize(bootstrap.map.javascriptKey);
   } catch {
     map.setStatus("지도 설정을 확인하지 못했습니다. 입력과 경로 결과는 계속 사용할 수 있습니다.");
   }
+  if (privateFeaturesEnabled) void authController.initialize();
 }
 
 window.addEventListener("pagehide", () => {

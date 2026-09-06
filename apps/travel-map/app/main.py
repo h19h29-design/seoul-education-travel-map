@@ -16,7 +16,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.api import router as api_router
+from app.api import create_router
 from app.api.auth import oauth_router
 from app.api.common import client_ip
 from app.auth.models import UserServices
@@ -333,8 +333,9 @@ def create_app(
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    app.include_router(oauth_router)
-    app.include_router(api_router)
+    if not active_settings.stateless_beta:
+        app.include_router(oauth_router)
+    app.include_router(create_router(include_private=not active_settings.stateless_beta))
     app.mount(
         "/static",
         StaticFiles(directory=Path(__file__).with_name("static"), check_dir=False),
