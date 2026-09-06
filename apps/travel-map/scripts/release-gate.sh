@@ -4307,34 +4307,36 @@ prepare_uv_work_cache "$test_uv_cache" \
 UV_CACHE_DIR=$test_uv_cache
 UV_PROJECT_ENVIRONMENT=$test_uv_environment
 export PYTHONWARNINGS UV_CACHE_DIR UV_PROJECT_ENVIRONMENT
+# Diagnostics belong on stderr; stdout is reserved for the final attestation.
+# Keep the value-producing snapshot command below separately captured.
 run_untrusted_verified "$uv_tool" sync --project apps/travel-map --locked --dev \
-    --python "$approved_python" --no-python-downloads --offline \
+    --python "$approved_python" --no-python-downloads --offline >&2 \
     || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
 UV_CACHE_DIR=$test_uv_cache
 export UV_CACHE_DIR
 run_untrusted_verified "$uv_tool" run --locked --no-sync \
     --python "$approved_python" --no-python-downloads --offline \
-    --project apps/travel-map pytest apps/travel-map/tests -q \
+    --project apps/travel-map pytest apps/travel-map/tests -q >&2 \
     || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
 run_untrusted_verified "$uv_tool" run --locked --no-sync \
     --python "$approved_python" --no-python-downloads --offline \
     --project apps/travel-map ruff check \
-    apps/travel-map/app apps/travel-map/tests apps/travel-map/scripts \
+    apps/travel-map/app apps/travel-map/tests apps/travel-map/scripts >&2 \
     || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
 run_untrusted_verified "$uv_tool" run --locked --no-sync \
     --python "$approved_python" --no-python-downloads --offline \
     --project apps/travel-map ruff format --check \
-    apps/travel-map/app apps/travel-map/tests apps/travel-map/scripts \
+    apps/travel-map/app apps/travel-map/tests apps/travel-map/scripts >&2 \
     || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
 run_untrusted_verified "$uv_tool" run --locked --no-sync \
     --python "$approved_python" --no-python-downloads --offline \
     --project apps/travel-map mypy \
-    apps/travel-map/app apps/travel-map/scripts \
+    apps/travel-map/app apps/travel-map/scripts >&2 \
     || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
 run_untrusted_verified "$pnpm_tool" --store-dir "$PNPM_STORE_DIR" \
-    --dir apps/travel-map install --frozen-lockfile --offline \
+    --dir apps/travel-map install --frozen-lockfile --offline >&2 \
     || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
-run_untrusted_verified "$pnpm_tool" --dir apps/travel-map test:e2e \
+run_untrusted_verified "$pnpm_tool" --dir apps/travel-map test:e2e >&2 \
     || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
 
 # A tool may create private caches, but it may not change the reviewed tracked
@@ -4437,7 +4439,7 @@ prepare_uv_work_cache "$prepare_uv_cache" \
 UV_CACHE_DIR=$prepare_uv_cache
 export UV_CACHE_DIR
 run_untrusted_verified "$uv_tool" sync --project apps/travel-map --locked --dev \
-    --python "$approved_python" --no-python-downloads --offline \
+    --python "$approved_python" --no-python-downloads --offline >&2 \
     || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
 UV_CACHE_DIR=$prepare_uv_cache
 export UV_CACHE_DIR

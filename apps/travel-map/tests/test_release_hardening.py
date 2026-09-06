@@ -1844,6 +1844,45 @@ def test_release_gate_uses_clean_environment_and_exact_head_source(
     )
 
 
+@pytest.mark.parametrize("test_status", [0, 1])
+def test_release_gate_keeps_test_output_out_of_attestation(
+    tmp_path: Path, test_status: int
+) -> None:
+    _, gate, fake_bin, _ = _release_gate_repository(tmp_path)
+    uv = fake_bin / "uv"
+    source = uv.read_text(encoding="utf-8")
+    anchor = 'if "pytest" in args:\n'
+    probe = (
+        '    print("synthetic test diagnostic", flush=True)\n'
+        f"    if {test_status}:\n"
+        f"        raise SystemExit({test_status})\n"
+    )
+    _write_executable(uv, _replace_once(source, anchor, anchor + probe))
+    completed, record = _run_release_gate(
+        tmp_path, gate, docker_config=_protected_docker_config(tmp_path)
+    )
+    assert "synthetic test diagnostic" in completed.stderr
+    if test_status:
+        assert completed.returncode != 0
+        assert completed.stdout == ""
+        assert not record.exists()
+    else:
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout == "ENCRYPTED_STORAGE_IMAGE_GATE_OK\n"
+        assert record.exists()
+
+
+def test_release_gate_preserves_snapshot_output_for_build(tmp_path: Path) -> None:
+    _, gate, _, events_path = _release_gate_repository(tmp_path)
+    completed, record = _run_release_gate(
+        tmp_path, gate, docker_config=_protected_docker_config(tmp_path)
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert record.exists()
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert any("SNAPSHOT_ID=reviewed-snapshot" in event["args"] for event in events)
+
+
 def test_release_gate_gives_each_sync_a_fresh_writable_cache(tmp_path: Path) -> None:
     _, gate, fake_bin, events_path = _release_gate_repository(tmp_path)
     cached_script = tmp_path / "uv-cache/archive-v0/reviewed-wheel/payload.py"
