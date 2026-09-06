@@ -4551,7 +4551,7 @@ run_isolated() {
 }
 
 run_isolated /bin/sh -eu -c \
-    'umask 077; python -m app.storage.migrations migrate --database /data/travel-map.sqlite3; exec python -m app.storage.migrations verify --database /data/travel-map.sqlite3' \
+    'umask 077; python -m app.storage.migrations migrate --database /data/travel-map.sqlite3; exec python -m app.storage.migrations verify --database /data/travel-map.sqlite3' >&2 \
     || blocked 'BLOCKED_ENCRYPTED_STORAGE_MIGRATION'
 
 storage_sentinel=$(/usr/bin/python3 -I -S \

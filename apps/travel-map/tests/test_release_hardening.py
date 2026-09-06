@@ -1258,6 +1258,11 @@ if args[:3] == ["image", "inspect", "--format"]:
 if args[:2] == ["image", "rm"]:
     raise SystemExit(0)
 if args and args[0] == "run":
+    if Path({event_literal}).with_suffix(".migration-output").exists() and any(
+        "python -m app.storage.migrations migrate" in argument for argument in args
+    ):
+        print("migrate: schema version 1")
+        print("verify: schema version 1")
     mount_source = None
     for argument in args:
         if argument.startswith("type=bind,src=") and ",dst=/data" in argument:
@@ -1842,6 +1847,7 @@ def test_release_gate_uses_clean_environment_and_exact_head_source(
     tmp_path: Path,
 ) -> None:
     repository, gate, _, events_path = _release_gate_repository(tmp_path)
+    events_path.with_suffix(".migration-output").write_text("enabled\n")
     docker_config, _ = _sanitized_docker_context(
         tmp_path,
         host="unix://" + str(_release_test_socket_path(tmp_path)),
@@ -1855,7 +1861,7 @@ def test_release_gate_uses_clean_environment_and_exact_head_source(
 
     assert completed.returncode == 0
     assert completed.stdout == "ENCRYPTED_STORAGE_IMAGE_GATE_OK\n"
-    assert completed.stderr == ""
+    assert completed.stderr == "migrate: schema version 1\nverify: schema version 1\n"
     assert record.read_text(encoding="ascii").splitlines() == [
         f"imageTag=seoul-education-travel-map:release-gate-{_git(repository, 'rev-parse', 'HEAD')}",
         "imageId=sha256:" + "a" * 64,
