@@ -1085,8 +1085,10 @@ run_docker() {
 
 run_buildx() {
     verify_release_docker_socket "$release_docker_host" || return 1
+    # Authless builds must not persist BuildKit client-token seeds in Docker config.
     DOCKER_HOST=$release_docker_host \
         BUILDX_CONFIG=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/buildx-config \
+        BUILDKIT_NO_CLIENT_TOKEN=1 \
         "$buildx_tool" "$@"
 }
 

@@ -1248,6 +1248,10 @@ if args[:2] == ["buildx", "build"]:
     state = Path(os.environ.get("BUILDX_CONFIG", str(Path(os.environ["DOCKER_CONFIG"]) / "buildx")))
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     (state / "activity").write_text("build completed\\n", encoding="utf-8")
+    if os.environ.get("BUILDKIT_NO_CLIENT_TOKEN") != "1":
+        config = Path(os.environ["DOCKER_CONFIG"])
+        (config / ".token_seed").write_text("synthetic seed fixture")
+        (config / ".token_seed.lock").touch()
     raise SystemExit(0)
 if args[:3] == ["image", "inspect", "--format"]:
     if ".Os" in args[3] or ".Architecture" in args[3]:
@@ -1841,6 +1845,17 @@ def test_release_gate_uses_docker_shared_cache_parent_for_storage_probe(
     docker_config = Path(state_events[0]["docker_config_path"])
     assert state == docker_config.parent / "buildx-config"
     assert not state.parent.exists()
+    assert "BUILDKIT_NO_CLIENT_TOKEN" in state_events[0]["environment"]
+    other_docker_events = [
+        event
+        for line in events_path.read_text().splitlines()
+        if (event := json.loads(line))["tool"] == "docker"
+        and event["args"][:2] != ["buildx", "build"]
+    ]
+    assert all(
+        "BUILDKIT_NO_CLIENT_TOKEN" not in event["environment"]
+        for event in other_docker_events
+    )
 
 
 def test_release_gate_uses_clean_environment_and_exact_head_source(
