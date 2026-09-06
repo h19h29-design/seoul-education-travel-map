@@ -255,6 +255,12 @@ its metadata and build the local project. Executable wheel files retain their
 execute bit. Test-created cache contents are never reused for release-context
 preparation. Missing offline dependencies continue to block the gate.
 
+The disposable encrypted-storage probe uses a private sibling directory of
+that seed, beneath `~/.cache/travel-map-release`, so Docker VMs that share the
+user directory can bind-mount it. The seed itself remains unchanged. The gate
+removes the synthetic probe data and its directory before issuing evidence;
+this does not create NAS user data or change Docker VM file-sharing settings.
+
 ```text
 imageTag=seoul-education-travel-map:release-gate-<40-char-git-sha>
 imageId=sha256:<64-hex-local-image-id>

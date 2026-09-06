@@ -4509,7 +4509,10 @@ image_digest=${image_id#sha256:}
     || blocked 'BLOCKED_IMAGE_ATTESTATION'
 case "$image_digest" in *[!0-9a-f]*) blocked 'BLOCKED_IMAGE_ATTESTATION' ;; esac
 
-gate_parent=$(/usr/bin/mktemp -d "$TMPDIR/travel-map-image-gate.XXXXXX") \
+# Keep the disposable bind mount beside the verified seed, under the user
+# directory shared with local Docker VMs, without writing inside the seed.
+gate_parent=$(/usr/bin/mktemp -d \
+    "${source_uv_cache%/*}/travel-map-image-gate.XXXXXX") \
     || blocked 'BLOCKED_PRIVATE_DIRECTORY'
 /bin/chmod 0700 "$gate_parent" || blocked 'BLOCKED_PRIVATE_DIRECTORY'
 gate_data=$gate_parent/data
@@ -4541,7 +4544,7 @@ run_isolated /bin/sh -eu -c \
 storage_sentinel=$(/usr/bin/python3 -I -S \
     -c 'import secrets; print("travel-map-image-gate-" + secrets.token_urlsafe(24))') \
     || blocked 'BLOCKED_PRIVATE_SENTINEL'
-storage_smoke_output=$(run_docker run --rm --user 10001:10001 --network none --read-only \
+storage_smoke_output=$(run_docker run --rm -i --user 10001:10001 --network none --read-only \
     --cap-drop ALL --security-opt no-new-privileges \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10001,gid=10001 \
     --mount "type=bind,src=$gate_data,dst=/data" \

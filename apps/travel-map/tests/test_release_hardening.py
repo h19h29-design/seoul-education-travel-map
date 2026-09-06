@@ -1266,7 +1266,7 @@ if args and args[0] == "run":
                 shutil.rmtree(child)
             else:
                 child.unlink()
-    stdin = sys.stdin.read()
+    stdin = sys.stdin.read() if "-i" in args or "--interactive" in args else ""
     if "HistoryRepository" in stdin:
         print("ENCRYPTED_STORAGE_SMOKE_OK")
     elif "-d" in args:
@@ -1794,6 +1794,34 @@ def test_release_gate_accepts_cjs_pnpm_and_keeps_its_store_sandbox(
     completed, record = _run_release_gate(tmp_path, gate, docker_config=docker_config)
     assert completed.returncode == 0, completed.stderr
     assert record.exists()
+
+
+def test_release_gate_uses_docker_shared_cache_parent_for_storage_probe(
+    tmp_path: Path,
+) -> None:
+    shared_parent = tmp_path / "shared-project-cache"
+    _, gate, _, events_path = _release_gate_repository(
+        tmp_path, cache_parent=shared_parent
+    )
+    docker_config, _ = _sanitized_docker_context(
+        tmp_path, host="unix://" + str(_release_test_socket_path(tmp_path))
+    )
+
+    completed, record = _run_release_gate(tmp_path, gate, docker_config=docker_config)
+
+    assert completed.returncode == 0, completed.stderr
+    assert record.exists()
+    mounts = [
+        Path(argument.split("src=", 1)[1].split(",dst=", 1)[0])
+        for line in events_path.read_text().splitlines()
+        if (event := json.loads(line))["tool"] == "docker"
+        for argument in event["args"]
+        if argument.startswith("type=bind,src=") and argument.endswith(",dst=/data")
+    ]
+    assert mounts
+    assert all(path.parent.parent == shared_parent.resolve() for path in mounts)
+    assert all(path.name == "data" for path in mounts)
+    assert all(not path.parent.exists() for path in mounts)
 
 
 def test_release_gate_uses_clean_environment_and_exact_head_source(
