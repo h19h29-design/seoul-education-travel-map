@@ -42,11 +42,10 @@ PREPARE_CONTEXT = ROOT / "scripts/prepare-release-context.py"
 SYNC = ROOT / "scripts/sync-institutions.py"
 FIXTURE_SNAPSHOT = ROOT / "tests/fixtures/institutions/snapshot"
 ROLLBACK_PUBLISH = ROOT / "deploy/nas/publish-rollback-baseline.sh"
-# The original review commit was restored onto main by this reachable commit;
-# both Git objects contain the exact immutable publisher blob asserted below.
-ROLLBACK_ORIGINAL_REVIEW_COMMIT = "3d4d25dd249e69aaf8a25e2bcb7267b3f296c0c6"
-ROLLBACK_REVIEW_COMMIT = "b550c010da5754154fa11b7ebfecf70e064282c6"
-ROLLBACK_PUBLISH_BLOB_SHA = "0227f8a202464dc0874b1ba64c71d504a57ee5cd"
+# This reviewed commit contains the exact publisher blob asserted below,
+# including the bounded runtime-readiness probe for the legacy image.
+ROLLBACK_REVIEW_COMMIT = "4a991e314f6548c58f4dcbe64f749ce0dd227002"
+ROLLBACK_PUBLISH_BLOB_SHA = "87296accd999643bd195304cce2de5b1bb3874bc"
 ROLLBACK_SHA = "469c13f5afbc13af3ed9e91eaf43c20825163c6e"
 ROLLBACK_IMAGE_ID = "sha256:" + "1" * 64
 ROLLBACK_MANIFEST = "sha256:" + "2" * 64

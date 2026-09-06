@@ -190,9 +190,9 @@ review commit is an ancestor of `HEAD`, that its publisher object is the fixed
 reviewed blob, and that the checked-out publisher has those exact bytes:
 
 ```sh
-git merge-base --is-ancestor b550c010da5754154fa11b7ebfecf70e064282c6 HEAD
-test "$(git rev-parse b550c010da5754154fa11b7ebfecf70e064282c6:apps/travel-map/deploy/nas/publish-rollback-baseline.sh)" = 0227f8a202464dc0874b1ba64c71d504a57ee5cd
-test "$(git hash-object apps/travel-map/deploy/nas/publish-rollback-baseline.sh)" = 0227f8a202464dc0874b1ba64c71d504a57ee5cd
+git merge-base --is-ancestor 4a991e314f6548c58f4dcbe64f749ce0dd227002 HEAD
+test "$(git rev-parse 4a991e314f6548c58f4dcbe64f749ce0dd227002:apps/travel-map/deploy/nas/publish-rollback-baseline.sh)" = 87296accd999643bd195304cce2de5b1bb3874bc
+test "$(git hash-object apps/travel-map/deploy/nas/publish-rollback-baseline.sh)" = 87296accd999643bd195304cce2de5b1bb3874bc
 ```
 
 Run Stage A only after the snapshot is approved and a dedicated, authless local
