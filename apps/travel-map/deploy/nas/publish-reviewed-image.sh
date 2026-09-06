@@ -1834,6 +1834,7 @@ run_docker() {
 run_buildx() {
     verify_publish_tools || return 1
     DOCKER_CONFIG=$publisher_docker_config DOCKER_HOST=$publisher_docker_host \
+        BUILDX_CONFIG=$publish_buildx_state \
         "$buildx_tool" "$@"
 }
 
@@ -4447,7 +4448,8 @@ validate_owned_private_directory \
     "$record_parent" "$record_parent_identity" "$TMPDIR" travel-map-publish. \
     || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'
 publish_bin=$record_parent/trusted-bin
-/bin/mkdir -m 0700 "$publish_bin" \
+publish_buildx_state=$record_parent/buildx-state
+/bin/mkdir -m 0700 "$publish_bin" "$publish_buildx_state" \
     || blocked 'BLOCKED_PRIVATE_PUBLISH_DIRECTORY'
 /usr/bin/python3 -I -S - \
     "$source_docker_tool" "$expected_docker_tool_identity" \

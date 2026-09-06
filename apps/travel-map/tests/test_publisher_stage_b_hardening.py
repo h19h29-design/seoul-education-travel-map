@@ -147,6 +147,7 @@ event = {{
     "args": args,
     "docker_host": os.environ.get("DOCKER_HOST"),
     "docker_config": os.environ.get("DOCKER_CONFIG"),
+    "buildx_config": os.environ.get("BUILDX_CONFIG"),
 }}
 with events.open("a", encoding="utf-8") as output:
     output.write(json.dumps(event) + "\\n")
@@ -171,6 +172,9 @@ elif event_count == 1 and mutation == "credential-helper":
     config_path.chmod(0o600)
 
 if executable.name == "docker-buildx":
+    state = Path(os.environ.get("BUILDX_CONFIG", str(Path(os.environ["DOCKER_CONFIG"]) / "buildx")))
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (state / "activity").write_text("synthetic builder state")
     args.insert(0, "buildx")
 
 if len(args) == 5 and args[:3] == ["image", "inspect", "--format"]:
@@ -490,6 +494,21 @@ def test_publisher_derives_endpoint_without_executing_source_tools(
     )
     assert all(event["args"][:2] != ["context", "inspect"] for event in observed)
     assert all(event["args"] != ["version"] for event in observed)
+    build_events = [
+        event for event in observed if Path(event["executable"]).name == "docker-buildx"
+    ]
+    assert build_events
+    for event in build_events:
+        state = Path(event["buildx_config"])
+        assert state == Path(event["executable"]).parent.parent / "buildx-state"
+        assert not state.parent.exists()
+    assert all(
+        event["buildx_config"] is None
+        for event in observed
+        if Path(event["executable"]).name == "docker"
+    )
+    config_root = Path(observed[0]["docker_config"])
+    assert {item.name for item in config_root.iterdir()} == {"config.json", "contexts"}
 
 
 @pytest.mark.parametrize("mutation", ["socket-rebind", "credential-helper"])
