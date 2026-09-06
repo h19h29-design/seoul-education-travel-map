@@ -154,7 +154,7 @@ def build_production_dependencies(settings: Settings) -> AppDependencies:
 def _optional_user_services(settings: Settings) -> UserServices | None:
     """Contain verified private-store failures at the optional login boundary."""
 
-    if settings.user_database_path is None:
+    if settings.stateless_beta or settings.user_database_path is None:
         return None
     try:
         return _build_user_services(settings)

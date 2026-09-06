@@ -52,6 +52,19 @@ def auth_storage_values() -> dict[str, object]:
     }
 
 
+def stateless_production_values() -> dict[str, object]:
+    values = production_values()
+    for name in auth_storage_values():
+        values.pop(name)
+    values.update(
+        {
+            "stateless_beta": True,
+            "public_base_url": "https://travel.h19h19.com",
+        }
+    )
+    return values
+
+
 # Break caught: starting the public production server without required upstreams.
 def test_production_settings_require_all_provider_keys_hosts_and_origins() -> None:
     with pytest.raises(ValidationError):
@@ -63,6 +76,46 @@ def test_production_settings_require_all_provider_keys_hosts_and_origins() -> No
     assert "kakao-secret" not in repr(settings)
     assert "seoul-secret" not in repr(settings)
     assert "opinet-secret" not in repr(settings)
+
+
+def test_stateless_beta_production_requires_no_private_storage_group() -> None:
+    settings = Settings(**stateless_production_values(), _env_file=None)
+
+    assert settings.stateless_beta is True
+    assert settings.public_base_url == "https://travel.h19h19.com"
+    assert settings.user_database_path is None
+    assert settings.kakao_oidc_client_id is None
+    assert settings.kakao_oidc_client_secret is None
+    assert settings.session_hmac_key is None
+    assert settings.kakao_subject_hmac_key is None
+    assert settings.data_encryption_key_v1 is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "user_database_path",
+        "kakao_oidc_client_id",
+        "kakao_oidc_client_secret",
+        "session_hmac_key",
+        "kakao_subject_hmac_key",
+        "data_encryption_key_v1",
+    ),
+)
+def test_stateless_beta_rejects_any_private_storage_setting(field: str) -> None:
+    values = stateless_production_values()
+    values[field] = auth_storage_values()[field]
+
+    with pytest.raises(ValidationError):
+        Settings(**values, _env_file=None)
+
+
+def test_stateless_beta_requires_canonical_public_origin() -> None:
+    values = stateless_production_values()
+    values["public_base_url"] = "https://other.example"
+
+    with pytest.raises(ValidationError):
+        Settings(**values, _env_file=None)
 
 
 @pytest.mark.parametrize(

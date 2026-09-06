@@ -3,6 +3,7 @@ import sqlite3
 import threading
 from base64 import urlsafe_b64encode
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import app.main as main_module
 from app import dependencies as dependency_module
@@ -30,6 +31,19 @@ def test_user_storage_absence_keeps_anonymous_public_endpoints_available(
 
     assert health.json() == {"status": "ok"}
     assert places.status_code == preview.status_code == 200
+
+
+def test_stateless_beta_never_attempts_private_service_assembly(monkeypatch) -> None:
+    def unavailable(_: object) -> UserServices:
+        raise AssertionError("stateless beta must not assemble private services")
+
+    monkeypatch.setattr(dependency_module, "_build_user_services", unavailable)
+    settings = SimpleNamespace(
+        stateless_beta=True,
+        user_database_path="/data/travel-map.sqlite3",
+    )
+
+    assert _optional_user_services(settings) is None
 
 
 # Break caught: a schema/open failure escaping optional assembly and preventing

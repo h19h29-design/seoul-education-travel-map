@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     )
 
     environment: Literal["development", "test", "production"] = "development"
+    # The beta deployment deliberately omits the private account store.  Keep
+    # this explicit so a later persistent deployment cannot be enabled by
+    # accidentally leaving a database path or login secret in the environment.
+    stateless_beta: bool = False
     kakao_javascript_key: SecretStr | None = None
     kakao_rest_api_key: SecretStr | None = None
     seoul_transit_service_key: SecretStr | None = None
@@ -264,23 +268,40 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production(self) -> "Settings":
-        auth_storage_values = (
-            self.public_base_url,
+        private_storage_values = (
             self.user_database_path,
             self.kakao_oidc_client_id,
             self.kakao_oidc_client_secret,
             self.session_hmac_key,
             self.kakao_subject_hmac_key,
             self.data_encryption_key_v1,
-            self.trusted_proxy_cidrs,
         )
-        supplied_auth_storage_values = sum(
-            value is not None for value in auth_storage_values
+        supplied_private_storage_values = sum(
+            value is not None for value in private_storage_values
         )
-        if supplied_auth_storage_values not in {0, len(auth_storage_values)}:
-            raise ValueError(
-                "auth/storage settings must be supplied as one complete group"
+        if self.stateless_beta:
+            if supplied_private_storage_values:
+                raise ValueError(
+                    "stateless beta must not configure private storage or login"
+                )
+            if (
+                self.public_base_url is not None
+                and self.public_base_url != "https://travel.h19h19.com"
+            ):
+                raise ValueError("PUBLIC_BASE_URL must be the canonical public origin")
+        else:
+            auth_storage_values = (
+                self.public_base_url,
+                *private_storage_values,
+                self.trusted_proxy_cidrs,
             )
+            supplied_auth_storage_values = sum(
+                value is not None for value in auth_storage_values
+            )
+            if supplied_auth_storage_values not in {0, len(auth_storage_values)}:
+                raise ValueError(
+                    "auth/storage settings must be supplied as one complete group"
+                )
         if (
             self.kakao_oidc_client_id is not None
             and self.kakao_rest_api_key is not None
@@ -289,7 +310,7 @@ class Settings(BaseSettings):
             raise ValueError(
                 "OIDC client ID must be distinct from the provider REST key"
             )
-        if supplied_auth_storage_values:
+        if not self.stateless_beta and supplied_auth_storage_values:
             if self.public_base_url != "https://travel.h19h19.com":
                 raise ValueError("PUBLIC_BASE_URL must be the canonical public origin")
             if self.user_database_path != "/data/travel-map.sqlite3":
@@ -316,7 +337,10 @@ class Settings(BaseSettings):
         )
         if missing:
             raise ValueError("production provider credentials are incomplete")
-        if supplied_auth_storage_values != len(auth_storage_values):
+        if self.stateless_beta:
+            if self.public_base_url != "https://travel.h19h19.com":
+                raise ValueError("stateless beta requires the canonical public origin")
+        elif supplied_auth_storage_values != len(auth_storage_values):
             raise ValueError("production auth/storage settings are incomplete")
         if any(urlsplit(origin).scheme != "https" for origin in self.allowed_origins):
             raise ValueError("production origins must use HTTPS")
