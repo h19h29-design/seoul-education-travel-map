@@ -335,7 +335,9 @@ def create_app(
 
     if not active_settings.stateless_beta:
         app.include_router(oauth_router)
-    app.include_router(create_router(include_private=not active_settings.stateless_beta))
+    app.include_router(
+        create_router(include_private=not active_settings.stateless_beta)
+    )
     app.mount(
         "/static",
         StaticFiles(directory=Path(__file__).with_name("static"), check_dir=False),

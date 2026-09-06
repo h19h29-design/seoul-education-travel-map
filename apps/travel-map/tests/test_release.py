@@ -1579,9 +1579,9 @@ def test_deploy_wrapper_rejects_a_stateless_user_data_mount_before_mutation(
 
 
 def test_stateless_compose_example_has_no_user_data_bind_mount() -> None:
-    compose = Path("apps/travel-map/deploy/nas/compose.stateless.example.yml").read_text(
-        encoding="utf-8"
-    )
+    compose = Path(
+        "apps/travel-map/deploy/nas/compose.stateless.example.yml"
+    ).read_text(encoding="utf-8")
 
     assert "/volume2/docker-1/seoul-education-travel-map/data" not in compose
     assert "/data:rw" not in compose
