@@ -314,7 +314,7 @@ print(resolved)
 PY
 ) || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
 trusted_path=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-tool_search_path=$canonical_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:$trusted_path
+tool_search_path=$canonical_home/.local/share/travel-map-release/bin:$canonical_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:$trusted_path
 uv_cache=$canonical_home/.cache/travel-map-release/uv
 playwright_cache=$canonical_home/Library/Caches/ms-playwright
 pnpm_store=$canonical_home/Library/pnpm/store/v10

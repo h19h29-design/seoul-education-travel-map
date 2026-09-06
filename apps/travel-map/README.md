@@ -185,6 +185,12 @@ copy-on-write checks require `/usr/bin/sandbox-exec` and the Darwin
 image or NAS target platforms, which remain the explicitly selected
 `linux/amd64` or `linux/arm64` value.
 
+Stage A uses pnpm 10 with the reviewed v10 store, matching CI. Install it into
+the project-only tool prefix with `npm install --global --prefix
+"$HOME/.local/share/travel-map-release" pnpm@10.34.5 --ignore-scripts`.
+Stage A searches that prefix first, retaining all executable ownership and
+permission checks. Shared pnpm installations and their permissions stay unchanged.
+
 Before Stage A, use a checkout with full Git history and prove that the restored
 review commit is an ancestor of `HEAD`, that its publisher object is the fixed
 reviewed blob, and that the checked-out publisher has those exact bytes:

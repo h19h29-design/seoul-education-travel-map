@@ -32,7 +32,8 @@ SAFE_BLOB = "b7767f67d3494c9c8df2deaac7129f48ce33d2f7"
 SCRIPT_BLOB = "1a2485251c33a70432394c93fb89330ef214bfc9"
 TRUSTED_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 TOOL_SEARCH_PATH_ASSIGNMENT = (
-    "tool_search_path=$canonical_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
+    "tool_search_path=$canonical_home/.local/share/travel-map-release/bin:"
+    "$canonical_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
     "$trusted_path"
 )
 UV_CACHE_ASSIGNMENT = "uv_cache=$canonical_home/.cache/travel-map-release/uv"
@@ -4888,6 +4889,42 @@ def test_release_gate_rejects_group_writable_tool_ancestor_before_execution(
     assert completed.stderr == "BLOCKED_UNSAFE_RELEASE_ENVIRONMENT\n"
     assert not record.exists()
     assert not events_path.exists()
+
+
+@pytest.mark.parametrize("dedicated", (True, False))
+def test_release_tool_resolver_prefers_project_tools_without_replacing_shared_tools(
+    tmp_path: Path, dedicated: bool
+) -> None:
+    source = (ROOT / "scripts/release-gate.sh").read_text(encoding="utf-8")
+    assignment = next(
+        line for line in source.splitlines() if line.startswith("tool_search_path=")
+    )
+    function = source.split("resolve_release_tool() {\n", 1)[1].split("\n}\n", 1)[0]
+    shared = tmp_path / ".local/bin/pnpm"
+    shared.parent.mkdir(parents=True)
+    _write_executable(shared, "#!/bin/sh\nexit 0\n")
+    selected = shared
+    if dedicated:
+        selected = tmp_path / ".local/share/travel-map-release/bin/pnpm"
+        selected.parent.mkdir(parents=True)
+        _write_executable(selected, "#!/bin/sh\nexit 0\n")
+    completed = subprocess.run(
+        ["/bin/sh", "-s", "--", str(tmp_path)],
+        input=(
+            "canonical_home=$1\ntrusted_path=/usr/bin:/bin\n"
+            'bootstrap_python() { /usr/bin/python3 -I -S "$@"; }\n'
+            + assignment
+            + "\nresolve_release_tool() {\n"
+            + function
+            + "\n}\nresolve_release_tool pnpm\n"
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == str(selected)
+    assert shared.read_text() == "#!/bin/sh\nexit 0\n"
 
 
 @pytest.mark.parametrize(
