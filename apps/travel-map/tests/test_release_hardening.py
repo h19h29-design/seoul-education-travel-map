@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 from tests.test_release import (
+    PUBLISH_TOOL_SEARCH_PATH_ASSIGNMENT,
     _image_manifest,
     _run_publish_reviewed_image,
     _short_system_tmp_root,
@@ -3540,7 +3541,7 @@ exit 2"""
         encoding="utf-8"
     )
     for original, replacement in (
-        (TOOL_SEARCH_PATH_ASSIGNMENT, f"tool_search_path={fake_bin}:$trusted_path"),
+        (PUBLISH_TOOL_SEARCH_PATH_ASSIGNMENT, f"tool_search_path={fake_bin}:$trusted_path"),
     ):
         publisher_source = _replace_once(publisher_source, original, replacement)
     if launcher_root_marker is not None:
