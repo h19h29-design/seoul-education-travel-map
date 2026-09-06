@@ -43,6 +43,10 @@ jobs:
           "$HOME/.local/bin/pnpm" --version
       - name: Install locked dependencies
         run: uv sync --project apps/travel-map --frozen --dev
+      - name: Prepare rollback test caches
+        run: |
+          # Rollback tests mock the gate but retain its cache ownership checks.
+          /usr/bin/install -d -m 0700 "$HOME/.cache/uv" "$HOME/Library/Caches/ms-playwright"
       - name: Test with warnings as errors
         env:
           PYTHONWARNINGS: error

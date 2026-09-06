@@ -1298,6 +1298,40 @@ def test_release_gate_treats_a_post_completion_signal_as_interrupted() -> None:
     assert '[ "$interrupted" -eq 1 ]' in gate
 
 
+@pytest.mark.parametrize("existing", [False, True])
+def test_ci_prepares_owned_rollback_caches_without_removing_contents(
+    tmp_path: Path, existing: bool
+) -> None:
+    """A fresh Linux runner must reach the publisher's mocked release gate."""
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    step = re.search(
+        r"(?m)^      - name: Prepare rollback test caches\n"
+        r"        run: \|\n((?:          .*\n)+)",
+        workflow,
+    )
+    caches = [tmp_path / ".cache/uv", tmp_path / "Library/Caches/ms-playwright"]
+    if existing:
+        for cache in caches:
+            cache.mkdir(parents=True, mode=0o755)
+            (cache / "retained").write_text("keep", encoding="ascii")
+    script = textwrap.dedent(step[1]) if step else ""
+    # Execute only this CI step against disposable paths, never the real home.
+    script = script.replace('"$HOME/', '"' + str(tmp_path) + "/")
+    completed = subprocess.run(
+        ["/bin/sh", "-eu", "-c", script], capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+    for cache in caches:
+        assert cache.is_dir(), f"Missing rollback prerequisite: {cache.name}"
+        assert cache.resolve() == cache
+        assert cache.stat().st_uid == os.getuid()
+        assert stat.S_IMODE(cache.stat().st_mode) == 0o700
+        if existing:
+            assert (cache / "retained").read_text(encoding="ascii") == "keep"
+    assert step is not None
+    assert step.start() < workflow.index("      - name: Test with warnings as errors")
+
+
 def test_ci_runs_every_warning_strict_release_check() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
     operations = Path("apps/travel-map/README.md").read_text(encoding="utf-8")
@@ -5586,9 +5620,9 @@ for forbidden in \
 do
     [ ! -e "$forbidden" ] || exit 109
 done
-gate_mode=$(stat -f '%Lp' "$0" 2>/dev/null || stat -c '%a' "$0")
-main_mode=$(stat -f '%Lp' apps/travel-map/app/main.py 2>/dev/null \
-    || stat -c '%a' apps/travel-map/app/main.py)
+gate_mode=$(stat -c '%a' "$0" 2>/dev/null || stat -f '%Lp' "$0")
+main_mode=$(stat -c '%a' apps/travel-map/app/main.py 2>/dev/null \
+    || stat -f '%Lp' apps/travel-map/app/main.py)
 [ "$gate_mode" = 755 ] && [ "$main_mode" = 644 ] || exit 110
 printf '%s\\n' "$CI|$PYTHONWARNINGS|$DOCKER_DEFAULT_PLATFORM|$NAS_PLATFORM|$#|$(pwd -P)" >> {gate_log_path}
 if [ {scenario} = legacy-build-race ]; then
