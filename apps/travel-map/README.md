@@ -222,6 +222,16 @@ The gate tests and builds the exact clean `HEAD` bytes offline, reaps accidental
 child processes, and durably creates one `0600` record only after the image and
 platform are revalidated. The record has exactly these four fields:
 
+The release host uses a dedicated dependency seed at
+`~/.cache/travel-map-release/uv`; the everyday uv cache is not relocated or
+modified. Populate this seed before Stage A with the locked dependency wheels
+and build dependencies. It must pass the same ownership, link and content
+validation as the original cache. The gate retains an immutable copy and gives
+each installation phase a fresh writable copy-on-write cache so uv can create
+its metadata and build the local project. Executable wheel files retain their
+execute bit. Test-created cache contents are never reused for release-context
+preparation. Missing offline dependencies continue to block the gate.
+
 ```text
 imageTag=seoul-education-travel-map:release-gate-<40-char-git-sha>
 imageId=sha256:<64-hex-local-image-id>

@@ -315,7 +315,7 @@ PY
 ) || blocked 'BLOCKED_UNSAFE_RELEASE_ENVIRONMENT'
 trusted_path=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 tool_search_path=$canonical_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:$trusted_path
-uv_cache=$canonical_home/.cache/uv
+uv_cache=$canonical_home/.cache/travel-map-release/uv
 playwright_cache=$canonical_home/Library/Caches/ms-playwright
 pnpm_store=$canonical_home/Library/pnpm/store/v10
 
@@ -971,7 +971,7 @@ def walk(root_descriptor, directory_descriptor, prefix, records, private):
                 details.st_uid not in {0, os.getuid()}
                 or details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                 or details.st_nlink != 1
-                or (private and mode != 0o400)
+                or (private and mode not in {0o400, 0o500})
             ):
                 raise ValueError
             child = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_descriptor)
@@ -2033,7 +2033,8 @@ def clone_uv_cache(source, destination, approved_identity):
                         raise ValueError
                 finally:
                     os.close(private_file)
-                os.chmod(name, 0o400, dir_fd=destination_descriptor, follow_symlinks=False)
+                private_mode = 0o500 if details.st_mode & 0o111 else 0o400
+                os.chmod(name, private_mode, dir_fd=destination_descriptor, follow_symlinks=False)
             elif stat.S_ISLNK(details.st_mode):
                 if details.st_uid not in {0, os.getuid()} or "/" not in relative or relative.split("/", 1)[0] not in {"archive-v0", "wheels-v6"}:
                     raise ValueError
@@ -3860,6 +3861,90 @@ verify_uv_caches() {
         && [ "$actual_private_uv_cache_identity" = "$expected_private_uv_cache_identity" ]
 }
 
+prepare_uv_work_cache() {
+    # uv initializes cache metadata and builds the local editable project.
+    # Give each phase its own copy; keep the attested cache immutable and
+    # never seed the pristine preparation phase from a cache used by tests.
+    verify_uv_caches || return 2
+    bootstrap_python - "$trusted_uv_cache" "$1" <<'PY' || return 2
+import ctypes
+import os
+import stat
+import sys
+from pathlib import Path
+
+clone = ctypes.CDLL(None, use_errno=True).fclonefileat
+clone.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+clone.restype = ctypes.c_int
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def copy_directory(source, destination):
+    for name in sorted(os.listdir(source)):
+        details = os.stat(name, dir_fd=source, follow_symlinks=False)
+        if stat.S_ISDIR(details.st_mode):
+            child_source = os.open(name, flags, dir_fd=source)
+            try:
+                if os.fstat(child_source) != details:
+                    raise OSError
+                os.mkdir(name, 0o700, dir_fd=destination)
+                child_destination = os.open(name, flags, dir_fd=destination)
+                try:
+                    copy_directory(child_source, child_destination)
+                finally:
+                    os.close(child_destination)
+            finally:
+                os.close(child_source)
+        elif stat.S_ISREG(details.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source)
+            try:
+                if os.fstat(child) != details or details.st_nlink != 1:
+                    raise OSError
+                if clone(child, destination, name.encode(), 0) != 0:
+                    raise OSError
+                if os.fstat(child) != details:
+                    raise OSError
+                mode = 0o700 if details.st_mode & 0o111 else 0o600
+                os.chmod(name, mode, dir_fd=destination, follow_symlinks=False)
+            finally:
+                os.close(child)
+        elif stat.S_ISLNK(details.st_mode):
+            # The immutable source policy already validates relative archive links.
+            target = os.readlink(name, dir_fd=source)
+            os.symlink(target, name, dir_fd=destination)
+        else:
+            raise OSError("unsupported cache entry")
+
+
+try:
+    source_path, destination_path = map(Path, sys.argv[1:])
+    for path in (source_path, destination_path):
+        if path.resolve(strict=True) != path or path.is_symlink():
+            raise OSError
+    source = os.open(source_path, flags)
+    destination = os.open(destination_path, flags)
+    try:
+        details = os.fstat(destination)
+        if (
+            details != destination_path.lstat()
+            or details.st_uid != os.getuid()
+            or stat.S_IMODE(details.st_mode) != 0o700
+            or os.listdir(destination)
+            or os.fstat(source) != source_path.lstat()
+        ):
+            raise OSError
+        copy_directory(source, destination)
+        if destination_path.lstat() != os.fstat(destination):
+            raise OSError
+    finally:
+        os.close(destination)
+        os.close(source)
+except (OSError, ValueError):
+    raise SystemExit(2) from None
+PY
+    verify_uv_caches || return 2
+}
+
 run_untrusted_verified() {
     verify_runtime_anchors || return 2
     case "$1" in
@@ -4217,7 +4302,9 @@ repo_git ls-tree -r -z --full-tree "$git_sha" > "$source_tree" \
 cd "$pinned_source"
 
 PYTHONWARNINGS=error
-UV_CACHE_DIR=$trusted_uv_cache
+prepare_uv_work_cache "$test_uv_cache" \
+    || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
+UV_CACHE_DIR=$test_uv_cache
 UV_PROJECT_ENVIRONMENT=$test_uv_environment
 export PYTHONWARNINGS UV_CACHE_DIR UV_PROJECT_ENVIRONMENT
 run_untrusted_verified "$uv_tool" sync --project apps/travel-map --locked --dev \
@@ -4345,7 +4432,9 @@ prepare_uv_cache=$prepare_environment_parent/cache
 UV_PROJECT_ENVIRONMENT=$prepare_uv_environment
 UV_CACHE_DIR=$prepare_uv_cache
 export UV_PROJECT_ENVIRONMENT UV_CACHE_DIR
-UV_CACHE_DIR=$trusted_uv_cache
+prepare_uv_work_cache "$prepare_uv_cache" \
+    || blocked 'BLOCKED_INVALID_RELEASE_ARTIFACT'
+UV_CACHE_DIR=$prepare_uv_cache
 export UV_CACHE_DIR
 run_untrusted_verified "$uv_tool" sync --project apps/travel-map --locked --dev \
     --python "$approved_python" --no-python-downloads --offline \

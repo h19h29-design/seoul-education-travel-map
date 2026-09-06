@@ -34,7 +34,7 @@ TOOL_SEARCH_PATH_ASSIGNMENT = (
     "tool_search_path=$canonical_home/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
     "$trusted_path"
 )
-UV_CACHE_ASSIGNMENT = "uv_cache=$canonical_home/.cache/uv"
+UV_CACHE_ASSIGNMENT = "uv_cache=$canonical_home/.cache/travel-map-release/uv"
 PLAYWRIGHT_CACHE_ASSIGNMENT = (
     "playwright_cache=$canonical_home/Library/Caches/ms-playwright"
 )
@@ -1842,6 +1842,38 @@ def test_release_gate_uses_clean_environment_and_exact_head_source(
         for event in docker_events
         if event["args"][:2] != ["context", "inspect"]
     )
+
+
+def test_release_gate_gives_each_sync_a_fresh_writable_cache(tmp_path: Path) -> None:
+    _, gate, fake_bin, events_path = _release_gate_repository(tmp_path)
+    cached_script = tmp_path / "uv-cache/archive-v0/reviewed-wheel/payload.py"
+    cached_script.chmod(0o755)
+    uv = fake_bin / "uv"
+    source = uv.read_text(encoding="utf-8")
+    anchor = 'cache_root = Path(os.environ["UV_CACHE_DIR"])\n'
+    probe = """if args[0] == "sync":
+    assert not (cache_root / "previous-phase").exists()
+    script = cache_root / "archive-v0/reviewed-wheel/payload.py"
+    assert script.stat().st_mode & stat.S_IXUSR
+    (cache_root / "CACHEDIR.TAG").write_text("cache metadata\\n")
+    (cache_root / "sdists-v9").mkdir(exist_ok=True)
+    (cache_root / "sdists-v9/.git").write_text("")
+    (cache_root / "previous-phase").write_text("phase-local\\n")
+"""
+    _write_executable(uv, _replace_once(source, anchor, anchor + probe))
+
+    completed, record = _run_release_gate(
+        tmp_path, gate, docker_config=_protected_docker_config(tmp_path)
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert record.exists()
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    syncs = [e for e in events if e["tool"] == "uv" and e["args"][0] == "sync"]
+    assert len(syncs) == 2
+    assert syncs[0]["uv_cache_dir"] != syncs[1]["uv_cache_dir"]
+    assert not (tmp_path / "uv-cache/previous-phase").exists()
+    assert not (tmp_path / "uv-cache/CACHEDIR.TAG").exists()
 
 
 def test_release_gate_uses_owner_private_cache_for_initial_uv_python_find(
