@@ -3515,31 +3515,54 @@ def forward(signum, _frame):
             pass
 
 
+def group_has_live_members():
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-axo", "pgid=,stat="],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+    except UnicodeError:
+        raise OSError from None
+    if result.returncode != 0:
+        raise OSError
+    rows = result.stdout.splitlines()
+    if not rows:
+        raise OSError
+    live = False
+    for row in rows:
+        fields = row.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            raise OSError
+        if int(fields[0]) == process.pid and not fields[1].startswith("Z"):
+            live = True
+    return live
+
+
+def signal_group(signum):
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # Darwin may report EPERM for an already terminated zombie-only group.
+        # A permission failure involving any live member must still fail closed.
+        if group_has_live_members():
+            raise
+
+
 def reap_group():
-    try:
-        os.killpg(process.pid, 0)
-    except ProcessLookupError:
+    if not group_has_live_members():
         return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+    signal_group(signal.SIGTERM)
     deadline = time.monotonic() + 2
     while True:
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
+        if not group_has_live_members():
             return
         if time.monotonic() >= deadline:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                return
+            signal_group(signal.SIGKILL)
             kill_deadline = time.monotonic() + 2
             while time.monotonic() < kill_deadline:
-                try:
-                    os.killpg(process.pid, 0)
-                except ProcessLookupError:
+                if not group_has_live_members():
                     return
                 time.sleep(0.01)
             raise OSError

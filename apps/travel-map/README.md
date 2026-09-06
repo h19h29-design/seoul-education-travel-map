@@ -185,6 +185,16 @@ copy-on-write checks require `/usr/bin/sandbox-exec` and the Darwin
 image or NAS target platforms, which remain the explicitly selected
 `linux/amd64` or `linux/arm64` value.
 
+Before Stage A, use a checkout with full Git history and prove that the restored
+review commit is an ancestor of `HEAD`, that its publisher object is the fixed
+reviewed blob, and that the checked-out publisher has those exact bytes:
+
+```sh
+git merge-base --is-ancestor b550c010da5754154fa11b7ebfecf70e064282c6 HEAD
+test "$(git rev-parse b550c010da5754154fa11b7ebfecf70e064282c6:apps/travel-map/deploy/nas/publish-rollback-baseline.sh)" = 0227f8a202464dc0874b1ba64c71d504a57ee5cd
+test "$(git hash-object apps/travel-map/deploy/nas/publish-rollback-baseline.sh)" = 0227f8a202464dc0874b1ba64c71d504a57ee5cd
+```
+
 Run Stage A only after the snapshot is approved and a dedicated, authless local
 Docker context exists. This stage must not receive registry credentials,
 provider credentials, an auth-bearing Docker path, or an open secret file
@@ -221,6 +231,13 @@ temporary mode-hardening procedure that is restored after the gate.
 The gate tests and builds the exact clean `HEAD` bytes offline, reaps accidental
 child processes, and durably creates one `0600` record only after the image and
 platform are revalidated. The record has exactly these four fields:
+
+Child cleanup requires that no live process remains in the tool's process
+group. Terminated zombie records may await OS reaping; they cannot execute or
+write artifacts. Unreadable process state and surviving live members still
+fail closed. Native test fixtures use the macOS per-user temporary hierarchy
+independently of the release runner's ambient `TMPDIR`; production cache
+ownership checks are unchanged.
 
 The release host uses a dedicated dependency seed at
 `~/.cache/travel-map-release/uv`; the everyday uv cache is not relocated or

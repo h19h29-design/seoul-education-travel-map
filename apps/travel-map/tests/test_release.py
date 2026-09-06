@@ -36,6 +36,7 @@ from tests.institutions.population_fixtures import (
 )
 
 ROOT = Path("apps/travel-map")
+CI_WORKFLOW = Path(".github/workflows/ci.yml")
 SMOKE = ROOT / "scripts/smoke-live.py"
 PREPARE_CONTEXT = ROOT / "scripts/prepare-release-context.py"
 SYNC = ROOT / "scripts/sync-institutions.py"
@@ -4851,32 +4852,123 @@ def test_deploy_wrapper_treats_interruption_during_env_swap_as_failure() -> None
     assert '[ "$interrupted" -eq 1 ]' in deploy
 
 
-# Production break caught: an operator can otherwise publish an unreviewed,
-# mutable, wrong-platform image while believing it is the deployed rollback.
-def test_rollback_baseline_publisher_is_tracked_from_the_reviewed_git_object() -> None:
-    ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", ROLLBACK_REVIEW_COMMIT, "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    object_path = f"{ROLLBACK_REVIEW_COMMIT}:apps/travel-map/deploy/nas/publish-rollback-baseline.sh"
-    blob = subprocess.run(
-        ["git", "rev-parse", object_path],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert ancestor.returncode == 0
-    assert blob.returncode == 0
-    assert blob.stdout.strip() == ROLLBACK_PUBLISH_BLOB_SHA, (
-        "the reachable restoration must retain the publisher reviewed at "
-        + ROLLBACK_ORIGINAL_REVIEW_COMMIT
-    )
+# Production break caught: an exported release artifact can otherwise contain
+# publisher bytes different from the reviewed Git blob while checkout-only
+# provenance checks still pass. This assertion must also run without `.git`.
+def test_rollback_baseline_publisher_matches_the_reviewed_git_blob() -> None:
     assert ROLLBACK_PUBLISH.is_file()
-    publisher = ROLLBACK_PUBLISH.read_text(encoding="utf-8")
+    publisher_bytes = ROLLBACK_PUBLISH.read_bytes()
+    blob_header = f"blob {len(publisher_bytes)}\0".encode()
+    assert hashlib.sha1(
+        blob_header + publisher_bytes, usedforsecurity=False
+    ).hexdigest() == (ROLLBACK_PUBLISH_BLOB_SHA)
+    publisher = publisher_bytes.decode()
     assert f"rollback_sha={ROLLBACK_SHA}" in publisher
     assert "rollback_platform=linux/amd64" in publisher
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_returncode", "expected_calls"),
+    (
+        (
+            "success",
+            0,
+            (
+                f"merge-base --is-ancestor {ROLLBACK_REVIEW_COMMIT} HEAD",
+                f"rev-parse {ROLLBACK_REVIEW_COMMIT}:{ROLLBACK_PUBLISH}",
+                f"hash-object {ROLLBACK_PUBLISH}",
+            ),
+        ),
+        (
+            "ancestor-failure",
+            9,
+            (f"merge-base --is-ancestor {ROLLBACK_REVIEW_COMMIT} HEAD",),
+        ),
+        (
+            "historical-object-mismatch",
+            1,
+            (
+                f"merge-base --is-ancestor {ROLLBACK_REVIEW_COMMIT} HEAD",
+                f"rev-parse {ROLLBACK_REVIEW_COMMIT}:{ROLLBACK_PUBLISH}",
+            ),
+        ),
+        (
+            "working-bytes-mismatch",
+            1,
+            (
+                f"merge-base --is-ancestor {ROLLBACK_REVIEW_COMMIT} HEAD",
+                f"rev-parse {ROLLBACK_REVIEW_COMMIT}:{ROLLBACK_PUBLISH}",
+                f"hash-object {ROLLBACK_PUBLISH}",
+            ),
+        ),
+    ),
+)
+def test_ci_requires_each_rollback_publisher_checkout_provenance_check(
+    tmp_path: Path,
+    scenario: str,
+    expected_returncode: int,
+    expected_calls: tuple[str, ...],
+) -> None:
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    step = re.search(
+        r"(?m)^      - name: Verify rollback publisher checkout provenance\n"
+        r"        run: \|\n(?P<script>(?:          .*\n)+)",
+        workflow,
+    )
+    assert step is not None
+    script = textwrap.dedent(step.group("script"))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "git-calls"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        """#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "$FAKE_GIT_CALLS"
+case "$1" in
+  merge-base)
+    [ "$FAKE_GIT_SCENARIO" != ancestor-failure ] || exit 9
+    ;;
+  rev-parse)
+    if [ "$FAKE_GIT_SCENARIO" = historical-object-mismatch ]; then
+      printf '%064d\\n' 0
+    else
+      printf '%s\\n' "$REVIEWED_BLOB"
+    fi
+    ;;
+  hash-object)
+    if [ "$FAKE_GIT_SCENARIO" = working-bytes-mismatch ]; then
+      printf '%064d\\n' 0
+    else
+      printf '%s\\n' "$REVIEWED_BLOB"
+    fi
+    ;;
+  *) exit 97 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "FAKE_GIT_CALLS": str(calls),
+            "FAKE_GIT_SCENARIO": scenario,
+            "REVIEWED_BLOB": ROLLBACK_PUBLISH_BLOB_SHA,
+        }
+    )
+
+    completed = subprocess.run(
+        ["bash", "-e", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == expected_returncode
+    assert tuple(calls.read_text(encoding="utf-8").splitlines()) == expected_calls
 
 
 def test_rollback_baseline_publisher_emits_only_the_verified_immutable_digest(

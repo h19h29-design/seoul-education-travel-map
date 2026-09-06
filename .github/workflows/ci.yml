@@ -47,6 +47,14 @@ jobs:
         run: |
           # Rollback tests mock the gate but retain its cache ownership checks.
           /usr/bin/install -d -m 0700 "$HOME/.cache/uv" "$HOME/Library/Caches/ms-playwright"
+      - name: Verify rollback publisher checkout provenance
+        run: |
+          review_commit=b550c010da5754154fa11b7ebfecf70e064282c6
+          publisher_path=apps/travel-map/deploy/nas/publish-rollback-baseline.sh
+          reviewed_blob=0227f8a202464dc0874b1ba64c71d504a57ee5cd
+          git merge-base --is-ancestor "$review_commit" HEAD
+          test "$(git rev-parse "$review_commit:$publisher_path")" = "$reviewed_blob"
+          test "$(git hash-object "$publisher_path")" = "$reviewed_blob"
       - name: Test with warnings as errors
         env:
           PYTHONWARNINGS: error

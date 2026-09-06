@@ -14,6 +14,7 @@ import tarfile
 import tempfile
 import textwrap
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,31 @@ PLAYWRIGHT_CACHE_ASSIGNMENT = (
 )
 PNPM_STORE_ASSIGNMENT = "pnpm_store=$canonical_home/Library/pnpm/store/v10"
 _TEST_SOCKETS: dict[Path, socket.socket | None] = {}
+
+
+@pytest.fixture
+def tmp_path(tmp_path: Path) -> Iterator[Path]:
+    """Keep native gate fixtures under the OS-owned per-user temp hierarchy.
+
+    Stage A deliberately supplies /private/tmp as TMPDIR. Its cache policy
+    rejects shared ancestors, so the fixture must not infer its trusted cache
+    location from that ambient value. Production cache checks remain unchanged.
+    """
+    if sys.platform != "darwin":
+        yield tmp_path
+        return
+    native_root = Path(
+        subprocess.check_output(
+            ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], text=True
+        ).strip()
+    ).resolve(strict=True)
+    if tmp_path.is_relative_to(native_root):
+        yield tmp_path
+        return
+    with tempfile.TemporaryDirectory(
+        prefix="travel-map-test-", dir=native_root
+    ) as path:
+        yield Path(path)
 
 
 def _release_test_socket_path(tmp_path: Path, suffix: str = "") -> Path:
@@ -2824,12 +2850,16 @@ def test_release_gate_reaps_descendants_before_committing_success(
             docker_config=_protected_docker_config(tmp_path),
         )
         lingering_pid = int(linger_pid_path.read_text(encoding="ascii"))
-        try:
-            os.kill(lingering_pid, 0)
-        except ProcessLookupError:
-            survived = False
-        else:
-            survived = True
+        state = subprocess.run(
+            ["/bin/ps", "-p", str(lingering_pid), "-o", "stat="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert state.returncode in (0, 1)
+        survived = bool(state.stdout.strip()) and not state.stdout.strip().startswith(
+            "Z"
+        )
     finally:
         if lingering_pid is not None:
             try:
@@ -2840,6 +2870,74 @@ def test_release_gate_reaps_descendants_before_committing_success(
     assert completed.returncode == 0
     assert record.exists()
     assert not survived
+
+
+def _release_process_helpers() -> dict:
+    source = (ROOT / "scripts/release-gate.sh").read_text()
+    block = source.split("run_untrusted() {", 1)[1].split("<<'PY'\n", 1)[1]
+    tree = ast.parse(block.split("\nPY", 1)[0])
+    helpers = ast.Module(
+        body=[
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef))
+        ],
+        type_ignores=[],
+    )
+    namespace = {}
+    exec(  # noqa: S102 - exercise the production script's lifecycle helpers.
+        compile(helpers, "release-group-helpers", "exec"), namespace
+    )
+    return namespace
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "decode", "empty", "malformed"])
+def test_release_group_state_read_failure_is_normalized(failure: str) -> None:
+    namespace = _release_process_helpers()
+
+    def read_state(command, **kwargs):
+        if failure == "decode":
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte")
+        status = 3 if failure == "nonzero" else 0
+        if status and kwargs["check"]:
+            raise subprocess.CalledProcessError(status, command)
+        return subprocess.CompletedProcess(
+            command, status, stdout="bad row format" if failure == "malformed" else ""
+        )
+
+    namespace["subprocess"] = SimpleNamespace(run=read_state)
+    namespace["process"] = SimpleNamespace(pid=12345)
+    with pytest.raises(OSError):
+        namespace["group_has_live_members"]()
+
+
+@pytest.mark.parametrize("already_terminated", [False, True])
+def test_release_group_cleanup_distinguishes_live_and_terminated_children(
+    already_terminated: bool,
+) -> None:
+    namespace = _release_process_helpers()
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
+    )
+    try:
+        if already_terminated:
+            child.terminate()
+            deadline = time.monotonic() + 5
+            while True:
+                state = subprocess.check_output(
+                    ["/bin/ps", "-p", str(child.pid), "-o", "stat="], text=True
+                ).strip()
+                if state.startswith("Z"):
+                    break
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        namespace["process"] = child
+        namespace["reap_group"]()
+        assert child.wait(timeout=5) < 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
 
 
 def test_release_gate_forwards_direct_wrapper_signal(tmp_path: Path) -> None:
