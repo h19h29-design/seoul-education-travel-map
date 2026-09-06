@@ -1038,11 +1038,12 @@ try:
     executable = Path(sys.argv[1])
     root = executable.parent.parent
     package_path = root / "package.json"
-    bundle = root / "dist/pnpm.mjs"
+    bundle = root / "dist" / executable.name
     package = json.loads(package_path.read_text(encoding="utf-8"))
     root_details = root.lstat()
     if (
         executable.parent.name != "bin"
+        or executable.name not in {"pnpm.cjs", "pnpm.mjs"}
         or root.resolve(strict=True) != root
         or root.is_symlink()
         or not stat.S_ISDIR(root_details.st_mode)
@@ -3128,7 +3129,7 @@ source_docker_tool=$docker_tool
 source_node_tool=$node_tool
 source_buildx_tool=$buildx_tool
 uv_tool=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/trusted-bin/uv
-pnpm_tool=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/pnpm-package/bin/pnpm.mjs
+pnpm_tool=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/pnpm-package/bin/${source_pnpm_tool##*/}
 docker_tool=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/trusted-bin/docker
 node_tool=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/trusted-bin/node
 buildx_tool=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/trusted-bin/docker-buildx
@@ -3576,7 +3577,7 @@ try:
     if interrupted:
         raise OSError
     command = sys.argv[1:]
-    if Path(command[0]).name in {"pnpm", "pnpm.mjs"}:
+    if Path(command[0]).name in {"pnpm", "pnpm.cjs", "pnpm.mjs"}:
         sandbox_exec = os.environ.get("TRAVEL_MAP_RELEASE_PNPM_SANDBOX_EXEC")
         sandbox_profile = os.environ.get("TRAVEL_MAP_RELEASE_PNPM_SANDBOX_PROFILE")
         if not sandbox_exec or not sandbox_profile:

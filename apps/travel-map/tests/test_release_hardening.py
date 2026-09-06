@@ -1767,6 +1767,34 @@ def _wait_for_release_gate_anchor(
 
 # Production break caught: ignored files and ambient Python/Git/Docker/provider
 # state can otherwise change what a standalone gate verifies and sends to Docker.
+def test_release_gate_accepts_cjs_pnpm_and_keeps_its_store_sandbox(
+    tmp_path: Path,
+) -> None:
+    _, gate, fake_bin, _ = _release_gate_repository(tmp_path)
+    package = fake_bin / "pnpm-package"
+    original = package / "bin/pnpm.mjs"
+    executable = package / "bin/pnpm.cjs"
+    original.rename(executable)
+    (package / "dist/pnpm.mjs").rename(package / "dist/pnpm.cjs")
+    (fake_bin / "pnpm").unlink()
+    (fake_bin / "pnpm").symlink_to(executable)
+    payload = executable.read_text()
+    first, rest = payload.split("\n", 1)
+    executable.write_text(
+        first
+        + "\nimport os\nfrom pathlib import Path\n"
+        + 'try:\n    Path(os.environ["PNPM_STORE_DIR"], "index").chmod(0o700)\n'
+        + "except PermissionError:\n    pass\nelse:\n    raise SystemExit(98)\n"
+        + rest
+    )
+    docker_config, _ = _sanitized_docker_context(
+        tmp_path, host="unix://" + str(_release_test_socket_path(tmp_path))
+    )
+    completed, record = _run_release_gate(tmp_path, gate, docker_config=docker_config)
+    assert completed.returncode == 0, completed.stderr
+    assert record.exists()
+
+
 def test_release_gate_uses_clean_environment_and_exact_head_source(
     tmp_path: Path,
 ) -> None:
