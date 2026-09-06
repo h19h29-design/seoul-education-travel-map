@@ -833,15 +833,23 @@ import time
 from urllib.error import URLError
 from urllib.request import urlopen
 
-for attempt in range(20):
+deadline = time.monotonic() + 30
+while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        break
     try:
-        with urlopen("http://127.0.0.1:8080/healthz", timeout=1) as response:
+        with urlopen(
+            "http://127.0.0.1:8080/healthz", timeout=min(1, remaining)
+        ) as response:
             if response.status == 200:
                 raise SystemExit(0)
     except (OSError, URLError):
         pass
-    if attempt < 19:
-        time.sleep(0.25)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        break
+    time.sleep(min(0.25, remaining))
 raise SystemExit(1)
 PY
 docker rm -f "$container" >&2 || blocked 'BLOCKED_ROLLBACK_RUNTIME_SMOKE'

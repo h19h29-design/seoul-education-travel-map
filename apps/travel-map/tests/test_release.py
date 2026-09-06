@@ -5321,6 +5321,71 @@ def test_rollback_baseline_publisher_cleans_a_failed_owned_container_start(
     )
 
 
+def test_rollback_runtime_probe_accepts_readiness_after_five_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    timeouts: list[float] = []
+
+    class HealthyResponse:
+        status = 200
+
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    def urlopen(_: str, *, timeout: float) -> HealthyResponse:
+        timeouts.append(timeout)
+        if clock[0] < 7.25:
+            raise OSError("not ready")
+        return HealthyResponse()
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+
+    with pytest.raises(SystemExit) as completed:
+        # The extracted source is the reviewed repository artifact under test.
+        exec(  # noqa: S102
+            compile(_rollback_health_probe_source(), "<rollback-health-probe>", "exec")
+        )
+
+    assert completed.value.code == 0
+    assert 7.25 <= clock[0] <= 30
+    assert timeouts and all(0 < timeout <= 1 for timeout in timeouts)
+
+
+def test_rollback_runtime_probe_blocks_at_the_thirty_second_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    timeouts: list[float] = []
+
+    def urlopen(_: str, *, timeout: float) -> None:
+        timeouts.append(timeout)
+        raise OSError("not ready")
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+
+    with pytest.raises(SystemExit) as completed:
+        # The extracted source is the reviewed repository artifact under test.
+        exec(  # noqa: S102
+            compile(_rollback_health_probe_source(), "<rollback-health-probe>", "exec")
+        )
+
+    assert completed.value.code == 1
+    assert clock[0] == 30
+    assert timeouts and all(0 < timeout <= 1 for timeout in timeouts)
+
+
 # Production break caught: the historical gate's fixed legacy tag is mutable.
 # A successful build must be bound to its immutable iidfile before that name can
 # be retagged by another Docker client.
@@ -5422,6 +5487,18 @@ def test_rollback_baseline_publisher_accepts_no_positional_input(
     assert result.completed.stderr == "usage: publish-rollback-baseline.sh\n"
     assert not result.gate_log.exists()
     assert not result.docker_log.exists()
+
+
+def _rollback_health_probe_source() -> str:
+    publisher = ROLLBACK_PUBLISH.read_text(encoding="utf-8")
+    anchor = (
+        "docker exec -i \"$container\" python - >/dev/null <<'PY' \\\n"
+        "    || blocked 'BLOCKED_ROLLBACK_RUNTIME_SMOKE'\n"
+    )
+    assert publisher.count(anchor) == 1
+    start = publisher.index(anchor) + len(anchor)
+    end = publisher.index("\nPY\n", start)
+    return publisher[start:end]
 
 
 def _run_smoke(
