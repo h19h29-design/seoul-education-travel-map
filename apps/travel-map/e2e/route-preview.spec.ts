@@ -428,14 +428,20 @@ test("renders route source data as inert text", async ({ page }) => {
   }>("preview.json");
   preview.routeLegs[0].routes[0].source =
     '<img src=x onerror="window.__task8Xss=\'executed\'">';
-  await installMockApi(page, { preview });
+  await installMockApi(page, {
+    previewForPayload: async () => {
+      // Exercise a response that arrives after the calculate click completes.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return preview;
+    },
+  });
   await page.goto("/");
   await completePublicOfficialTrip(page);
 
-  await expect(page.locator("#route-list img")).toHaveCount(0);
-  expect(await page.locator(".route-source").allTextContents()).toContain(
+  await expect.poll(() => page.locator(".route-source").allTextContents()).toContain(
     '<img src=x onerror="window.__task8Xss=\'executed\'"> 기준',
   );
+  await expect(page.locator("#route-list img")).toHaveCount(0);
   await expect
     .poll(() => page.evaluate(() => window.__task8Xss))
     .toBeUndefined();
