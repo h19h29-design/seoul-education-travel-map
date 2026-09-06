@@ -5191,6 +5191,8 @@ try:
             raise ValueError
         print("classic", f"{config['digest']},{config['size']}")
     elif remote_media_type == OCI_INDEX:
+        if remote_digest != image_id:
+            raise ValueError
         manifests = value.get("manifests")
         if type(manifests) is not list or not manifests:
             raise ValueError
@@ -5312,7 +5314,7 @@ try:
     if role == "runnable":
         if (
             IN_TOTO_LAYER in media_types
-            or config["digest"] != expected_config_digest
+            or expected_config_digest != "-"
         ):
             raise ValueError
     elif role == "attestation":
@@ -5364,7 +5366,7 @@ case "$root_mode" in
             "$runnable_manifest" "$runnable_digest" "$runnable_size" \
             || blocked 'BLOCKED_REMOTE_IMAGE_MISMATCH'
         runnable_config_descriptor=$(validate_child_manifest \
-            "$runnable_manifest" runnable "$image_id") \
+            "$runnable_manifest" runnable "-") \
             || blocked 'BLOCKED_REMOTE_IMAGE_MISMATCH'
         runnable_config_digest=${runnable_config_descriptor%,*}
         runnable_config_size=${runnable_config_descriptor#*,}

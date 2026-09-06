@@ -1874,7 +1874,6 @@ def _bind_publish_payloads(
     manifests = bound_root["manifests"]
     assert isinstance(manifests, list)
     child_digests: dict[str, str] = {}
-    runnable_image_id: str | None = None
     children = raw_children or {}
     configs = image_configs or {}
     for candidate in manifests:
@@ -1900,13 +1899,6 @@ def _bind_publish_payloads(
             config_payload,
             str(child_config["mediaType"]),
         )
-        if (
-            not attestation
-            and isinstance(platform, dict)
-            and platform.get("os") == "linux"
-            and platform.get("architecture") == "amd64"
-        ):
-            runnable_image_id = str(bound_child["config"]["digest"])
         child_payload = _encoded_publish_json(bound_child)
         child_descriptor = _publish_payload_descriptor(
             child_payload,
@@ -1932,8 +1924,8 @@ def _bind_publish_payloads(
     root_descriptor = _publish_payload_descriptor(root_payload, root_media_type)
     remote_digest = str(root_descriptor["digest"])
     raw_payloads[remote_digest] = root_payload.hex()
-    if original_remote_digest == original_image_id and runnable_image_id is not None:
-        image_id = runnable_image_id
+    if original_remote_digest == original_image_id:
+        image_id = remote_digest
     return (
         image_id,
         remote_digest,
@@ -3468,7 +3460,7 @@ def test_publish_reviewed_image_accepts_containerd_index_with_linked_attestation
             attestation_link=runnable_digest,
         ),
         raw_children={
-            runnable_digest: _image_manifest(image_id),
+            runnable_digest: _image_manifest("sha256:" + "f" * 64),
             attestation_digest: _image_manifest(
                 attestation_config,
                 attestation=True,
@@ -3495,7 +3487,7 @@ def test_publish_reviewed_image_accepts_containerd_index_without_attestation(
         remote_digest=image_id,
         root_manifest=_index_manifest([(runnable_digest, "linux/amd64")]),
         raw_children={
-            runnable_digest: _image_manifest(image_id),
+            runnable_digest: _image_manifest("sha256:" + "f" * 64),
         },
         image_configs={runnable_digest: {"architecture": "amd64", "os": "linux"}},
         expect_success=True,
@@ -4620,8 +4612,8 @@ def test_publish_reviewed_image_rejects_child_image_platform_mismatch(
     assert completed.stderr == "BLOCKED_REMOTE_IMAGE_MISMATCH\n"
 
 
-@pytest.mark.parametrize("identity_mode", ("classic-config", "containerd-config"))
-def test_publish_reviewed_image_rejects_classic_or_containerd_config_mismatch(
+@pytest.mark.parametrize("identity_mode", ("classic-config", "containerd-index"))
+def test_publish_reviewed_image_rejects_classic_config_or_containerd_root_mismatch(
     tmp_path: Path,
     identity_mode: str,
 ) -> None:
