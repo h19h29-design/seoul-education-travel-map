@@ -1210,7 +1210,7 @@ recorded_config_payload = (
     "<protected-bootstrap-config>" if is_context_inspect else docker_config_payload
 )
 with Path({event_literal}).open("a", encoding="utf-8") as output:
-    output.write(json.dumps({{"tool": "docker", "args": args, "cwd": str(Path.cwd()), "environment": sorted(os.environ), "docker_config_path": os.environ["DOCKER_CONFIG"], "docker_config_payload": recorded_config_payload, "docker_host": os.environ.get("DOCKER_HOST"), "context_dockerfile": context_dockerfile}}) + "\\n")
+    output.write(json.dumps({{"tool": "docker", "args": args, "cwd": str(Path.cwd()), "environment": sorted(os.environ), "docker_config_path": os.environ["DOCKER_CONFIG"], "docker_config_payload": recorded_config_payload, "docker_host": os.environ.get("DOCKER_HOST"), "context_dockerfile": context_dockerfile, "buildx_config_path": os.environ.get("BUILDX_CONFIG")}}) + "\\n")
 image_id = "sha256:" + "a" * 64
 if is_context_inspect:
     context_name = json.loads(docker_config_payload).get("currentContext")
@@ -1245,6 +1245,9 @@ if args[:2] == ["buildx", "build"]:
     context = Path(args[-1])
     if not context.is_dir() or not (context / "Dockerfile").is_file():
         raise SystemExit(91)
+    state = Path(os.environ.get("BUILDX_CONFIG", str(Path(os.environ["DOCKER_CONFIG"]) / "buildx")))
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (state / "activity").write_text("build completed\\n", encoding="utf-8")
     raise SystemExit(0)
 if args[:3] == ["image", "inspect", "--format"]:
     if ".Os" in args[3] or ".Architecture" in args[3]:
@@ -1822,6 +1825,17 @@ def test_release_gate_uses_docker_shared_cache_parent_for_storage_probe(
     assert all(path.parent.parent == shared_parent.resolve() for path in mounts)
     assert all(path.name == "data" for path in mounts)
     assert all(not path.parent.exists() for path in mounts)
+    state_events = [
+        event
+        for line in events_path.read_text().splitlines()
+        if (event := json.loads(line))["tool"] == "docker"
+        and event["args"][:2] == ["buildx", "build"]
+    ]
+    assert len(state_events) == 1
+    state = Path(state_events[0]["buildx_config_path"])
+    docker_config = Path(state_events[0]["docker_config_path"])
+    assert state == docker_config.parent / "buildx-config"
+    assert not state.parent.exists()
 
 
 def test_release_gate_uses_clean_environment_and_exact_head_source(

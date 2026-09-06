@@ -1085,7 +1085,9 @@ run_docker() {
 
 run_buildx() {
     verify_release_docker_socket "$release_docker_host" || return 1
-    DOCKER_HOST=$release_docker_host "$buildx_tool" "$@"
+    DOCKER_HOST=$release_docker_host \
+        BUILDX_CONFIG=$TRAVEL_MAP_RELEASE_PRIVATE_ROOT/buildx-config \
+        "$buildx_tool" "$@"
 }
 
 case "$0" in
@@ -1549,6 +1551,7 @@ case "$clean_environment_marker" in
         private_npm_cache=$private_environment/npm-cache
         private_pnpm_home=$private_environment/pnpm-home
         private_docker_config=$private_environment/docker-config
+        private_buildx_config=$private_environment/buildx-config
         private_trusted_bin=$private_environment/trusted-bin
         private_release_record=$private_environment/release-record
         private_pnpm_package=$private_environment/pnpm-package
@@ -1557,7 +1560,7 @@ case "$clean_environment_marker" in
         /bin/mkdir -m 0700 \
             "$private_home" "$private_xdg_config" "$private_xdg_cache" \
             "$private_xdg_data" "$private_npm_cache" "$private_pnpm_home" \
-            "$private_docker_config" "$private_trusted_bin" \
+            "$private_docker_config" "$private_buildx_config" "$private_trusted_bin" \
             "$private_release_record" \
             || blocked 'BLOCKED_PRIVATE_DIRECTORY'
         if ! bootstrap_python - \
@@ -3004,6 +3007,7 @@ private_root_name = "TRAVEL_MAP_RELEASE_PRIVATE_ROOT"
 derived_paths = {"UV_PROJECT_ENVIRONMENT": "xdg-cache/test-uv-environment"}
 controlled_layout = {
     "docker-config",
+    "buildx-config",
     "trusted-bin",
     "release-record",
     "pnpm-package",
@@ -3066,6 +3070,15 @@ try:
             or any(path.iterdir())
         ):
             raise ValueError
+    buildx_config = private_root / "buildx-config"
+    buildx_details = buildx_config.lstat()
+    if (
+        not stat.S_ISDIR(buildx_details.st_mode)
+        or stat.S_IMODE(buildx_details.st_mode) != 0o700
+        or buildx_details.st_uid != os.getuid()
+        or any(buildx_config.iterdir())
+    ):
+        raise ValueError
     docker_config = private_root / "docker-config"
     config = docker_config / "config.json"
     config_details = config.lstat()
