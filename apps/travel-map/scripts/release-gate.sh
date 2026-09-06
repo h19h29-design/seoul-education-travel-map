@@ -4663,10 +4663,28 @@ run_docker run -d --name "$gate_container" --user 10001:10001 \
 
 run_docker exec -i "$gate_container" python - <<'PY' \
     || blocked 'BLOCKED_ENCRYPTED_STORAGE_RUNTIME'
+import time
+from urllib.error import URLError
 from urllib.request import urlopen
 
-with urlopen("http://127.0.0.1:8080/healthz", timeout=5) as response:
-    assert response.status == 200
+deadline = time.monotonic() + 30
+while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        break
+    try:
+        with urlopen(
+            "http://127.0.0.1:8080/healthz", timeout=min(1, remaining)
+        ) as response:
+            if response.status == 200:
+                raise SystemExit(0)
+    except (OSError, URLError):
+        pass
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        break
+    time.sleep(min(0.25, remaining))
+raise SystemExit(1)
 PY
 run_docker exec -i "$gate_container" python - <<'PY' \
     || blocked 'BLOCKED_ENCRYPTED_STORAGE_MODE'

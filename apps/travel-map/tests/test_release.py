@@ -5320,8 +5320,10 @@ def test_rollback_baseline_publisher_cleans_a_failed_owned_container_start(
     )
 
 
-def test_rollback_runtime_probe_accepts_readiness_after_five_seconds(
+@pytest.mark.parametrize("probe", ("rollback", "release"))
+def test_runtime_probe_accepts_readiness_after_five_seconds(
     monkeypatch: pytest.MonkeyPatch,
+    probe: str,
 ) -> None:
     clock = [0.0]
     timeouts: list[float] = []
@@ -5337,7 +5339,7 @@ def test_rollback_runtime_probe_accepts_readiness_after_five_seconds(
 
     def urlopen(_: str, *, timeout: float) -> HealthyResponse:
         timeouts.append(timeout)
-        if clock[0] < 7.25:
+        if clock[0] < 8:
             raise OSError("not ready")
         return HealthyResponse()
 
@@ -5350,16 +5352,20 @@ def test_rollback_runtime_probe_accepts_readiness_after_five_seconds(
     with pytest.raises(SystemExit) as completed:
         # The extracted source is the reviewed repository artifact under test.
         exec(  # noqa: S102
-            compile(_rollback_health_probe_source(), "<rollback-health-probe>", "exec")
+            compile(
+                _runtime_health_probe_source(probe), "<runtime-health-probe>", "exec"
+            )
         )
 
     assert completed.value.code == 0
-    assert 7.25 <= clock[0] <= 30
+    assert 8 <= clock[0] <= 30
     assert timeouts and all(0 < timeout <= 1 for timeout in timeouts)
 
 
-def test_rollback_runtime_probe_blocks_at_the_thirty_second_deadline(
+@pytest.mark.parametrize("probe", ("rollback", "release"))
+def test_runtime_probe_blocks_at_the_thirty_second_deadline(
     monkeypatch: pytest.MonkeyPatch,
+    probe: str,
 ) -> None:
     clock = [0.0]
     timeouts: list[float] = []
@@ -5377,7 +5383,9 @@ def test_rollback_runtime_probe_blocks_at_the_thirty_second_deadline(
     with pytest.raises(SystemExit) as completed:
         # The extracted source is the reviewed repository artifact under test.
         exec(  # noqa: S102
-            compile(_rollback_health_probe_source(), "<rollback-health-probe>", "exec")
+            compile(
+                _runtime_health_probe_source(probe), "<runtime-health-probe>", "exec"
+            )
         )
 
     assert completed.value.code == 1
@@ -5488,12 +5496,24 @@ def test_rollback_baseline_publisher_accepts_no_positional_input(
     assert not result.docker_log.exists()
 
 
-def _rollback_health_probe_source() -> str:
-    publisher = ROLLBACK_PUBLISH.read_text(encoding="utf-8")
-    anchor = (
-        "docker exec -i \"$container\" python - >/dev/null <<'PY' \\\n"
-        "    || blocked 'BLOCKED_ROLLBACK_RUNTIME_SMOKE'\n"
-    )
+def _runtime_health_probe_source(probe: str) -> str:
+    path, anchor = {
+        "rollback": (
+            ROLLBACK_PUBLISH,
+            (
+                "docker exec -i \"$container\" python - >/dev/null <<'PY' \\\n"
+                "    || blocked 'BLOCKED_ROLLBACK_RUNTIME_SMOKE'\n"
+            ),
+        ),
+        "release": (
+            ROOT / "scripts/release-gate.sh",
+            (
+                "run_docker exec -i \"$gate_container\" python - <<'PY' \\\n"
+                "    || blocked 'BLOCKED_ENCRYPTED_STORAGE_RUNTIME'\n"
+            ),
+        ),
+    }[probe]
+    publisher = path.read_text(encoding="utf-8")
     assert publisher.count(anchor) == 1
     start = publisher.index(anchor) + len(anchor)
     end = publisher.index("\nPY\n", start)
