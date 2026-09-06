@@ -157,7 +157,11 @@ def _scenario(target: str | None, mismatch: str | None) -> dict[str, object]:
             OCI_INDEX,
             mismatch=mismatch if target == "index-root" else None,
         )
-        image_id = expected_image_id
+        image_id = _digest(root_payload)
+        if target == "runnable-config":
+            # A changed config descriptor also changes the root index. Keep
+            # the original approved root so transitive identity rejects it.
+            image_id = str(_scenario(None, None)["image_id"])
         raw_by_digest = {
             str(root_descriptor["digest"]): root_payload.hex(),
             str(runnable_descriptor["digest"]): runnable_manifest.hex(),
@@ -171,7 +175,7 @@ def _scenario(target: str | None, mismatch: str | None) -> dict[str, object]:
             ["descriptor", "tag"],
             ["raw", str(root_descriptor["digest"])],
         ]
-        if target != "index-root":
+        if target not in {"index-root", "runnable-config"}:
             expected_network.append(["raw", str(runnable_descriptor["digest"])])
         if target in {"attestation-child", None}:
             expected_network.append(["image", str(runnable_descriptor["digest"])])
