@@ -3559,7 +3559,16 @@ try:
         if not sandbox_exec or not sandbox_profile:
             raise OSError
         command = [sandbox_exec, "-p", sandbox_profile, *command]
-    process = subprocess.Popen(command, start_new_session=True)
+    # Supervisor controls are private to this invocation. Inheriting them would
+    # make nested release checks incorrectly skip their own bootstrap.
+    child_environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("TRAVEL_MAP_RELEASE_")
+    }
+    process = subprocess.Popen(
+        command, env=child_environment, start_new_session=True
+    )
     if interrupted and process.poll() is None:
         os.killpg(process.pid, signal.SIGTERM)
     while True:

@@ -1775,6 +1775,7 @@ def test_release_gate_uses_clean_environment_and_exact_head_source(
     assert first_uv["docker_config_payload"] == "{}\n"
     assert not events_path.with_suffix(".core-injection").exists()
     environment = set(first_uv["environment"])
+    assert not any(name.startswith("TRAVEL_MAP_RELEASE_") for name in environment)
     assert not environment.intersection(
         {
             "PYTHONPATH",
