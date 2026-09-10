@@ -31,11 +31,13 @@ _RETENTION_RETRY_SECONDS = 60 * 60
 _USER_STORAGE_LOG = logging.getLogger("travel_map.user_storage")
 # Kakao Maps loads the SDK bootstrap/API from dapi.kakao.com, its runtime from
 # t1.daumcdn.net, and map tile images from Daum CDN subdomains. These are the
-# only third-party origins required by the public map; no inline code is allowed.
+# only third-party origins required by the public map; inline scripts and style
+# elements stay blocked while Kakao's runtime SVG style attributes are allowed.
 _PUBLIC_CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
     "script-src 'self' https://dapi.kakao.com https://t1.daumcdn.net; "
     "style-src 'self'; "
+    "style-src-attr 'unsafe-inline'; "
     "img-src 'self' data: https://*.daumcdn.net; "
     "connect-src 'self' https://dapi.kakao.com; "
     "font-src 'self'; "

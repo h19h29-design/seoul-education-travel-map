@@ -51,17 +51,19 @@ def test_invalid_host_uses_json_error_envelope(client) -> None:
     assert response.json() == {"error": {"code": "INVALID_HOST"}}
 
 
-# Break caught: serving the public UI without a browser-enforced policy left
-# response-backed map labels able to execute through an HTML rendering sink.
+# Break caught: Kakao route overlays rendered as black fills when Kakao runtime
+# style attributes were blocked by a CSP without style-src-attr.
 def test_public_ui_has_strict_kakao_compatible_content_security_policy() -> None:
     with TestClient(create_app()) as client:
         response = client.get("/")
 
     assert response.status_code == 200
-    assert response.headers["content-security-policy"] == (
+    csp = response.headers["content-security-policy"]
+    assert csp == (
         "default-src 'self'; "
         "script-src 'self' https://dapi.kakao.com https://t1.daumcdn.net; "
         "style-src 'self'; "
+        "style-src-attr 'unsafe-inline'; "
         "img-src 'self' data: https://*.daumcdn.net; "
         "connect-src 'self' https://dapi.kakao.com; "
         "font-src 'self'; "
@@ -70,7 +72,15 @@ def test_public_ui_has_strict_kakao_compatible_content_security_policy() -> None
         "form-action 'self'; "
         "frame-ancestors 'none'"
     )
-    assert "unsafe-inline" not in response.headers["content-security-policy"]
+    directives = {
+        name.strip(): value.strip()
+        for part in csp.split(";")
+        for name, _, value in [part.strip().partition(" ")]
+    }
+    assert "unsafe-inline" not in directives["script-src"]
+    assert "unsafe-inline" not in directives["style-src"]
+    assert directives["style-src-attr"] == "'unsafe-inline'"
+    assert sum("unsafe-inline" in value for value in directives.values()) == 1
 
 
 # Break caught: public HTML, static assets, and API responses relying only on
