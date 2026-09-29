@@ -382,5 +382,29 @@ export async function completePublicOfficialTrip(page: Page): Promise<void> {
   await page
     .getByRole("option", { name: /서울특별시청.*세종대로 110/ })
     .click();
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.getByRole("button", { name: "경로·예상 여비 확인" }).click();
+}
+
+// The refreshed view shows either the conditions form or the results panel, so a
+// second form interaction after a calculation starts with the 조건 tab.
+export async function openFormView(page: Page): Promise<void> {
+  await page.locator("#ui-form-tab").click();
+}
+
+// The refreshed input view collapses the end date-time block; expanding it has
+// the same effect as pressing its summary.
+export async function openEndScheduleDetail(page: Page): Promise<void> {
+  await revealCollapsedDetail(page, ".ui-end-details");
+}
+
+// Vehicle assumptions, prior allowance, and the fixed policy note live in the
+// collapsed 차량·추가 출장 설정 block.
+export async function openExtraOptionsDetail(page: Page): Promise<void> {
+  await revealCollapsedDetail(page, ".ui-more-options");
+}
+
+async function revealCollapsedDetail(page: Page, selector: string): Promise<void> {
+  await page.locator(selector).evaluate((node) => {
+    (node as HTMLDetailsElement).open = true;
+  });
 }
