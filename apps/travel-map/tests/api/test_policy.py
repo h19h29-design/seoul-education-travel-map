@@ -33,6 +33,8 @@ DISCLOSURE_KEYS = {
     "sourceRefs",
 }
 STATIC_ROOT = Path("apps/travel-map/app/static")
+# The W3C SVG namespace is a fixed identifier, not a disclosed policy value.
+SVG_NAMESPACE_URL = "http://www.w3.org/2000/svg"
 
 
 # Production break caught: selecting a rule by the host/UTC date instead of the
@@ -270,12 +272,26 @@ def test_policy_number_scanner_detects_grouped_and_plain_literals(literal: str) 
     )
 
 
+# The only tolerated spelling is the SVG namespace URI itself: a policy value
+# next to it is still reported.
+def test_policy_number_scanner_ignores_only_the_w3c_svg_namespace() -> None:
+    namespace = f'const SVG_NS = "{SVG_NAMESPACE_URL}";'
+    assert_no_policy_numbers({"/static/ui-refresh.js": namespace}, {2_000})
+
+    with pytest.raises(AssertionError, match="policy number 2000"):
+        assert_no_policy_numbers(
+            {"/static/ui-refresh.js": f"{namespace}\nconst metres = 2000;"},
+            {2_000},
+        )
+
+
 def assert_no_policy_numbers(
     public_artifacts: dict[str, str],
     disclosed_numbers: set[int],
 ) -> None:
     for artifact_name, contents in public_artifacts.items():
         normalized_contents = re.sub(r"(?<=\d)_(?=\d)", "", contents)
+        normalized_contents = normalized_contents.replace(SVG_NAMESPACE_URL, "")
         for value in disclosed_numbers:
             assert re.search(rf"(?<!\d){value}(?!\d)", normalized_contents) is None, (
                 f"policy number {value} duplicated in {artifact_name}"
