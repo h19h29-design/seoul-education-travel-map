@@ -1,0 +1,282 @@
+/* Additive UI: keep original styles.css; never apply icon rules to SDK SVGs. */
+body.travel-ui-v2 {
+  --ui-green:#126b53; --ui-green-dark:#0a513e; --ui-green-light:#edf6f1;
+  --ui-text:#20352e; --ui-muted:#66786f; --ui-line:#dfe7e1; --ui-background:#f5f7f5;
+  --navy:var(--ui-text); --blue:var(--ui-green); --blue-weak:var(--ui-green-light);
+  --mint:#207d61; --mint-weak:#edf6f1; --ink:var(--ui-text); --muted:var(--ui-muted);
+  --line:var(--ui-line); --line-strong:#d1dcd4; --surface:#fff; --canvas:var(--ui-background);
+  --workspace-height:clamp(640px,calc(100dvh - 270px),850px);
+  margin:0; min-width:0; min-height:100vh; background:var(--ui-background);color:var(--ui-text);
+  font-family:'Pretendard','Apple SD Gothic Neo','Noto Sans KR','Noto Sans CJK KR','Malgun Gothic',system-ui,sans-serif;
+  font-size:14px;line-height:1.5;letter-spacing:-.3px;-webkit-font-smoothing:antialiased;
+}
+.travel-ui-v2 *,.travel-ui-v2 *::before,.travel-ui-v2 *::after{box-sizing:border-box}
+.travel-ui-v2 [hidden]{display:none!important}
+.travel-ui-v2 .ui-icon{flex:0 0 auto;width:20px;height:20px}
+.travel-ui-v2 :is(button,input,select,summary){font:inherit}
+.travel-ui-v2 :is(button,summary,select){cursor:pointer}
+.travel-ui-v2 button{-webkit-tap-highlight-color:transparent}
+.travel-ui-v2 button:disabled{cursor:not-allowed}
+.travel-ui-v2 :where(button,input,select,a,summary):focus-visible{outline:3px solid #73ad97;outline-offset:3px}
+.travel-ui-v2 :where(h1,h2)[tabindex='-1']:focus{outline:none}
+/* Header and page hierarchy */
+.travel-ui-v2 .app-header{height:78px;padding:0 max(28px,calc((100vw - 1440px)/2));gap:22px;border-bottom:1px solid var(--ui-line);display:flex;align-items:center;background:#fff}
+.travel-ui-v2 .brand{display:inline-flex;align-items:center;gap:11px;color:var(--ui-text);text-decoration:none;letter-spacing:-.6px;flex-shrink:0}
+.travel-ui-v2 .ui-brand-mark{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:var(--ui-green);color:white}
+.travel-ui-v2 .ui-brand-mark .ui-icon{width:26px;height:26px}
+.travel-ui-v2 .ui-brand-words{display:grid;gap:1px}
+.travel-ui-v2 .ui-brand-words strong{font-size:19px;font-weight:800;line-height:1.35}
+.travel-ui-v2 .ui-brand-words small{color:var(--ui-muted);font-size:11px;font-weight:500;letter-spacing:-.2px}
+.travel-ui-v2 .utility-nav{margin-left:auto;display:flex;gap:8px;align-items:center}
+.travel-ui-v2 .utility-button{display:inline-flex;justify-content:center;align-items:center;min-height:40px;padding:8px 12px;font-size:13px;font-weight:600;color:#506359;background:none;border:0;border-radius:8px;white-space:nowrap}
+.travel-ui-v2 .utility-button:hover{background:var(--ui-green-light);color:var(--ui-green)}
+.travel-ui-v2 .auth-status{font-size:11px}
+.travel-ui-v2 .menu-button{display:none}
+.travel-ui-v2 .ui-privacy{display:inline-flex;gap:6px;align-items:center;color:var(--ui-green);font-size:11px;font-weight:600;padding-left:18px;border-left:1px solid var(--ui-line);white-space:nowrap}
+.travel-ui-v2 .ui-privacy .ui-icon{width:15px;height:15px}
+.travel-ui-v2 .ui-intro{max-width:1440px;margin:0 auto;padding:27px 28px 24px;display:flex;justify-content:space-between;align-items:center;gap:20px}
+.travel-ui-v2 .ui-intro h1{margin:0 0 6px;font-size:clamp(25px,2.2vw,31px);line-height:1.3;font-weight:800;letter-spacing:-1.4px}
+.travel-ui-v2 .ui-intro p{margin:0;font-size:13px;color:var(--ui-muted)}
+.travel-ui-v2 .ui-flow-hint{display:flex;gap:9px;align-items:center;flex-shrink:0;color:#798a80}
+.travel-ui-v2 .ui-flow-hint>span{display:inline-flex;gap:7px;align-items:center;font-size:12px;font-weight:600}
+.travel-ui-v2 .ui-flow-hint b{display:grid;place-items:center;width:24px;height:24px;border:1px solid var(--ui-line);border-radius:50%;font-size:11px;font-weight:600;background:white}
+.travel-ui-v2 .ui-flow-hint .is-active{color:var(--ui-green)}
+.travel-ui-v2 .ui-flow-hint .is-active b{background:var(--ui-green);color:white;border-color:var(--ui-green)}
+.travel-ui-v2 .ui-flow-hint>.ui-icon{width:14px;height:14px;transform:rotate(-90deg);color:#aab8ae}
+/* Two-column working surface */
+.travel-ui-v2 .app-shell{display:grid;grid-template-columns:402px minmax(0,1fr);gap:20px;width:100%;max-width:1440px;min-height:0;padding:0 28px;margin:0 auto;align-items:start}
+.travel-ui-v2 .rail{display:flex;flex-direction:column;min-width:0;height:var(--workspace-height);background:white;border:1px solid var(--ui-line);border-radius:18px;box-shadow:0 4px 16px rgb(32 53 46/3%);overflow:hidden}
+.travel-ui-v2 .ui-view-tabs{display:grid;grid-template-columns:1fr 1fr;padding:0 22px;gap:20px;flex:0 0 53px;border-bottom:1px solid var(--ui-line)}
+.travel-ui-v2 .ui-view-tab{position:relative;border:0;padding:14px 0;background:none;color:var(--ui-muted);font-size:13px;font-weight:700;border-radius:0}
+.travel-ui-v2 .ui-view-tab[aria-selected='true']{color:var(--ui-green)}
+.travel-ui-v2 .ui-view-tab[aria-selected='true']::after{content:'';position:absolute;height:3px;border-radius:3px 3px 0 0;background:var(--ui-green);left:0;right:0;bottom:-1px}
+.travel-ui-v2 .ui-view-tab:disabled{color:#929e96}
+.travel-ui-v2 :is(.input-section,.results-panel){flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#d4dfd7 transparent;padding:20px 22px 0;background:#fff;border:none}
+.travel-ui-v2.ui-form-view .results-panel{display:none}
+.travel-ui-v2 .input-section>h2{font-size:17px;margin:0 0 16px;color:var(--ui-text);letter-spacing:-.5px;font-weight:750}
+.travel-ui-v2 .input-section form{display:grid;gap:16px;margin:0}
+.travel-ui-v2 label{display:grid;gap:6px;color:var(--ui-text);font-size:12px;font-weight:650}
+.travel-ui-v2 :is(input,select){width:100%;min-width:0;min-height:43px;border:1px solid #dce5de;border-radius:9px;padding:10px 11px;background:#fff;color:var(--ui-text);box-shadow:none;font-size:13px;transition:border-color .15s,background .15s}
+.travel-ui-v2 :is(input,select):hover{border-color:#b0c6b9}
+.travel-ui-v2 :is(input,select):focus{border-color:var(--ui-green)}
+.travel-ui-v2 input::placeholder{color:#8b9a90;font-size:12px}
+.travel-ui-v2 :is(input[type='checkbox'],input[type='radio']){accent-color:var(--ui-green)}
+.travel-ui-v2 fieldset{min-width:0}
+/* Route direction cards */
+.travel-ui-v2 .trip-patterns{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;border:0;border-radius:0;padding:0;margin:0}
+.travel-ui-v2 .trip-patterns legend{padding:0 0 8px;font-size:12px;color:var(--ui-muted);font-weight:600}
+.travel-ui-v2 .trip-patterns label{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;min-height:66px;padding:10px 3px;border:1px solid var(--ui-line);background:white;border-radius:10px;text-align:center;position:relative;cursor:pointer;color:#5f7166}
+.travel-ui-v2 .trip-patterns label:has(input:checked){background:var(--ui-green-light);border-color:#5b987f;color:var(--ui-green-dark);box-shadow:inset 0 0 0 .5px #5b987f}
+.travel-ui-v2 .trip-patterns label:has(input:focus-visible){outline:3px solid #73ad97;outline-offset:2px}
+.travel-ui-v2 .trip-patterns input{position:absolute;width:1px;height:1px;min-height:0;padding:0;margin:0;opacity:0}
+.travel-ui-v2 .trip-patterns strong{font-size:12px;font-weight:750;white-space:nowrap}
+.travel-ui-v2 .trip-patterns small{font-size:10px;font-weight:500;color:#73847a;letter-spacing:-.4px;white-space:nowrap}
+.travel-ui-v2 .ui-pattern-note{color:var(--ui-muted);font-size:10px;line-height:1.5;margin:-8px 0 0;min-height:15px}
+/* Search and optional filters */
+.travel-ui-v2 .field-search{display:grid;gap:6px;position:relative}
+.travel-ui-v2 .ui-place-field{padding-left:27px}
+.travel-ui-v2 .ui-place-field::before{content:attr(data-point);position:absolute;top:30px;left:0;width:19px;height:19px;border-radius:50%;color:var(--ui-green);background:#e2f0e7;font-size:10px;font-weight:800;display:grid;place-items:center}
+.travel-ui-v2 .ui-place-field[data-point='B']::before{color:white;background:var(--ui-green)}
+.travel-ui-v2 .field-label-row{display:flex;align-items:center;justify-content:space-between;gap:5px}
+.travel-ui-v2 .filter-toggle{font-size:10px;color:var(--ui-muted);background:none;border:0;min-height:24px;padding:0;text-decoration:none}
+.travel-ui-v2 .field-note{margin:0;min-height:0;color:#728378;font-size:10px;line-height:1.5;font-weight:400;overflow-wrap:anywhere}
+.travel-ui-v2 .search-actions{display:flex;flex-wrap:wrap;gap:5px;min-height:0}
+.travel-ui-v2 .search-actions:not(:has(>:not([hidden]))){display:none}
+.travel-ui-v2 .search-filter-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));padding:10px;border:1px solid var(--ui-line);border-radius:9px;background:var(--ui-background);gap:9px}
+.travel-ui-v2 .search-filter-grid select{min-height:36px;font-size:11px;padding:7px}
+.travel-ui-v2 .facet-feedback{display:grid;gap:5px}
+.travel-ui-v2 .facet-status{margin:0;min-height:0;font-size:10px;color:var(--ui-muted)}
+.travel-ui-v2 .facet-status:empty{display:none}
+.travel-ui-v2 .suggestions{position:relative;z-index:12;max-height:230px;overflow:auto;margin:0;padding:5px;border:1px solid #b2caba;border-radius:10px;list-style:none;background:white;box-shadow:0 8px 22px rgb(32 53 46/10%)}
+.travel-ui-v2 .suggestions [role='option']{display:grid;padding:10px;gap:3px;border-radius:6px;cursor:pointer}
+.travel-ui-v2 .suggestions :is([role='option']:hover,[aria-selected='true']){background:var(--ui-green-light)}
+.travel-ui-v2 .suggestion-primary{color:var(--ui-text);font-size:12px;overflow-wrap:anywhere}
+.travel-ui-v2 .suggestion-secondary{color:var(--ui-muted);font-size:10px;overflow-wrap:anywhere}
+/* Date/time and progressive disclosure */
+.travel-ui-v2 .schedule-fields{border:0;border-top:1px solid var(--ui-line);border-radius:0;padding:14px 0 0;display:grid;gap:13px;margin:0}
+.travel-ui-v2 .schedule-fields>legend{padding:0 8px 0 0;font-size:12px;font-weight:700;color:var(--ui-text)}
+.travel-ui-v2 .date-time-grid{display:grid;grid-template-columns:1fr;gap:9px}
+.travel-ui-v2 .date-time-field{display:grid;gap:5px}
+.travel-ui-v2 .date-time-field>strong{display:block;font-size:11px;color:var(--ui-muted);font-weight:600}
+.travel-ui-v2 .inline-controls{display:grid;grid-template-columns:minmax(0,1fr) 120px;gap:8px}
+.travel-ui-v2 .inline-controls label{display:grid;gap:4px;font-size:10px;color:var(--ui-muted)}
+.travel-ui-v2 .inline-controls input{min-height:41px;font-size:12px;padding:8px 9px}
+.travel-ui-v2 .duration-control{display:grid;grid-template-columns:64px 1fr;gap:8px;align-items:center}
+.travel-ui-v2 .duration-control>strong{font-size:11px;color:var(--ui-muted);font-weight:600}
+.travel-ui-v2 .duration-inputs{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.travel-ui-v2 .duration-inputs label{display:flex;flex-direction:row-reverse;align-items:center;justify-content:flex-end;gap:6px;font-size:11px;color:var(--ui-muted)}
+.travel-ui-v2 .duration-inputs input{width:60px;min-height:35px;padding:6px 8px;text-align:center;font-size:13px}
+.travel-ui-v2 .duration-quick{grid-column:1/-1;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px}
+.travel-ui-v2 .duration-quick button{min-height:32px;padding:4px;border:1px solid var(--ui-line);border-radius:7px;background:white;color:#687b6e;font-size:11px;font-weight:600}
+.travel-ui-v2 .duration-quick button[aria-pressed='true']{color:var(--ui-green);border-color:#b8d0c1;background:var(--ui-green-light)}
+.travel-ui-v2 .ui-end-details{margin-top:-2px}
+.travel-ui-v2 summary{list-style:none;display:flex;align-items:center;gap:8px;min-height:38px;font-size:11px;color:#6b7c72}
+.travel-ui-v2 summary::-webkit-details-marker{display:none}
+.travel-ui-v2 summary .ui-icon{width:15px;height:15px}
+.travel-ui-v2 .ui-end-time{margin-left:auto;font-size:11px;font-weight:650;color:var(--ui-text)}
+.travel-ui-v2 details[open]>summary .ui-icon{transform:rotate(180deg)}
+.travel-ui-v2 .ui-end-details[open] .date-time-field{padding:8px 0}
+.travel-ui-v2 .ui-more-options{border-top:1px solid var(--ui-line);border-bottom:1px solid var(--ui-line);padding:3px 0;margin:-6px 0 0}
+.travel-ui-v2 .ui-more-options>summary{font-size:12px;font-weight:650;color:#435f4f}
+.travel-ui-v2 .ui-option-state{margin-left:auto;font-size:10px;color:#89998e;font-weight:400}
+.travel-ui-v2 .has-options .ui-option-state{color:var(--ui-green);font-weight:700}
+.travel-ui-v2 .ui-options-body{padding:9px 0 12px;display:grid;gap:12px}
+.travel-ui-v2 .vehicle-assumptions{border:0;padding:0;margin:0}
+.travel-ui-v2 .vehicle-assumptions legend{font-size:11px;padding:0 0 8px;color:var(--ui-muted)}
+.travel-ui-v2 .vehicle-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.travel-ui-v2 .vehicle-grid label{color:var(--ui-muted);font-size:11px}
+.travel-ui-v2 .vehicle-grid :is(input,select){min-height:39px;font-size:12px;padding:7px}
+.travel-ui-v2 .check-line{display:flex;flex-direction:row;gap:8px;align-items:center;color:var(--ui-muted);font-size:11px}
+.travel-ui-v2 .check-line input{min-height:17px;width:17px;height:17px;margin:0}
+.travel-ui-v2 .policy-disclosure{padding:10px;border-radius:8px;border:1px solid var(--ui-line);background:var(--ui-background);display:grid;gap:5px}
+.travel-ui-v2 .policy-disclosure strong{border:0;background:none;padding:0;font-size:11px;border-radius:0;color:var(--ui-text)}
+.travel-ui-v2 .policy-disclosure span{color:var(--ui-muted);font-size:10px}
+/* Primary action remains within reach while the sidebar scrolls */
+.travel-ui-v2 .ui-submit-dock{position:sticky;bottom:0;z-index:8;padding:10px 0 13px;margin-top:-8px;background:white;box-shadow:0 -8px 12px rgb(255 255 255/96%);display:grid;gap:7px}
+.travel-ui-v2 .primary-button{width:100%;display:inline-flex;align-items:center;justify-content:center;min-height:49px;border:1px solid var(--ui-green);border-radius:10px;color:white;background:var(--ui-green);font-size:14px;font-weight:750;box-shadow:0 4px 10px rgb(18 107 83/10%);transition:background .15s}
+.travel-ui-v2 .primary-button:hover:not(:disabled){background:var(--ui-green-dark)}
+.travel-ui-v2 .primary-button:disabled{opacity:1;color:#fafffc;background:#739989;border-color:#739989;box-shadow:none}
+.travel-ui-v2 .primary-button[aria-busy='true']{background:var(--ui-green)}
+.travel-ui-v2 .ui-submit-hint{font-size:10px;text-align:center;color:var(--ui-muted);line-height:1.5;margin:0}
+.travel-ui-v2 .form-error{padding:10px;border-radius:7px;border-left:3px solid #b64937;color:#903b2d;background:#fff1ed;font-size:12px;margin:0}
+.travel-ui-v2 .secondary-action{min-height:34px;border:1px solid #bfd3c6;border-radius:7px;color:var(--ui-green);background:white;padding:6px 10px;font-size:11px;font-weight:650}
+/* Map container. No generic SVG fill, stroke, or size overrides. */
+.travel-ui-v2 .map-stage{position:relative;min-width:0;display:flex;flex-direction:column;overflow:hidden;height:var(--workspace-height);min-height:0;border:1px solid var(--ui-line);border-radius:18px;background:#fff}
+.travel-ui-v2 .map-toolbar{position:static;display:flex;flex-wrap:wrap;align-items:center;width:100%;padding:14px 19px;gap:15px;border:0;border-bottom:1px solid var(--ui-line);border-radius:0;background:white;z-index:1;box-shadow:none}
+.travel-ui-v2 .map-toolbar strong{font-size:13px;color:var(--ui-text);margin-right:auto}
+.travel-ui-v2 .map-toolbar label{display:flex;flex-direction:row;align-items:center;gap:5px;font-size:11px;color:var(--ui-muted);font-weight:500}
+.travel-ui-v2 .map-toolbar input{width:14px;height:14px;min-height:14px;margin:0}
+.travel-ui-v2 .map-toolbar p{display:none}
+.travel-ui-v2 .map-canvas{width:100%;height:auto;min-height:0;position:relative;flex:1 1 auto;overflow:hidden;border-radius:0;background:#e9efe9}
+.travel-ui-v2 .map-placeholder{pointer-events:none;position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#65796b;z-index:0}
+.travel-ui-v2 .map-placeholder span{font-size:20px;font-weight:600}
+.travel-ui-v2 .map-placeholder small{font-size:12px}
+.travel-ui-v2 .map-canvas.is-ready>.map-placeholder{display:none}
+.travel-ui-v2 .map-status{position:absolute;bottom:13px;left:14px;z-index:4;max-width:calc(100% - 28px);margin:0;padding:9px 12px;border:1px solid rgb(206 218 209/70%);border-radius:8px;color:#566e5e;background:rgb(255 255 255/94%);box-shadow:0 2px 8px rgb(32 53 46/5%);font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+.travel-ui-v2 .map-status:empty{display:none}
+.travel-ui-v2 .ui-map-footer{flex:0 0 auto;min-height:45px;padding:12px 17px;display:flex;gap:7px;align-items:center;font-size:10px;color:#708276;background:white;border-top:1px solid var(--ui-line)}
+.travel-ui-v2 .ui-map-footer .ui-icon{height:15px;width:15px;color:#809e89}
+.travel-ui-v2 .ui-original-map-collapse{display:none!important}
+/* Results hierarchy */
+.travel-ui-v2 .results-panel{padding-bottom:22px}
+.travel-ui-v2 :is(.section-heading,.route-heading){display:flex;align-items:center;justify-content:space-between;gap:10px}
+.travel-ui-v2 :is(.section-heading,.route-heading) h2{margin:0;font-size:16px;color:var(--ui-text);font-weight:750}
+.travel-ui-v2 .coverage-status{font-size:10px;font-weight:600;color:var(--ui-green)}
+.travel-ui-v2 .summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:17px}
+.travel-ui-v2 .summary-card{min-width:0;padding:13px;border:1px solid var(--ui-line);border-radius:11px;background:white}
+.travel-ui-v2 .summary-card:nth-child(3){grid-column:1/-1;background:#eef6f1;border-color:#d9e8dd;padding:16px}
+.travel-ui-v2 .summary-card h3{font-size:11px;margin:0;color:var(--ui-muted);font-weight:600}
+.travel-ui-v2 .summary-card p{margin:8px 0 4px;font-size:20px;color:var(--ui-text);font-weight:800;line-height:1.3;letter-spacing:-.8px}
+.travel-ui-v2 .summary-card:nth-child(2) p{color:var(--ui-text)}
+.travel-ui-v2 .summary-card:nth-child(3) p{color:var(--ui-green);font-size:30px;margin:5px 0}
+.travel-ui-v2 .summary-card small{display:block;font-size:10px;color:var(--ui-muted);line-height:1.5}
+.travel-ui-v2 .summary-card :is(#classification-warning,#mobility-warning){color:#986414;font-size:11px;margin-top:6px}
+.travel-ui-v2 .route-section{margin-top:24px}
+.travel-ui-v2 .route-heading{margin-bottom:13px}
+.travel-ui-v2 .route-heading span{font-size:11px;color:var(--ui-muted)}
+.travel-ui-v2 .sort-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;background:#f1f5f1;padding:4px;border-radius:9px;margin:0 0 17px}
+.travel-ui-v2 .sort-tabs button{min-height:33px;border:0;background:none;color:#738579;border-radius:6px;font-size:11px;padding:5px}
+.travel-ui-v2 .sort-tabs [aria-selected='true']{color:var(--ui-green);background:white;box-shadow:0 1px 4px rgb(32 53 46/7%);font-weight:750}
+.travel-ui-v2 .route-list{display:grid;gap:18px}
+.travel-ui-v2 .route-leg{display:grid;gap:9px;margin:0;padding:0;border:0;border-radius:0;background:none}
+.travel-ui-v2 .route-leg h3{color:var(--ui-text);font-size:12px;font-weight:750;margin:0}
+.travel-ui-v2 .route-leg-description{display:none}
+.travel-ui-v2 .route-leg-cards{display:grid;gap:9px}
+.travel-ui-v2 .route-card{text-align:left;width:100%;display:grid;gap:10px;padding:14px;border:1px solid var(--ui-line);border-radius:11px;background:white;color:var(--ui-text);box-shadow:none}
+.travel-ui-v2 .route-card:is(.mode-car,.mode-transit,.mode-walk){border-left:1px solid var(--ui-line)}
+.travel-ui-v2 .route-card:hover{border-color:#9fbdab}
+.travel-ui-v2 .route-card[aria-current='true']{border:1.5px solid #4b9371;background:#f7fbf8;box-shadow:0 0 0 1px rgb(75 147 113/5%)}
+.travel-ui-v2 .route-top{display:flex;flex-wrap:wrap;gap:7px;justify-content:space-between;align-items:center}
+.travel-ui-v2 .route-top strong{font-size:13px;font-weight:750;color:var(--ui-text)}
+.travel-ui-v2 .route-badges{display:flex;flex-wrap:wrap;gap:3px}
+.travel-ui-v2 .route-badge{border:0;border-radius:4px;color:var(--ui-green);background:#e5f1e9;padding:3px 5px;font-size:9px;font-weight:650}
+.travel-ui-v2 .route-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;align-items:start}
+.travel-ui-v2 .route-metrics>span{display:grid;gap:4px;color:var(--ui-muted);font-size:10px}
+.travel-ui-v2 .route-metrics b{color:#3b5545;font-size:12px;font-weight:650}
+.travel-ui-v2 .route-source{color:#85958a;font-size:9px}
+.travel-ui-v2 .route-warning{color:#91651e;font-size:11px}
+.travel-ui-v2 .legal-notice{position:static;display:grid;grid-template-columns:1fr 1fr;gap:3px 25px;max-width:1440px;margin:17px auto 0;padding:0 30px 22px;border:0;background:transparent;color:#6f8274;font-size:10px;line-height:1.6}
+.travel-ui-v2 .legal-notice p{margin:0;color:#718277;font-size:10px}
+.travel-ui-v2 .legal-notice p:nth-child(2){grid-column:1}
+.travel-ui-v2 .legal-notice small{grid-column:2;grid-row:1/3;text-align:right;color:#788b7d;font-size:10px}
+.travel-ui-v2 .info-dialog{width:min(620px,calc(100vw - 32px));max-height:calc(100dvh - 50px);padding:25px;color:var(--ui-text);border:1px solid var(--ui-line);border-radius:18px;box-shadow:0 22px 70px rgb(15 40 28/18%);background:white}
+.travel-ui-v2 .info-dialog::backdrop{background:rgb(20 41 30/35%)}
+.travel-ui-v2 .dialog-heading-row{display:flex;align-items:center;justify-content:space-between;gap:20px}
+.travel-ui-v2 .dialog-heading-row h2{margin:0;font-size:19px}
+.travel-ui-v2 .dialog-close{min-height:38px;padding:7px 12px;border:1px solid var(--ui-line);border-radius:8px;color:var(--ui-muted);background:white;font-size:12px}
+.travel-ui-v2 .dialog-content{margin-top:17px;font-size:13px;line-height:1.8}
+.travel-ui-v2 .dialog-content h3{margin-bottom:5px;font-size:14px}
+.travel-ui-v2 .dialog-content p{color:var(--ui-muted)}
+@media(min-width:768px) and (max-width:1100px){
+  .travel-ui-v2 .ui-flow-hint{display:none}
+  .travel-ui-v2 .app-shell{grid-template-columns:370px minmax(0,1fr);gap:14px;padding:0 20px}
+  .travel-ui-v2 .ui-intro{padding-left:20px;padding-right:20px}
+  .travel-ui-v2 .app-header{padding:0 20px;gap:12px}
+  .travel-ui-v2 .ui-privacy{padding-left:12px;font-size:10px}
+  .travel-ui-v2 :is(.input-section,.results-panel){padding-left:18px;padding-right:18px}
+  .travel-ui-v2 .map-toolbar{gap:10px;padding:14px}
+  .travel-ui-v2 .map-toolbar strong{flex-basis:100%}
+}
+@media(max-width:767px){
+  .travel-ui-v2 .app-header{height:68px;padding:0 17px;gap:10px;position:relative}
+  .travel-ui-v2 .brand{gap:9px}
+  .travel-ui-v2 .ui-brand-mark{width:34px;height:34px;border-radius:10px}
+  .travel-ui-v2 .ui-brand-mark .ui-icon{width:23px;height:23px}
+  .travel-ui-v2 .ui-brand-words strong{font-size:17px}
+  .travel-ui-v2 .ui-brand-words small{font-size:10px}
+  .travel-ui-v2 .menu-button{display:block;order:3;margin-left:auto;padding:6px;width:38px;height:38px;min-height:38px;border:1px solid var(--ui-line);border-radius:8px;background:white;color:var(--ui-green);font-size:19px}
+  .travel-ui-v2 .utility-nav{display:none;position:absolute;top:61px;right:14px;width:min(260px,calc(100vw - 28px));padding:10px;background:white;border:1px solid var(--ui-line);border-radius:12px;box-shadow:0 12px 25px rgb(32 53 46/10%);z-index:30}
+  .travel-ui-v2 .utility-nav.is-open{display:flex;flex-direction:column;align-items:stretch;gap:5px}
+  .travel-ui-v2 .utility-nav .utility-button{justify-content:flex-start;padding:11px}
+  .travel-ui-v2 :is(.ui-privacy,.ui-flow-hint){display:none}
+  .travel-ui-v2 .ui-intro{padding:24px 19px 20px;gap:0}
+  .travel-ui-v2 .ui-intro h1{font-size:26px;letter-spacing:-1px;margin-bottom:7px}
+  .travel-ui-v2 .ui-intro p{max-width:305px;font-size:12px;line-height:1.7}
+  .travel-ui-v2 .app-shell{display:flex;flex-direction:column;gap:17px;padding:0 14px}
+  .travel-ui-v2 .rail{width:100%;height:auto;min-height:0;border-radius:15px;overflow:visible}
+  .travel-ui-v2 .ui-view-tabs{flex:0 0 auto;min-height:51px;padding:0 20px;border-radius:15px 15px 0 0}
+  .travel-ui-v2 :is(.input-section,.results-panel){padding:20px 19px 0;overflow:visible;border-radius:0 0 15px 15px}
+  .travel-ui-v2 .results-panel{padding-bottom:22px}
+  .travel-ui-v2 .input-section form{gap:17px}
+  .travel-ui-v2 .trip-patterns label{min-height:68px}
+  .travel-ui-v2 .ui-pattern-note{font-size:11px}
+  .travel-ui-v2 :is(input,select){min-height:46px;font-size:16px;padding:9px}
+  .travel-ui-v2 input::placeholder{font-size:12px}
+  .travel-ui-v2 .inline-controls input{min-height:44px;font-size:14px}
+  .travel-ui-v2 .duration-inputs input{min-height:40px;font-size:16px}
+  .travel-ui-v2 .duration-quick button{min-height:38px;font-size:12px}
+  .travel-ui-v2 .ui-submit-dock{padding:11px 0 13px;border-radius:0 0 15px 15px}
+  /* The approved small-screen flow keeps the action inside the form, so the dock
+     must not float above (and cover) the schedule inputs while scrolling. */
+  .travel-ui-v2 .ui-submit-dock{position:static;margin-top:0;box-shadow:none}
+  .travel-ui-v2 .primary-button{min-height:51px;font-size:15px}
+  .travel-ui-v2 .map-stage,.travel-ui-v2 .map-stage.is-expanded{width:100%;height:360px;min-height:360px;border-radius:15px}
+  .travel-ui-v2 .map-toolbar{padding:12px 14px;gap:11px}
+  .travel-ui-v2 .map-toolbar label{font-size:10px}
+  .travel-ui-v2 .map-canvas{height:auto;min-height:0}
+  /* The small-screen collapse step is removed here, so the real Kakao canvas
+     must stay displayed instead of the base mobile hidden state, and it keeps
+     the fixed 360px stage height below the toolbar. */
+  .travel-ui-v2 .map-stage .map-canvas{display:block;position:relative;inset:auto;top:auto;right:auto;bottom:auto;left:auto;height:auto;min-height:0;z-index:auto}
+  .travel-ui-v2 .map-status{font-size:10px;bottom:9px;left:9px;max-width:calc(100% - 18px);padding:8px}
+  .travel-ui-v2 .ui-map-footer{padding:10px 12px;font-size:10px}
+  .travel-ui-v2 .legal-notice{display:flex;flex-direction:column;padding:0 20px 25px;margin:15px 0 0;gap:3px}
+
+  /* Small screens keep the original full-viewport dialog contract. */
+  .travel-ui-v2 .info-dialog{width:100vw;max-width:none;height:100dvh;max-height:none;border:0;border-radius:0;padding:20px}
+  .travel-ui-v2 .legal-notice small{text-align:left;margin-top:6px}
+}
+@media(max-width:355px){
+  .travel-ui-v2 :is(.input-section,.results-panel){padding-left:14px;padding-right:14px}
+  .travel-ui-v2 .ui-place-field{padding-left:23px}
+  .travel-ui-v2 .map-toolbar{gap:8px}
+  .travel-ui-v2 .map-toolbar strong{flex-basis:100%}
+}
+@media(prefers-reduced-motion:reduce){.travel-ui-v2 *,.travel-ui-v2 *::before,.travel-ui-v2 *::after{transition:none!important;animation:none!important;scroll-behavior:auto!important}}
+@media print{
+  body.travel-ui-v2{background:white}
+  .travel-ui-v2 :is(.ui-intro,.app-header,.map-stage,.ui-view-tabs,.input-section){display:none!important}
+  .travel-ui-v2 .app-shell{display:block;padding:0}
+  .travel-ui-v2 :is(.rail,.results-panel){height:auto;overflow:visible;border:0;display:block}
+  .travel-ui-v2 #results[hidden]{display:none!important}
+}
