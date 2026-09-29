@@ -23,8 +23,10 @@ async function submitAndReadPayload(
     candidate.method() === "POST"
     && new URL(candidate.url()).pathname === "/api/v1/trips/preview"
   ));
-  await page.getByRole("button", { name: "경로 계산" }).click();
-  return JSON.parse((await request).postData() || "{}") as Record<string, unknown>;
+  await page.locator("#calculate-button").click();
+  const payload = JSON.parse((await request).postData() || "{}") as Record<string, unknown>;
+  await expect(page.getByRole("tab", { name: "계산 결과" })).toHaveAttribute("aria-selected", "true");
+  return payload;
 }
 
 // Mutation caught: changing a quick choice without recalculating the visible end.
@@ -60,6 +62,7 @@ test("manual_end_change_updates_duration", async ({ page }) => {
   await page.goto("/");
   await page.locator("#starts-date").fill("2026-08-10");
   await page.locator("#starts-time").fill("09:00");
+  await page.locator(".ui-end-details > summary").click();
   await page.locator("#returns-date").fill("2026-08-10");
   await page.locator("#returns-time").evaluate((element) => {
     element.value = "14:45";
@@ -89,18 +92,18 @@ test("one_minute_or_over_twenty_four_hours_blocks_submit", async ({ page }) => {
   await installMockApi(page);
   await page.goto("/");
   await selectTripInputs(page);
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
   await page.locator("#duration-hours").click();
   await page.locator("#duration-hours").press("ControlOrMeta+A");
   await page.locator("#duration-hours").press("0");
   await page.locator("#duration-minutes").click();
   await page.locator("#duration-minutes").press("ControlOrMeta+A");
   await page.locator("#duration-minutes").press("1");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
 
   await page.locator("#duration-hours").fill("24");
   await page.locator("#duration-minutes").fill("1");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
 });
 
 // Boundary coverage: the reviewed inclusive duration limits remain calculable.
@@ -113,24 +116,26 @@ test("two_and_1440_minute_durations_enable_exact_payloads", async ({ page }) => 
 
   await page.locator("#duration-hours").fill("0");
   await page.locator("#duration-minutes").fill("2");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
   const twoMinutePayload = await submitAndReadPayload(page);
   expect(twoMinutePayload.startsAt).toBe("2026-08-10T09:00:00+09:00");
   expect(twoMinutePayload.endsAt).toBe("2026-08-10T09:02:00+09:00");
 
+  await page.getByRole("tab", { name: "출장 조건" }).click();
   await page.locator("#duration-hours").fill("24");
   await page.locator("#duration-minutes").fill("0");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
   const fullDayPayload = await submitAndReadPayload(page);
   expect(fullDayPayload.startsAt).toBe("2026-08-10T09:00:00+09:00");
   expect(fullDayPayload.endsAt).toBe("2026-08-11T09:00:00+09:00");
 
+  await page.getByRole("tab", { name: "출장 조건" }).click();
   await page.locator("#duration-hours").fill("0");
   await page.locator("#duration-minutes").fill("1");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   await page.locator("#duration-hours").fill("24");
   await page.locator("#duration-minutes").fill("1");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
 });
 
 // Mutation caught: serializing a display label, legacy field, or an incorrect enum.
@@ -148,6 +153,9 @@ test("each_trip_pattern_sends_exact_enum_and_no_legacy_fields", async ({ page })
     ["일정 후 퇴근", "OUTBOUND_ONLY_END_AFTER_SCHEDULE"],
     ["바로 출근 후 근무지 복귀", "RETURN_ONLY_DIRECT_TO_DESTINATION"],
   ]) {
+    if (await page.getByRole("tab", { name: "계산 결과" }).getAttribute("aria-selected") === "true") {
+      await page.getByRole("tab", { name: "출장 조건" }).click();
+    }
     await page.getByRole("radio", { name: label }).check();
     const payload = await submitAndReadPayload(page);
     expect(payload.tripPattern).toBe(expected);
@@ -168,6 +176,7 @@ test("one_way_uses_approved_trip_end_labels_and_ends_at_payload", async ({ page 
   await page.getByRole("button", { name: "5시간" }).click();
   await page.getByRole("radio", { name: "일정 후 퇴근" }).check();
 
+  await page.locator(".ui-end-details > summary").click();
   await expect(page.getByText("출장 종료 일시", { exact: true })).toBeVisible();
   await expect(page.getByLabel("출장 종료 날짜")).toHaveValue("2026-08-10");
   await expect(page.getByLabel("출장 종료 시간")).toHaveValue("14:00");
@@ -260,6 +269,7 @@ test("distance_basis_copy_never_labels_one_way_or_missing_evidence_as_round_trip
   await submitAndReadPayload(page);
   await expect(page.locator("#classification-distance")).toHaveText("편도 확인 거리(하한) 6.4km");
   await expect(page.locator("#classification-distance")).not.toContainText("왕복");
+  await page.getByRole("tab", { name: "출장 조건" }).click();
   await submitAndReadPayload(page);
   await expect(page.locator("#classification-distance")).toHaveText("거리 근거 없음 · 지급액 검토 필요");
   await expect(page.locator("#classification-distance")).not.toContainText("왕복");

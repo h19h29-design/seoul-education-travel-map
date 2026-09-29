@@ -189,7 +189,7 @@ test("anonymous calculation remains intact when a delayed me response resolves",
   }
 });
 
-test("settings dialog restores focus after Escape and fills the mobile viewport", async ({ page }) => {
+test("settings dialog fits the mobile viewport and restores focus after Escape", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   await installAuthenticatedSettingsApi(page);
   await page.goto("/");
@@ -198,7 +198,10 @@ test("settings dialog restores focus after Escape and fills the mobile viewport"
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "기본 설정" });
   await expect(dialog).toBeVisible();
-  expect(await dialog.evaluate((element) => element.getBoundingClientRect().width === window.innerWidth)).toBe(true);
+  expect(await dialog.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    return bounds.left >= 0 && bounds.right <= window.innerWidth && bounds.width >= window.innerWidth - 32;
+  })).toBe(true);
   await page.keyboard.press("Escape");
   await expect(trigger).toBeFocused();
 });
@@ -215,10 +218,10 @@ test("history draft requires a current destination selection", async ({ page }) 
   await page.getByRole("button", { name: "계산 이력" }).click();
   await page.getByRole("button", { name: "다시 계산" }).first().click();
   await expect(page.getByText("출장지를 다시 선택하세요.")).toBeVisible();
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   expect(previewPosts).toBe(0);
   await page.getByRole("option", { name: /서울특별시청.*세종대로 110/ }).click();
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
   await expect.poll(() => previewPosts).toBe(1);
 });
 

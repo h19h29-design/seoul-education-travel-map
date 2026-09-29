@@ -20,18 +20,21 @@ test("mobile_375_search_candidate_schedule_result_and_map_flow", async ({ page }
   await installMockApi(page);
   await page.goto("/");
   await completePublicOfficialTrip(page);
-  await page.getByRole("button", { name: "4시간" }).click();
-  await page.getByRole("radio", { name: "일반 왕복" }).check();
-  await page.getByRole("button", { name: "경로 계산" }).click();
-
-  await expect(page.getByLabel("출발 기관")).toBeVisible();
-  await expect(page.getByLabel("출장지")).toBeVisible();
   await expect(page.locator("[data-route-direction='OUTBOUND']")).toContainText("가는 길");
   await expect(page.locator("[data-route-direction='RETURN']")).toContainText("돌아오는 길");
-  await page.getByRole("button", { name: "지도 펼치기" }).click();
   await expect(page.locator("#map")).toBeVisible();
-  await page.getByRole("button", { name: "지도 접기" }).click();
-  await expect(page.locator("#map")).toBeHidden();
+  await page.getByRole("tab", { name: "출장 조건" }).click();
+  await page.getByRole("button", { name: "4시간" }).click();
+  await page.getByRole("radio", { name: "일반 왕복" }).check();
+  await page.locator("#calculate-button").click();
+
+  await expect(page.getByRole("tab", { name: "계산 결과" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("[data-route-direction='OUTBOUND']")).toContainText("가는 길");
+  await expect(page.locator("[data-route-direction='RETURN']")).toContainText("돌아오는 길");
+  await expect(page.locator("#map")).toBeVisible();
+  await page.getByRole("tab", { name: "출장 조건" }).click();
+  await expect(page.getByLabel("출발 기관")).toBeVisible();
+  await expect(page.getByLabel("출장지")).toBeVisible();
   expect(await page.evaluate(() => {
     const elements = ["origin-search", "destination-search", "duration-hours", "results", "map-collapse"]
       .map((id) => document.getElementById(id));
@@ -113,13 +116,16 @@ test("submits prior same-day allowance and displays only the remaining amount", 
   await page.goto("/");
   await expect(page.getByLabel("기존 지급액(원)")).toBeDisabled();
   await completePublicOfficialTrip(page);
+  await page.getByRole("tab", { name: "출장 조건" }).click();
+  await page.locator(".ui-more-options").evaluate((element: HTMLDetailsElement) => { element.open = true; });
   await page.getByLabel("오늘 다른 관내출장이 있습니다").check();
   await expect(page.getByLabel("기존 지급액(원)")).toBeEnabled();
   await page.getByLabel("기존 지급액(원)").fill("10000");
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
   await expect(page.locator("#allowance-amount")).toHaveText("10,000원");
+  await page.getByRole("tab", { name: "출장 조건" }).click();
   await page.getByLabel("기존 지급액(원)").fill("20000");
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
   await expect(page.locator("#allowance-amount")).toHaveText("0원");
   expect(payloads.slice(1).map((payload) => payload.previousAllowanceKrw)).toEqual([10_000, 20_000]);
 });
@@ -154,7 +160,7 @@ test("selects a private school origin and shows route rankings", async ({ page }
   await page
     .getByRole("option", { name: /서울특별시청.*세종대로 110/ })
     .click();
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
 
   await expect(page.getByText("최단시간")).toHaveCount(2);
   await expect(page.getByText("최단거리")).toHaveCount(2);
@@ -228,8 +234,8 @@ test("discloses the fixed public policy without an editable selector", async ({ 
     .getByRole("option", { name: /서울특별시청.*세종대로 110/ })
     .click();
 
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
+  await page.locator("#calculate-button").click();
   await expect(page.getByRole("heading", { name: "추천 경로" })).toBeVisible();
 });
 
@@ -264,6 +270,7 @@ test("keeps localized time controls readable on mobile", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   await installMockApi(page);
   await page.goto("/");
+  await page.locator(".ui-end-details").evaluate((element: HTMLDetailsElement) => { element.open = true; });
 
   expect(
     await page
@@ -283,7 +290,7 @@ test("keeps localized date controls readable in the input rail", async ({ page }
   ).toBeTruthy();
 });
 
-test("shows the input rail, rankings, and collapsible map without mobile overflow", async ({
+test("shows the input rail, rankings, and visible map without mobile overflow", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 375, height: 812 });
@@ -297,7 +304,6 @@ test("shows the input rail, rankings, and collapsible map without mobile overflo
 
   await completePublicOfficialTrip(page);
   await expect(page.getByRole("heading", { name: "추천 경로" })).toBeVisible();
-  await page.getByRole("button", { name: "지도 펼치기" }).click();
   await expect(page.locator("#map")).toBeVisible();
   expect(
     await page
@@ -361,7 +367,7 @@ test("delayed_preview_is_discarded_when_destination_is_removed", async ({ page }
     new URL(response.url()).pathname === "/api/v1/trips/preview"
   ));
 
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
   await page.getByLabel("출장지").fill("서울");
   await expect(page.locator("#calculate-button")).toBeDisabled();
   releasePreview(readFixture<Record<string, unknown>>("preview.json"));
@@ -404,7 +410,7 @@ test("only_a_fresh_preview_renders_after_destination_is_replaced", async ({ page
     new URL(response.url()).pathname === "/api/v1/trips/preview"
   ));
 
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
   await page.getByLabel("출장지").fill("서울역");
   await page.getByRole("option", { name: /서울역 지번 안내소.*동자동 43-205/ }).click();
   await expect(page.locator("#calculate-button")).toBeEnabled();
@@ -415,7 +421,7 @@ test("only_a_fresh_preview_renders_after_destination_is_replaced", async ({ page
     (await mapState(page)).created.filter(({ kind }) => kind === "PolylineFake").length
   )).toBe(0);
 
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
   await expect(page.getByText("FRESH_DESTINATION 기준")).toBeVisible();
   await expect(page.locator("#form-error")).toBeHidden();
   expect(previewCount).toBe(2);
@@ -477,7 +483,7 @@ test("map click invalidates the selected destination until its result is confirm
   await expect(
     page.getByRole("option", { name: /서울특별시청 지도 선택.*세종대로 110/ }),
   ).toBeVisible();
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   await page.locator("#trip-form").evaluate((form) => form.requestSubmit());
   await expect(page.locator("#form-error")).toBeVisible();
   expect(previewPosts).toBe(0);
@@ -490,23 +496,22 @@ test("map click invalidates the selected destination until its result is confirm
       request.method() === "POST" &&
       new URL(request.url()).pathname === "/api/v1/trips/preview",
   );
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
   const payload = JSON.parse((await previewRequest).postData() || "{}");
   expect(payload.destination.name).toBe("서울특별시청 지도 선택");
 });
 
-test("mobile map exposes a collapse control above the expanded canvas", async ({
+test("mobile map and layer controls stay visible without a collapse step", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 375, height: 812 });
   await installMockApi(page);
   await page.goto("/");
 
-  await page.getByRole("button", { name: "지도 펼치기" }).click();
-  await expect(page.getByRole("button", { name: "지도 접기" })).toBeVisible();
-  await page.getByRole("button", { name: "지도 접기" }).click();
-  await expect(page.getByRole("button", { name: "지도 펼치기" })).toBeVisible();
-  await expect(page.locator("#map")).toBeHidden();
+  await expect(page.locator("#map")).toBeVisible();
+  await expect(page.locator(".map-toolbar")).toBeVisible();
+  await expect(page.getByRole("button", { name: "지도 펼치기" })).toBeHidden();
+  expect(await page.locator("#map").evaluate((element) => element.getBoundingClientRect().height >= 180)).toBe(true);
 });
 
 test("map polyline, cleanup, and boundary effects reach the Kakao adapter", async ({
@@ -554,7 +559,8 @@ test("map polyline, cleanup, and boundary effects reach the Kakao adapter", asyn
     )
     .toBe(1);
 
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.getByRole("tab", { name: "출장 조건" }).click();
+  await page.locator("#calculate-button").click();
   await expect
     .poll(async () =>
       (await mapState(page)).events.filter(
@@ -578,7 +584,8 @@ test("keeps checked boundary layers after a route preview is rendered again", as
     )
     .toBe(2);
 
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.getByRole("tab", { name: "출장 조건" }).click();
+  await page.locator("#calculate-button").click();
 
   await expect(page.getByLabel("서울 경계")).toBeChecked();
   await expect(page.getByLabel("12km 지원영역")).toBeChecked();
@@ -600,9 +607,9 @@ test("keyboard option selection authorizes calculation while free text does not"
   await page.getByLabel("출발 기관").press("Enter");
   await expect(page.getByLabel("출발 기관")).toHaveValue("샘물공립초등학교");
   await page.getByLabel("출장지").fill("서울시청");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
 
   await page.getByLabel("출장지").press("ArrowDown");
   await page.getByLabel("출장지").press("Enter");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
 });

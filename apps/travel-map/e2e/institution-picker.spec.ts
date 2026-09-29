@@ -173,24 +173,24 @@ test("editing_selected_institution_clears_origin_marker_and_disables_submit", as
   await page.goto("/");
   await selectFirstOrigin(page);
   await selectFirstDestination(page);
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
 
   const selectedState = await mapState(page);
   const originMarker = selectedState.created.find(({ kind, options }) =>
     kind === "MarkerFake" && options.title === "샘물공립초등학교");
   expect(originMarker).toBeDefined();
   await page.getByLabel("출발 기관").fill("수정");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   await expect.poll(async () =>
     (await mapState(page)).events.some(({ id, map, type }) =>
       id === originMarker?.id && map === null && type === "setMap"),
   ).toBe(true);
 
   await page.getByRole("option", { name: /샘물공립초등학교/ }).click();
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
   await page.getByRole("button", { name: "기관 검색 필터 열기" }).click();
   await page.getByLabel("기관유형").selectOption("HIGH_SCHOOL");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
 });
 
 test("new_institution_query_cannot_select_stale_options", async ({ page }) => {
@@ -242,17 +242,17 @@ test("new_institution_query_cannot_select_stale_options", async ({ page }) => {
 
   await expect(input).toHaveValue("새기관검색");
   await expect(input).not.toHaveAttribute("aria-activedescendant", /.+/);
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   expect((await mapState(page)).created.some(({ kind, options }) =>
     kind === "MarkerFake" && options.title === "이전 출발기관")).toBe(false);
 
   releaseCurrent?.();
   await expect(page.getByRole("option", { name: /새 출발기관/ })).toBeVisible();
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   await input.press("ArrowDown");
   await input.press("Enter");
   await expect(input).toHaveValue("새 출발기관");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
 });
 
 test("institution_picker_announces_loading_zero_and_error_states", async ({
@@ -332,7 +332,7 @@ test("facet_failure_leaves_text_search_and_anonymous_calculation_available", asy
   await expect(page.getByLabel("기관유형")).toBeDisabled();
   await selectFirstOrigin(page);
   await selectFirstDestination(page);
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
   await expect(page.getByRole("heading", { name: "추천 경로" })).toBeVisible();
   await expect(page.locator("#allowance-amount")).toHaveText("20,000원");
   expect(requestedPaths).toContain("/api/v1/me");
@@ -344,7 +344,7 @@ test("facet_failure_leaves_text_search_and_anonymous_calculation_available", asy
     await hangingPage.goto("/");
     await selectFirstOrigin(hangingPage);
     await selectFirstDestination(hangingPage);
-    await hangingPage.getByRole("button", { name: "경로 계산" }).click();
+    await hangingPage.locator("#calculate-button").click();
     await expect(hangingPage.getByRole("heading", { name: "추천 경로" })).toBeVisible();
   } finally {
     await hangingContext.close();

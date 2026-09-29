@@ -382,5 +382,5 @@ export async function completePublicOfficialTrip(page: Page): Promise<void> {
   await page
     .getByRole("option", { name: /서울특별시청.*세종대로 110/ })
     .click();
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
 }

@@ -114,7 +114,7 @@ test("destination_selection_shows_one_replaceable_marker_and_pans_map", async ({
 
   const markerCountBeforePreview = state.created.filter(({ kind }) => kind === "MarkerFake").length;
   const activeCandidatesBeforePreview = activeMarkerIds(state);
-  await page.getByRole("button", { name: "경로 계산" }).click();
+  await page.locator("#calculate-button").click();
   await expect(page.getByRole("heading", { name: "추천 경로" })).toBeVisible();
   state = await mapState(page);
   expect(state.created.filter(({ kind }) => kind === "MarkerFake")).toHaveLength(
@@ -171,7 +171,7 @@ test("editing_selected_destination_invalidates_selection_and_marker", async ({
     kind === "MarkerFake" && options.title === "서울특별시청");
 
   await page.getByLabel("출장지").fill("서");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   await expect(page.locator("#destination-selection")).toContainText("2자 이상");
   await expect.poll(async () =>
     (await mapState(page)).events.some(({ id, map, type }) =>
@@ -250,17 +250,17 @@ test("new_destination_query_cannot_select_stale_options", async ({ page }) => {
 
   await expect(input).toHaveValue("새주소검색");
   await expect(input).not.toHaveAttribute("aria-activedescendant", /.+/);
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   expect((await mapState(page)).created.some(({ kind, options }) =>
     kind === "MarkerFake" && options.title === "이전 출장지")).toBe(false);
 
   releaseCurrent?.();
   await expect(page.getByRole("option", { name: /새 출장지/ })).toBeVisible();
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   await input.press("ArrowDown");
   await input.press("Enter");
   await expect(input).toHaveValue("새 출장지");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
 });
 
 test("map_click_requires_reverse_candidate_confirmation", async ({ page }) => {
@@ -314,7 +314,7 @@ test("map_click_requires_reverse_candidate_confirmation", async ({ page }) => {
   const firstClick = triggerMapClick(page, 37.51, 126.91);
   await firstRequest;
   await expect.poll(() => Boolean(releaseFirst)).toBe(true);
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   await expect(page.locator("#destination-selection")).toContainText("주소를 확인하고 있습니다");
 
   const secondRequest = page.waitForRequest((request) => {
@@ -328,14 +328,14 @@ test("map_click_requires_reverse_candidate_confirmation", async ({ page }) => {
   releaseSecond?.();
   await secondClick;
   await expect(page.getByRole("option", { name: /두 번째 지도 후보/ })).toBeVisible();
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeDisabled();
+  await expect(page.locator("#calculate-button")).toBeDisabled();
   releaseFirst?.();
   await firstClick;
   await expect(page.getByRole("option", { name: /두 번째 지도 후보/ })).toBeVisible();
   await expect(page.getByRole("option", { name: /첫 번째 지도 후보/ })).toHaveCount(0);
 
   await page.getByRole("option", { name: /두 번째 지도 후보/ }).click();
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
   expect(await page.evaluate(() =>
     (window as typeof window & { __task5AbortCalls: number }).__task5AbortCalls,
   )).toBeGreaterThan(0);
@@ -382,7 +382,7 @@ test("keyboard_arrows_enter_and_escape_control_both_listboxes", async ({ page })
   await destination.press("Enter");
   await expect(destination).toHaveValue("서울특별시청");
   await expect(page.locator("#destination-selection")).toContainText("선택했습니다");
-  await expect(page.getByRole("button", { name: "경로 계산" })).toBeEnabled();
+  await expect(page.locator("#calculate-button")).toBeEnabled();
   expect(previewRequests).toBe(0);
   expect(await page.locator("html").evaluate((node) =>
     node.scrollWidth <= window.innerWidth,
